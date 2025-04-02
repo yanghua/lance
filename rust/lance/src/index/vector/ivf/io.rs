@@ -42,7 +42,7 @@ use object_store::path::Path;
 use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
-
+use tracing::instrument;
 use super::IVFIndex;
 use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
@@ -143,6 +143,7 @@ async fn merge_streams(
 /// These existing partitions must have the same centroids and PQ codebook.
 ///
 /// TODO: migrate this function to `lance-index` crate.
+#[instrument(level = "debug", skip_all)]
 pub(super) async fn write_pq_partitions(
     writer: &mut dyn Writer,
     ivf: &mut IvfModel,

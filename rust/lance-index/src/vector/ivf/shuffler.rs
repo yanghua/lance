@@ -45,7 +45,7 @@ use log::info;
 use object_store::path::Path;
 use snafu::location;
 use tempfile::TempDir;
-
+use tracing::instrument;
 use crate::vector::ivf::IvfTransformer;
 use crate::vector::transform::Transformer;
 use crate::vector::PART_ID_COLUMN;
@@ -241,6 +241,7 @@ impl PartitionListBuilder {
 ///   the streams into a single stream by k-list merge algo.
 ///
 #[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     ivf: Arc<IvfTransformer>,
@@ -380,7 +381,7 @@ pub async fn shuffle_vectors(
     Ok(partition_files)
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct IvfShuffler {
     unsorted_buffers: Vec<String>,
 
@@ -692,6 +693,7 @@ impl IvfShuffler {
         partitions_builder.finish()
     }
 
+    #[instrument(level = "debug", skip(self))]
     pub async fn write_partitioned_shuffles(
         &self,
         batches_per_partition: usize,
@@ -796,6 +798,7 @@ impl IvfShuffler {
             .await
     }
 
+    #[instrument(level = "debug", skip_all)]
     pub async fn load_partitioned_shuffles(
         basedir: &Path,
         files: Vec<String>,
