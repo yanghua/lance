@@ -55,6 +55,7 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
+use log::warn;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -1868,6 +1869,11 @@ fn prepare_vector_index_params(
                 kwargs.get_item("precomputed_shuffle_buffers_path")?
             ) {
                 (Some(l), Some(p)) => {
+                    warn!("--------------------------------------------");
+                    warn!("{}", p.clone().to_string());
+                    warn!("--------------------------------------------");
+                    let segments: Vec<&str> = p.clone().to_string().split('/').collect();
+                    warn!("分割结果: {:?}", segments);
                     let path = Path::parse(p.to_string()).map_err(|e| {
                         PyValueError::new_err(format!(
                             "Failed to parse precomputed_shuffle_buffers_path: {}",

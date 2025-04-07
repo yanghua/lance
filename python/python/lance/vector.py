@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
@@ -283,6 +284,7 @@ def compute_pq_codes(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
+    storage_options: Optional[dict[str, str]] = None,
 ) -> Tuple[Union[str, Path], List[str]]:
     """Compute pq codes for each row using GPU kmeans and spill to disk.
 
@@ -305,6 +307,7 @@ def compute_pq_codes(
     Tuple[Union[str, Path], List[str]]
         The absolute path of the pq codes dataset and shuffle buffers
     """
+    LOGGER.warn("Starting compute_pq_codes to %s", dst_dataset_uri)
     from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
@@ -384,11 +387,12 @@ def compute_pq_codes(
         dst_dataset_uri,
         schema=output_schema,
         data_storage_version="legacy",
+        storage_options=storage_options,
     )
 
     progress.close()
 
-    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.warn("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
@@ -410,6 +414,7 @@ def compute_partitions(
     num_sub_vectors: Optional[int] = None,
     filter_nan: bool = True,
     sample_size: Optional[int] = None,
+    storage_options: Optional[dict[str, str]] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -434,6 +439,7 @@ def compute_partitions(
     str
         The absolute path of the partition dataset.
     """
+    LOGGER.warn("Starting compute_partitions to %s", dst_dataset_uri)
     from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
@@ -555,11 +561,12 @@ def compute_partitions(
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
         data_storage_version="stable",
+        storage_options=storage_options,
     )
 
     progress.close()
 
-    LOGGER.info("Saved precomputed partitions to %s", dst_dataset_uri)
+    LOGGER.warn("Saved precomputed partitions to %s", dst_dataset_uri)
     return str(dst_dataset_uri)
 
 
@@ -616,6 +623,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
     *,
     filter_nan: bool = True,
     allow_cuda_tf32: bool = True,
+    storage_options: Optional[dict[str, str]] = None,
 ):
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -739,6 +747,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
         dst_dataset_uri,
         schema=output_schema,
         data_storage_version="legacy",
+        storage_options=storage_options,
     )
 
     progress.close()

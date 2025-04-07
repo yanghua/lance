@@ -1791,6 +1791,8 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
+        precomputed_partition_dataset_uri: Optional[str] = None,
+        precomputed_partition_with_pqcode_dataset_uri: Optional[str] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2019,7 +2021,7 @@ class LanceDataset(pa.dataset.Dataset):
                 one_pass_train_ivf_pq_on_accelerator,
             )
 
-            LOGGER.info("Doing one-pass ivfpq accelerated computations")
+            LOGGER.warn("Doing one-pass ivfpq accelerated computations")
 
             timers["ivf+pq_train:start"] = time.time()
             (
@@ -2039,7 +2041,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
             timers["ivf+pq_train:end"] = time.time()
             ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
+            LOGGER.warn("ivf+pq training time: %ss", ivfpq_train_time)
             timers["ivf+pq_assign:start"] = time.time()
             shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
                 self,
@@ -2055,7 +2057,7 @@ class LanceDataset(pa.dataset.Dataset):
             ivfpq_assign_time = (
                 timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
             )
-            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+            LOGGER.warn("ivf+pq transform time: %ss", ivfpq_assign_time)
 
             kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
             kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
@@ -2095,7 +2097,7 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partition_dataset is provided"
                 )
             if precomputed_partition_dataset is not None:
-                LOGGER.info("Using provided precomputed partition dataset")
+                LOGGER.warn("Using provided precomputed partition dataset")
                 precomputed_ds = LanceDataset(
                     precomputed_partition_dataset, storage_options=storage_options
                 )
@@ -2138,7 +2140,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["ivf_train:end"] = time.time()
                 ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
-                LOGGER.info("ivf training time: %ss", ivf_train_time)
+                LOGGER.warn("ivf training time: %ss", ivf_train_time)
                 timers["ivf_assign:start"] = time.time()
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
@@ -2151,10 +2153,12 @@ class LanceDataset(pa.dataset.Dataset):
                     batch_size=20480,
                     num_sub_vectors=num_sub_vectors_cur,
                     filter_nan=filter_nan,
+                    dst_dataset_uri=precomputed_partition_dataset_uri,
+                    storage_options=storage_options,
                 )
                 timers["ivf_assign:end"] = time.time()
                 ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
-                LOGGER.info("ivf transform time: %ss", ivf_assign_time)
+                LOGGER.warn("ivf transform time: %ss", ivf_assign_time)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -2202,11 +2206,11 @@ class LanceDataset(pa.dataset.Dataset):
                 and "precomputed_partitions_file" in kwargs
                 and not one_pass_ivfpq
             ):
-                LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
+                LOGGER.warn("Computing new precomputed shuffle buffers for PQ.")
                 partitions_file = kwargs["precomputed_partitions_file"]
                 del kwargs["precomputed_partitions_file"]
 
-                partitions_ds = LanceDataset(partitions_file)
+                partitions_ds = LanceDataset(partitions_file, storage_options=storage_options)
                 # Use accelerator to train pq codebook
                 from .vector import (
                     compute_pq_codes,
@@ -2223,21 +2227,23 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["pq_train:end"] = time.time()
                 pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
-                LOGGER.info("pq training time: %ss", pq_train_time)
+                LOGGER.warn("pq training time: %ss", pq_train_time)
                 timers["pq_assign:start"] = time.time()
                 shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
                     kmeans_list,
                     batch_size=20480,
+                    dst_dataset_uri=precomputed_partition_with_pqcode_dataset_uri,
+                    storage_options=storage_options,
                 )
                 timers["pq_assign:end"] = time.time()
                 pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
-                LOGGER.info("pq transform time: %ss", pq_assign_time)
+                LOGGER.warn("pq transform time: %ss", pq_assign_time)
                 # Save disk space
                 if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
                 ):
-                    LOGGER.info(
+                    LOGGER.warn(
                         "Temporary partitions file stored at %s,"
                         "you may want to delete it.",
                         partitions_file,
@@ -2289,12 +2295,12 @@ class LanceDataset(pa.dataset.Dataset):
         final_create_index_time = (
             timers["final_create_index:end"] - timers["final_create_index:start"]
         )
-        LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
+        LOGGER.warn("Final create_index rust time: %ss", final_create_index_time)
         # Save disk space
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]
         ):
-            LOGGER.info(
+            LOGGER.warn(
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
             )
