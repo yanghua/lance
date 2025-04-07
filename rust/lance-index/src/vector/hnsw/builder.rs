@@ -730,7 +730,7 @@ impl IvfSubIndex for HNSW {
             inner: Arc::new(inner),
         };
 
-        log::info!(
+        log::warn!(
             "Building HNSW graph: num={}, max_levels={}, m={}, ef_construction={}, distance_type:{}",
             storage.len(),
             hnsw.inner.params.max_level,

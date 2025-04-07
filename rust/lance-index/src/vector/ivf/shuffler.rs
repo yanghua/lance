@@ -41,7 +41,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::ReadBatchParams;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use snafu::location;
 use tempfile::TempDir;
@@ -253,7 +253,7 @@ pub async fn shuffle_dataset(
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
-        info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
+        warn!("Precomputed shuffle files provided, skip calculation of IVF partition.");
         let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true, None)?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
@@ -261,7 +261,7 @@ pub async fn shuffle_dataset(
 
         shuffler
     } else {
-        info!(
+        warn!(
             "Calculating IVF partitions for vectors (num_partitions={}, precomputed_partitions={})",
             num_partitions,
             precomputed_partitions.is_some()
@@ -303,7 +303,7 @@ pub async fn shuffle_dataset(
                             .expect("failed to add part id column");
 
                         if part_ids.null_count() > 0 {
-                            info!(
+                            warn!(
                                 "Filter out rows without valid partition IDs: null_count={}",
                                 part_ids.null_count()
                             );
@@ -330,7 +330,7 @@ pub async fn shuffle_dataset(
 
         let start = std::time::Instant::now();
         shuffler.write_unsorted_stream(stream).await?;
-        info!(
+        warn!(
             "wrote partition assignment to unsorted tmp file in {:?}",
             start.elapsed()
         );
@@ -343,13 +343,13 @@ pub async fn shuffle_dataset(
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
         .await?;
-    info!("created sorted chunks in {:?}", start.elapsed());
+    warn!("created sorted chunks in {:?}", start.elapsed());
 
     // step 3: load the sorted chunks, consumers are expect to be responsible for merging the streams
     let start = std::time::Instant::now();
     let stream =
         IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files).await?;
-    info!("merged partitioned shuffles in {:?}", start.elapsed());
+    warn!("merged partitioned shuffles in {:?}", start.elapsed());
 
     Ok(stream)
 }

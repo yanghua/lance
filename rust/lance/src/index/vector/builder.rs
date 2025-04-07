@@ -50,7 +50,7 @@ use lance_io::{
     ReadBatchParams,
 };
 use lance_linalg::distance::DistanceType;
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
@@ -351,7 +351,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let start = std::time::Instant::now();
-        info!(
+        warn!(
             "loading training data for quantizer. sample size: {}",
             sample_size_hint
         );
@@ -714,7 +714,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
         let scheduler = ScanScheduler::new(obj_store, scheduler_config);
         for (part_id, (storage_size, index_size)) in partition_sizes.into_iter().enumerate() {
-            log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
+            log::warn!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
             } else {

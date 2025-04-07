@@ -7,7 +7,7 @@ use arrow_array::{cast::AsArray, FixedSizeListArray};
 use futures::StreamExt;
 use lance_arrow::{interleave_batches, DataTypeExt};
 use lance_core::datatypes::Schema;
-use log::info;
+use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::SeedableRng;
@@ -188,7 +188,7 @@ pub async fn maybe_sample_training_data(
             message: format!("Sample training data: {}", err),
             location: location!(),
         })?;
-        info!(
+        warn!(
             "Sample training data: retrieved {} rows by sampling after filtering out nulls",
             batch.num_rows()
         );

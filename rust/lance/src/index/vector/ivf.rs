@@ -1187,7 +1187,7 @@ pub async fn build_ivf_model(
     let centroids = params.centroids.clone();
     if centroids.is_some() && !params.retrain {
         let centroids = centroids.unwrap();
-        info!("Pre-computed IVF centroids is provided, skip IVF training");
+        warn!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != params.num_partitions * dim {
             return Err(Error::Index {
                 message: format!(

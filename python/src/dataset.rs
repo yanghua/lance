@@ -1218,7 +1218,7 @@ impl Dataset {
             }
         };
 
-        log::info!("Creating index: type={}", index_type);
+        log::warn!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
             "BTREE" => Box::<ScalarIndexParams>::default(),
             "BITMAP" => Box::new(ScalarIndexParams {
