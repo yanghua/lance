@@ -1872,7 +1872,8 @@ fn prepare_vector_index_params(
                     warn!("--------------------------------------------");
                     warn!("{}", p.clone().to_string());
                     warn!("--------------------------------------------");
-                    let segments: Vec<&str> = p.clone().to_string().split('/').collect();
+                    let path_string = p.clone().to_string();
+                    let segments: Vec<&str> = path_string.split('/').collect();
                     warn!("分割结果: {:?}", segments);
                     let path = Path::parse(p.to_string()).map_err(|e| {
                         PyValueError::new_err(format!(
