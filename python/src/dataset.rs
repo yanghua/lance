@@ -1292,6 +1292,8 @@ impl Dataset {
 
         let replace = replace.unwrap_or(true);
 
+        warn!("Creating index with params: {:?}", params);
+
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(
             None,
