@@ -570,7 +570,32 @@ pub trait DatagenExt {
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset_with_params(path, frag_count, rows_per_fragment, None).await
+    }
+
+    async fn into_dataset_with_params(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset_with_params(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset_with_params("memory://", frag_count, rows_per_fragment, write_params).await
+    }
 
     async fn into_ram_dataset(
         self,
@@ -606,6 +631,22 @@ impl DatagenExt for BatchGeneratorBuilder {
             }),
         )
         .await
+    }
+
+    async fn into_dataset_with_params(self, path: &str, frag_count: FragmentCount, rows_per_fragment: FragmentRowCount, write_params: Option<WriteParams>) -> lance_core::Result<Dataset> {
+        let reader = self.into_reader_rows(
+            RowCount::from(rows_per_fragment.0 as u64),
+            BatchCount::from(frag_count.0),
+        );
+        Dataset::write(
+            reader,
+            path,
+            write_params.or(Some(WriteParams {
+                max_rows_per_file: rows_per_fragment.0 as usize,
+                ..Default::default()
+            })),
+        )
+            .await
     }
 }
 

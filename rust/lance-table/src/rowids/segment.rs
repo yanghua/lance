@@ -191,6 +191,7 @@ impl U64Segment {
                         bitmap.clear(offset);
                     }
 
+                    println!("Bitmap range: {:?} bitmap: {:?}", range, bitmap);
                     Self::RangeWithBitmap { range, bitmap }
                 } else {
                     // Must use array, but at least it's sorted
@@ -242,6 +243,7 @@ impl U64Segment {
             Self::RangeWithBitmap { range, bitmap } => {
                 let holes = bitmap.count_zeros();
                 (range.end - range.start) as usize - holes
+                // bitmap.len
             }
             Self::SortedArray(array) => array.len(),
             Self::Array(array) => array.len(),
@@ -301,15 +303,15 @@ impl U64Segment {
                 let start = range.start + offset as u64;
                 let end = start + len as u64;
 
-                let bitmap = bitmap.slice(offset, len);
-                if bitmap.count_ones() == len {
+                let bitmap_slice = bitmap.slice(offset, range.end as usize - range.start as usize);
+                if bitmap_slice.count_ones() == len {
                     // Bitmap no longer serves a purpose
                     Self::Range(start..end)
                     // TODO: could also have a case where we switch back to RangeWithHoles
                 } else {
                     Self::RangeWithBitmap {
-                        range: start..end,
-                        bitmap: bitmap.into(),
+                        range: start..range.end,
+                        bitmap: bitmap_slice.into(),
                     }
                 }
             }

@@ -1601,23 +1601,30 @@ impl FileFragment {
             }
         }
 
+        println!("The schema want to scan is: {:?}", scanner.schema().await.unwrap().fields);
+
         // As we get row addrs, add them into our deletion vector
         scanner
             .try_into_stream()
             .await?
             .try_for_each(|batch| {
+                println!("------------------1");
                 let array = batch[ROW_ADDR].clone();
                 let int_array: &UInt64Array = as_primitive_array(array.as_ref());
 
                 // _rowaddr is global, not within fragment level. The high bits
                 // are the fragment_id, the low bits are the row_id within the
                 // fragment.
+                println!("------------------2");
                 let local_row_ids = int_array.values().iter().map(|v| *v as u32);
 
+                println!("------------------3");
                 deletion_vector.extend(local_row_ids);
                 futures::future::ready(Ok(()))
             })
             .await?;
+
+        println!("after extend deletion vector...");
 
         // If we haven't deleted any additional rows, we can return the fragment as-is.
         if deletion_vector.len() == starting_length {

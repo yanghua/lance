@@ -110,10 +110,18 @@ mod test {
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_select::filter::filter;
+    use aws_sdk_s3::config::retry::ShouldAttempt::No;
     use futures::Future;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_core::datatypes::Schema;
+    use lance_datagen::Dimension;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -430,5 +438,129 @@ mod test {
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
     }
 
-    // TODO: query / scan / take after deletion, compaction, then deletion
+    #[tokio::test]
+    async fn test_stable_row_id_after_multiple_deletion_and_compaction_new() {
+        use arrow_array::Int32Array;
+
+        let mut dataset = lance_datagen::gen()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_move_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        
+        println!("initial dataset created with {} fragments", dataset.get_fragments().len());
+
+        println!("first delete");
+        dataset.delete("i = 2 or i = 3 or i = 5").await.unwrap();
+        println!("after first delete, fragments: {}", dataset.get_fragments().len());
+
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let result = scan.try_into_batch().await.unwrap();
+        // print all row ids
+        let row_ids_before_compact = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options.clone(), None).await.unwrap();
+        println!("after compaction, fragments's len is : {}, max fragment id is : {}", dataset.get_fragments().len(), dataset.get_fragments().last().unwrap().metadata.id);
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 57);
+
+        println!("Try to scan all the data after deletion and compaction");
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let result = scan.try_into_batch().await.unwrap();
+        // print all row ids
+        let row_ids_after_compact = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        println!("row ids: {:?}", row_ids_after_compact.values());
+        assert_eq!(row_ids_before_compact, row_ids_after_compact);
+
+        println!("second delete");
+        dataset.delete("i = 9").await.unwrap();
+        println!("after second delete, fragments: {}", dataset.get_fragments().len());
+
+        let mut scan = dataset.scan();
+        let result = scan.filter("i >= 0").unwrap().try_into_batch().await.unwrap();
+        let ids = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let expected: Vec<i32> = (0..60)
+            .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
+            .collect();
+        assert_eq!(ids.values(), expected.as_slice());
+        println!("after first scan with filter");
+
+        scan = dataset.scan();
+        scan.with_row_id();
+        scan.filter("i == 15");
+        let result = scan.try_into_batch().await.unwrap();
+        let row_id = result[ROW_ID].as_primitive::<UInt64Type>();
+        let row_id_vec = row_id.values().to_vec();
+        println!("after second scan with filter, row ids: {:?}", row_id_vec);
+
+        println!("after third scan with filter, row ids: {:?}", result[ROW_ID]);
+        assert_eq!(1, result[ROW_ID].len());
+
+        println!("third delete");
+        dataset.delete("i = 15 or i = 25").await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 30,
+            ..Default::default()
+        };
+
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let result = scan.try_into_batch().await.unwrap();
+        let row_ids_before_compact = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        let _metrics = compact_files(&mut dataset, options.clone(), None).await.unwrap();
+        println!("after compaction, fragments's len is : {}, max fragment id is : {}", dataset.get_fragments().len(), dataset.get_fragments().last().unwrap().metadata.id);
+
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let result = scan.try_into_batch().await.unwrap();
+        let row_ids_after_compact = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids_before_compact, row_ids_after_compact);
+
+        // assert_eq!(dataset.count_rows(None).await.unwrap(), 54);
+        // scan = dataset.scan();
+        // scan.with_row_id();
+        // scan.filter("i == 15");
+        // let result = scan.try_into_batch().await.unwrap();
+        // assert_eq!(0, result[ROW_ID].len());
+        //
+        // let result = dataset.take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap()).await.unwrap();
+        // println!("The i is : {:?}", result["i"].as_any().downcast_ref::<Int32Array>().unwrap());
+        // assert_eq!(result.num_rows(), 0);
+    }
 }

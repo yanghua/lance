@@ -225,10 +225,12 @@ pub fn apply_row_id_and_deletes(
 
     let row_ids = if config.with_row_id {
         if let Some(row_id_sequence) = &config.row_id_sequence {
+            println!("+++++++++++++The row id sequence is : {:?}, batch_offset is : {:?}, num_rows: {:?}", row_id_sequence, batch_offset, num_rows);
             let row_ids = row_id_sequence
                 .slice(batch_offset as usize, num_rows as usize)
                 .iter()
                 .collect::<UInt64Array>();
+            println!("+++++++++++++Row IDs: {:?}", row_ids);
             Some(Arc::new(row_ids))
         } else {
             // If we don't have a row id sequence, can assume the row ids are
@@ -248,11 +250,13 @@ pub fn apply_row_id_and_deletes(
 
     let batch = if config.with_row_id {
         let row_id_arr = row_ids.unwrap();
+        println!("----- Row ID array: {:?}", row_id_arr);
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
     } else {
         batch
     };
 
+    // println!("----- Batch before row addr: {:?}", batch);
     let batch = if config.with_row_addr {
         let row_addr_arr = row_addrs.unwrap();
         batch.try_with_column(ROW_ADDR_FIELD.clone(), row_addr_arr)?
@@ -277,6 +281,7 @@ pub fn wrap_with_row_id_and_delete(
     fragment_id: u32,
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
+    println!("The fragment id is: {}", fragment_id);
     let config = Arc::new(config);
     let mut offset = 0;
     stream

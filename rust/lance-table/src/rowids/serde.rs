@@ -39,6 +39,7 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                 })
             }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
+                println!("The bitmap data is : {:?}", bitmap);
                 Ok(Self::RangeWithBitmap {
                     range: start..end,
                     bitmap: Bitmap {

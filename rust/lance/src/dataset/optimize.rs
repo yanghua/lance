@@ -836,8 +836,12 @@ async fn rechunk_stable_row_ids(
                 .map(|frag| frag.physical_rows.unwrap() as u64)
                 .sum::<u64>()
         },
-        "{:?}",
-        old_sequences
+        "{:?}, {:?}",
+        old_sequences,
+        new_fragments
+            .iter()
+            .map(|frag| frag.physical_rows.unwrap() as u64)
+            .collect::<Vec<_>>()
     );
 
     let new_sequences = lance_table::rowids::rechunk_sequences(

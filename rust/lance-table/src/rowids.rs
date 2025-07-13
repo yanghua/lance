@@ -267,18 +267,39 @@ impl RowIdSequence {
 
         // Find the ending position
         let mut offset_last = offset_start + len;
+        println!("The init offset_last: {:?}", offset_last);
         let mut segment_offset_last = segment_offset;
         for segment in &self.0[segment_offset..] {
-            let segment_len = segment.len();
+            let segment_len = match segment {
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    bitmap.len
+                }
+                _ => segment.len()
+            };
+            // let segment_len = segment.len();
             if offset_last <= segment_len {
                 break;
             }
+        
             offset_last -= segment_len;
+            println!("The offset_last in the loop is : {:?}, segment_len is : {:?}", offset_last, segment_len);
             segment_offset_last += 1;
         }
 
+        println!("The result offset_last: {:?}", offset_last);
+
+        let segment_offset_last = segment_offset_last.min(self.0.len().saturating_sub(1));
+        let segments = if segment_offset <= segment_offset_last && segment_offset < self.0.len() {
+            &self.0[segment_offset..=segment_offset_last]
+        } else {
+            &[]
+        };
+
+        println!(" RowIdSeqSlice details: segments: {:?}, offset_start: {:?}, offset_last: {:?}", segments, offset_start, offset_last);
+
         RowIdSeqSlice {
-            segments: &self.0[segment_offset..=segment_offset_last],
+            segments,
+            // segments: &self.0[segment_offset..=segment_offset_last],
             offset_start,
             offset_last,
         }

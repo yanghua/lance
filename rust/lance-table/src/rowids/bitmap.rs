@@ -14,6 +14,7 @@ impl std::fmt::Debug for Bitmap {
         write!(f, "Bitmap {{ data: ")?;
         for i in 0..self.len {
             write!(f, "{}", if self.get(i) { "1" } else { "0" })?;
+            println!("************ {}", if self.get(i) { "1" } else { "0" });
         }
         write!(f, ", len: {} }}", self.len)
     }
@@ -49,6 +50,7 @@ impl Bitmap {
     }
 
     pub fn get(&self, i: usize) -> bool {
+        println!("Getting bit at index {}, the len is {}, the len of data is {:?}", i, self.len, self.data);
         self.data[i / 8] & (1 << (i % 8)) != 0
     }
 

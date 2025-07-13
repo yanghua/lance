@@ -2952,7 +2952,12 @@ impl Stream for DatasetRecordBatchStream {
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
             Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
+                println!("Polling next record batch in DatasetRecordBatchStream");
+                match result {
+                    Some(Ok(batch)) => Poll::Ready(Some(Ok(batch))),
+                    Some(Err(e)) => Poll::Ready(Some(Err(Error::io(e.to_string(), location!())))),
+                    None => Poll::Ready(None),
+                }
             }
             Poll::Pending => Poll::Pending,
         }

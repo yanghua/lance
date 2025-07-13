@@ -589,6 +589,8 @@ impl RecordBatchExt for RecordBatch {
         let new_schema = Arc::new(self.schema().as_ref().try_with_column(field)?);
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
+        // println!("New schema: {:?}", new_schema);
+        // println!("New columns: {:?}", new_columns);
         Self::try_new(new_schema, new_columns)
     }
 
