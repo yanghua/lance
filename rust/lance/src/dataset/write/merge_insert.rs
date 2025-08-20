@@ -1379,9 +1379,10 @@ impl MergeInsertJob {
                     .iter()
                     .map(|f| f.physical_rows.unwrap() as u64);
 
-                let sequences = lance_table::rowids::rechunk_sequences_for_merge_insert(
+                let sequences = lance_table::rowids::rechunk_sequences(
                     [row_id_sequence.clone()],
                     fragment_sizes,
+                    true,
                 )
                 .map_err(|e| Error::Internal {
                     message: format!(
@@ -1961,6 +1962,7 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
+    use arrow_array::types::Utf8Type;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
@@ -2084,6 +2086,32 @@ mod tests {
         )
     }
 
+    // async fn create_test_dataset(
+    //     test_uri: &str,
+    //     version: LanceFileVersion,
+    //     enable_move_stable_row_ids: bool,
+    // ) -> Arc<Dataset> {
+    //     let dataset = lance_datagen::gen_batch()
+    //         .col("key", array::step::<UInt32Type>())
+    //         .col("value", array::fill::<UInt32Type>(1u32))
+    //         .col("filterme", array::cycle_utf8_literals(&["A", "B", "A", "A", "B", "A"]))
+    //         .into_dataset_with_params(
+    //             test_uri,
+    //             FragmentCount(1),
+    //             FragmentRowCount(6),
+    //             Some(WriteParams {
+    //                 max_rows_per_file: 10,
+    //                 data_storage_version: Some(version),
+    //                 enable_move_stable_row_ids,
+    //                 ..Default::default()
+    //             }),
+    //         )
+    //         .await
+    //         .unwrap();
+    //
+    //     Arc::new(dataset)
+    // }
+
     async fn get_row_ids_for_keys(dataset: &Dataset, keys: &[u32]) -> UInt64Array {
         let filter = format!(
             "key IN ({})",
@@ -2131,8 +2159,9 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let ds =
-            create_test_dataset(schema, batch, test_uri, version, enable_move_stable_row_ids).await;
+        // let ds =
+        //     create_test_dataset(test_uri, version, enable_move_stable_row_ids).await;
+        let ds = create_test_dataset(schema, batch, test_uri, version, false).await;
 
         let row_ids_before = get_row_ids_for_keys(&ds, test_keys).await;
 
@@ -2175,6 +2204,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        // let ds = create_test_dataset(test_uri, version, false).await;
         let ds = create_test_dataset(schema, batch, test_uri, version, false).await;
 
         // Quick test that no on-keys is not valid and fails
