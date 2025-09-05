@@ -169,5 +169,5 @@ def test_dataset_take(
         f"{batch_size} batch size, {get_scheme_from_path(path_prefix)} scheme)"
     )
     benchmark.pedantic(
-        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=1
+        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=5
     )

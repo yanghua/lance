@@ -21,7 +21,7 @@ format: format-python
 .PHONY: format
 
 build:
-	maturin develop
+	maturin develop -- --cargo-extra-args="--features jemallocator"
 .PHONY: build
 
 clean:

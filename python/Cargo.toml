@@ -69,10 +69,16 @@ tracing = { version = "0.1" }
 url = "2.5.0"
 bytes = "1.4"
 once_cell = "1.21.3"
+mimalloc = { version = "0.1.47", optional = true, features = ["secure"] }
+jemallocator = { version = "0.5.4", optional = true, features = ["disable_initial_exec_tls"] }
+snmalloc-rs = { version = "0.3.8", optional = true, features = ["local_dynamic_tls"] }
 
 [features]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+mimalloc = ["dep:mimalloc"]
+snmalloc-rs = ["dep:snmalloc-rs"]
+jemallocator = ["dep:jemallocator"]
 
 [build-dependencies]
 prost-build = "0.11"

@@ -22,6 +22,16 @@
 // Remove after upgrading pyo3 to 0.23
 #![allow(clippy::useless_conversion)]
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "snmalloc-rs")]
+#[global_allocator]
+static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+#[cfg(feature = "jemallocator")]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use std::env;
 use std::sync::{Arc, LazyLock};
 
