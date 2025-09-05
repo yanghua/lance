@@ -25,9 +25,9 @@ def clear_page_cache():
         if system == "Darwin":  # macOS
             subprocess.run(["purge"], check=True)
         elif system == "Linux":
-            subprocess.run(["sync"], check=True)
+            subprocess.run(["sudo", "sync"], check=True)
             subprocess.run(
-                ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True
+                ["sudo", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True
             )
         else:
             # other OSes are not supported currently
@@ -169,5 +169,5 @@ def test_dataset_take(
         f"{batch_size} batch size, {get_scheme_from_path(path_prefix)} scheme)"
     )
     benchmark.pedantic(
-        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=5
+        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=1
     )
