@@ -38,7 +38,7 @@ def clear_page_cache():
 
 def get_path_prefixes():
     temp_dir = tempfile.mkdtemp()
-    prefixes = ["memory://", f"file://{temp_dir}"]
+    prefixes = [f"file://{temp_dir}"]
     object_store_path_prefix = os.getenv(ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX, "")
     if object_store_path_prefix:
         prefixes.append(object_store_path_prefix)
@@ -113,8 +113,7 @@ def create_dataset(
     return lance.write_dataset(
         table,
         path,
-        max_rows_per_file=file_size,
-        max_rows_per_group=batch_size,
+        max_bytes_per_file=file_size,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
     )
@@ -129,10 +128,7 @@ def gen_ranges(total_rows, num_rows):
 @pytest.mark.parametrize(
     "lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")], ids=["V2_0", "V2_1"]
 )
-@pytest.mark.parametrize("num_rows", [100, 1000], ids=["100rows", "1000rows"])
-@pytest.mark.parametrize(
-    "batch_size", [512, 1024, 2048], ids=["batch512", "batch1024", "batch2048"]
-)
+@pytest.mark.parametrize("num_rows", [1], ids=["1rows"])
 @pytest.mark.parametrize("compression", [None, "zstd"], ids=["no_compression", "zstd"])
 @pytest.mark.parametrize(
     "path_prefix", get_path_prefixes(), ids=lambda x: get_scheme_from_path(x)
@@ -143,7 +139,6 @@ def test_dataset_take(
     file_size,
     lance_format_version,
     num_rows,
-    batch_size,
     compression,
     path_prefix,
 ):
@@ -154,7 +149,7 @@ def test_dataset_take(
 
     num_batches = 1024
     ds = create_dataset(
-        path, data_storage_version, num_batches, file_size, batch_size, compression
+        path, data_storage_version, num_batches, file_size, 1024, compression
     )
     total_rows = ds.count_rows()
     rows = gen_ranges(total_rows, num_rows)
@@ -164,10 +159,13 @@ def test_dataset_take(
         assert batch.num_rows == num_rows
 
     benchmark.group = (
-        f"Random Take Dataset({file_size} file size, "
+        f"Random Take Dataset({file_size} per file, "
         f"{num_batches} batches, {num_rows} rows per take, "
-        f"{batch_size} batch size, {get_scheme_from_path(path_prefix)} scheme)"
+        f"{get_scheme_from_path(path_prefix)} scheme)"
     )
     benchmark.pedantic(
-        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=1
+        dataset_take_rows_bench, 
+        setup=clear_page_cache, 
+        rounds=10, 
+        iterations=1
     )
