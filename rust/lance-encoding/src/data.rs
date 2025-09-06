@@ -583,7 +583,9 @@ impl VariableWidthBlock {
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         debug!("into_arrow for VariableWidthBlock");
         let data_buffer = self.data.into_buffer();
+        debug!("The data_buffer size is: {:?}", data_buffer.len());
         let offsets_buffer = self.offsets.into_buffer();
+        debug!("The offsets_buffer size is: {:?}", offsets_buffer.len());
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(offsets_buffer)
             .add_buffer(data_buffer)
