@@ -59,6 +59,7 @@ impl AllNullDataBlock {
 }
 
 use std::collections::HashMap;
+use log::debug;
 
 // `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
 // `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
@@ -450,6 +451,7 @@ impl FixedSizeListBlock {
     }
 
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        debug!("into_arrow for FixedSizeListBlock");
         let num_values = self.num_values();
         let builder = match &data_type {
             DataType::FixedSizeList(child_field, _) => {
@@ -579,6 +581,7 @@ pub struct VariableWidthBlock {
 
 impl VariableWidthBlock {
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        debug!("into_arrow for VariableWidthBlock");
         let data_buffer = self.data.into_buffer();
         let offsets_buffer = self.offsets.into_buffer();
         let builder = ArrayDataBuilder::new(data_type)
