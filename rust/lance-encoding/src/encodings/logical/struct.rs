@@ -24,7 +24,7 @@ use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::FieldExt;
 use lance_core::Result;
-use log::trace;
+use log::{debug, trace};
 
 use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
@@ -301,6 +301,7 @@ struct RepDefStructDecodeTask {
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        debug!("---------> Decoding struct array inStructuralDecodeArrayTask");
         let arrays = self
             .children
             .into_iter()

@@ -33,7 +33,7 @@ use lance_core::{
     error::Error,
     utils::{bit::pad_bytes, hash::U8SliceKey},
 };
-use log::trace;
+use log::{debug, trace};
 use snafu::location;
 
 use crate::{
@@ -3027,6 +3027,7 @@ impl StructuralCompositeDecodeArrayTask {
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        debug!(" -----------> Decoding composite array task with {} sub-tasks", self.tasks.len());
         let mut arrays = Vec::with_capacity(self.tasks.len());
         let mut unravelers = Vec::with_capacity(self.tasks.len());
         for task in self.tasks {

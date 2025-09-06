@@ -6,6 +6,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{cast::AsArray, Array, ArrayRef, LargeListArray, ListArray};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
+use log::debug;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::list::ListArrayExt;
 use lance_core::Result;
@@ -198,9 +199,11 @@ impl StructuralListDecodeTask {
 
 impl StructuralDecodeArrayTask for StructuralListDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        debug!("--------> debug in StructuralDecodeArrayTask");
         let DecodedArray { array, mut repdef } = self.child_task.decode()?;
         match &self.data_type {
             DataType::List(child_field) => {
+                debug!("--------> debug in StructuralListDecodeTask: List");
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
                 let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
                 Ok(DecodedArray {
@@ -209,6 +212,7 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
                 })
             }
             DataType::LargeList(child_field) => {
+                debug!("--------> debug in StructuralListDecodeTask: LargeList");
                 let (offsets, validity) = repdef.unravel_offsets::<i64>()?;
                 let list_array =
                     LargeListArray::try_new(child_field.clone(), offsets, array, validity)?;
