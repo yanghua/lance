@@ -3055,7 +3055,9 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
+        debug!("---------> The array's len before restoring validity is {:?}", array.len());
         let array = Self::restore_validity(array, &mut repdef);
+        debug!("---------> The array's len after restoring validity is {:?}", array.len());
 
         Ok(DecodedArray { array, repdef })
     }
