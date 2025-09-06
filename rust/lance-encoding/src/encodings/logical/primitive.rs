@@ -36,6 +36,7 @@ use lance_core::{
 use log::{debug, trace};
 use snafu::location;
 use tracing::field::debug;
+use tracing::instrument;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
@@ -3035,6 +3036,7 @@ impl StructuralCompositeDecodeArrayTask {
 }
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
+    #[instrument(name = "StructuralDecodeArrayTask#decode", level = "debug", skip_all)]
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         debug!(" -----------> Decoding composite array task with {} sub-tasks", self.tasks.len());
         let mut arrays = Vec::with_capacity(self.tasks.len());
