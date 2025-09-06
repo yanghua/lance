@@ -151,13 +151,14 @@ def test_dataset_take(
     path = f"{path_prefix.rstrip('/')}/{random_uuid}.lance/"
 
     num_batches = 1024
+    print("creating dataset....")
     ds = create_dataset(
         path, data_storage_version, num_batches, file_size, 1, compression
     )
     total_rows = ds.count_rows()
-    rows = gen_ranges(total_rows, num_rows)
 
     def dataset_take_rows_bench():
+        rows = gen_ranges(total_rows, num_rows)
         batch = ds.take(rows)
         assert batch.num_rows == num_rows
 
