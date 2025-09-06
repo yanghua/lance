@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import os
+
+os.environ['LANCE_LOG'] = 'DEBUG'
+
 import platform
 import subprocess
 import tempfile
@@ -11,6 +14,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance import LanceDataset
+from lance.tracing import trace_to_chrome
+
+trace_to_chrome(file="./tracing.json")
 
 DEFAULT_BATCH_SIZE = 1024
 ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX = (
