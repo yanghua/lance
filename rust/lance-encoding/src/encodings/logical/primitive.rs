@@ -35,7 +35,7 @@ use lance_core::{
 };
 use log::{debug, trace};
 use snafu::location;
-
+use tracing::field::debug;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
@@ -2561,13 +2561,17 @@ impl DecodePageTask for VariableFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         debug!("----------> Decoding VariableFullZipDecodeTask with {} visible items", self.num_visible_items);
         let block = VariableWidthBlock {
-            data: self.data,
+            data: self.data.clone(),
             offsets: self.offsets,
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_visible_items,
             block_info: BlockInfo::new(),
         };
+        debug!("The block is {:?}", block);
+        debug!("The data length is : {:?}", self.data.clone().len());
         let decomopressed = self.decompressor.decompress(block)?;
+        debug!("The decompressed data block is: {:?}", decomopressed);
+        debug!("The length of the decompressed is: {:?}", decomopressed.data_size());
         let rep = self.rep.to_vec();
         let def = self.def.to_vec();
         let unraveler =
