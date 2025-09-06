@@ -590,8 +590,10 @@ impl VariableWidthBlock {
             .len(self.num_values as usize)
             .null_count(0);
         if validate {
+            debug!("build in validate");
             Ok(builder.build()?)
         } else {
+            debug!("build in non-validate");
             Ok(unsafe { builder.build_unchecked() })
         }
     }
