@@ -492,6 +492,7 @@ impl DecodeMiniBlockTask {
 
 impl DecodePageTask for DecodeMiniBlockTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        debug!("-----------> Decoding miniblock page");
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
@@ -893,6 +894,7 @@ impl DecodeComplexAllNullTask {
 
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        debug!("-----------> Decoding complex all-null page: {:?}", self);
         let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let rep = self.decode_level(&self.rep, num_values);
@@ -943,6 +945,7 @@ struct SimpleAllNullDecodePageTask {
 }
 impl DecodePageTask for SimpleAllNullDecodePageTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        debug!("-----------> Decoding simple all-null page");
         let unraveler = RepDefUnraveler::new(
             None,
             Some(vec![1; self.num_values as usize]),
@@ -2556,6 +2559,7 @@ struct VariableFullZipDecodeTask {
 
 impl DecodePageTask for VariableFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        debug!("----------> Decoding VariableFullZipDecodeTask with {} visible items", self.num_visible_items);
         let block = VariableWidthBlock {
             data: self.data,
             offsets: self.offsets,
@@ -2593,6 +2597,7 @@ struct FixedFullZipDecodeTask {
 
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        debug!("----------> Decoding FixedFullZipDecodeTask with {} rows", self.num_rows);
         // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
         let estimated_size_bytes = self
             .data
