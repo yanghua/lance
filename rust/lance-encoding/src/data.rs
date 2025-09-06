@@ -586,6 +586,7 @@ impl VariableWidthBlock {
         debug!("The data_buffer size is: {:?}", data_buffer.len());
         let offsets_buffer = self.offsets.into_buffer();
         debug!("The offsets_buffer size is: {:?}", offsets_buffer.len());
+        debug!("The num values is {:?}", self.num_values);
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(offsets_buffer)
             .add_buffer(data_buffer)
