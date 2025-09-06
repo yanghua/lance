@@ -3044,6 +3044,8 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             unravelers.push(decoded.repdef);
 
             debug!("before make_array the decoded data size is : {:?}", decoded.data.data_size());
+            use std::mem;
+            debug!("The datablock's discriminant: {:?}", mem::discriminant(&decoded.data));
             let array = make_array(
                 decoded
                     .data
