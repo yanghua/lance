@@ -3054,10 +3054,12 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
-
-        debug!("---------> The array's len before restoring validity is {:?}", array.len());
+        
+        debug!("---------> The array before restoring validity memory size: {} bytes， data size: {}", 
+       array.get_array_memory_size(), array.to_data().get_array_memory_size());
         let array = Self::restore_validity(array, &mut repdef);
-        debug!("---------> The array's len after restoring validity is {:?}", array.len());
+        debug!("---------> The array after restoring validity , memory size: {} bytes, data size: {}", 
+       array.get_array_memory_size(), array.to_data().get_array_memory_size());
 
         Ok(DecodedArray { array, repdef })
     }
