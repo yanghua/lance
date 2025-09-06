@@ -75,6 +75,9 @@ def create_dataset(
         ]
     )
 
+    blob_size = 10 * 1024 * 1024  # 10MB
+    large_blob_data = b'x' * blob_size
+
     batches = []
     for i in range(num_batches):
         start = i * batch_size
@@ -90,7 +93,7 @@ def create_dataset(
             dtype=np.float32,
         )
         arr_fsl = pa.FixedSizeListArray.from_arrays(pa.array(fsl_values), 2)
-        arr_blob = pa.array([f"blob-{x}".encode() for x in range(start, stop)])
+        arr_blob = pa.array([large_blob_data for _ in range(start, stop)])
 
         batch = pa.RecordBatch.from_arrays(
             [arr_i, arr_f, arr_s, arr_fsl, arr_blob], schema=schema
@@ -124,7 +127,7 @@ def gen_ranges(total_rows, num_rows):
 
 
 @pytest.mark.benchmark()
-@pytest.mark.parametrize("file_size", [1024 * 1024], ids=["1MB"])
+@pytest.mark.parametrize("file_size", [100 * 1024 * 1024], ids=["100MB"])
 @pytest.mark.parametrize(
     "lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")], ids=["V2_0", "V2_1"]
 )
@@ -149,7 +152,7 @@ def test_dataset_take(
 
     num_batches = 1024
     ds = create_dataset(
-        path, data_storage_version, num_batches, file_size, 1024, compression
+        path, data_storage_version, num_batches, file_size, 1, compression
     )
     total_rows = ds.count_rows()
     rows = gen_ranges(total_rows, num_rows)
