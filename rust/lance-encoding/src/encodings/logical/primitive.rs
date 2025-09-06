@@ -3043,22 +3043,25 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             let decoded = task.decode()?;
             unravelers.push(decoded.repdef);
 
+            debug!("before make_array the decoded data size is : {:?}", decoded.data.data_size());
             let array = make_array(
                 decoded
                     .data
                     .into_arrow(self.data_type.clone(), self.should_validate)?,
             );
+            debug!("After make_array the memory size: {} bytes， data size: {}",
+                array.get_array_memory_size(), array.to_data().get_array_memory_size());
 
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
-        
-        debug!("---------> The array before restoring validity memory size: {} bytes， data size: {}", 
+
+        debug!("---------> The array before restoring validity memory size: {} bytes， data size: {}",
        array.get_array_memory_size(), array.to_data().get_array_memory_size());
         let array = Self::restore_validity(array, &mut repdef);
-        debug!("---------> The array after restoring validity , memory size: {} bytes, data size: {}", 
+        debug!("---------> The array after restoring validity , memory size: {} bytes, data size: {}",
        array.get_array_memory_size(), array.to_data().get_array_memory_size());
 
         Ok(DecodedArray { array, repdef })
