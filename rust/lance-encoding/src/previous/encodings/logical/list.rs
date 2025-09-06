@@ -13,7 +13,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, Offs
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::{cache::LanceCache, Error, Result};
-use log::trace;
+use log::{debug, trace};
 use snafu::location;
 use tokio::task::JoinHandle;
 
@@ -617,6 +617,7 @@ struct ListDecodeTask {
 
 impl DecodeArrayTask for ListDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        debug!("-------------> Decoding ListArray with {} rows", self.offsets.len() - 1);
         let items = self
             .items
             .map(|items| {

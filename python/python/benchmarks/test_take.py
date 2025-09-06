@@ -3,6 +3,7 @@
 import os
 
 os.environ['LANCE_LOG'] = 'DEBUG'
+os.environ['LANCE_FILE_WRITER_MAX_PAGE_BYTES'] = '1048576'
 
 import platform
 import subprocess
@@ -136,10 +137,10 @@ def gen_ranges(total_rows, num_rows):
 @pytest.mark.benchmark()
 @pytest.mark.parametrize("file_size", [100 * 1024 * 1024], ids=["100MB"])
 @pytest.mark.parametrize(
-    "lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")], ids=["V2_0", "V2_1"]
+    "lance_format_version", [("2.1", "V2_1")], ids=["V2_1"]
 )
 @pytest.mark.parametrize("num_rows", [1], ids=["1rows"])
-@pytest.mark.parametrize("compression", [None, "zstd"], ids=["no_compression", "zstd"])
+@pytest.mark.parametrize("compression", ["zstd"], ids=["zstd"])
 @pytest.mark.parametrize(
     "path_prefix", get_path_prefixes(), ids=lambda x: get_scheme_from_path(x)
 )

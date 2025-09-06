@@ -2374,6 +2374,7 @@ pub trait DecodeArrayTask: Send {
 
 impl DecodeArrayTask for Box<dyn StructuralDecodeArrayTask> {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        debug!("-------------> Decoding array with structural decoder");
         StructuralDecodeArrayTask::decode(*self).map(|decoded_array| decoded_array.array)
     }
 }

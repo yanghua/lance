@@ -12,7 +12,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
-use log::trace;
+use log::{debug, trace};
 
 use crate::{
     decoder::{
@@ -170,6 +170,7 @@ impl BinaryArrayDecoder {
 
 impl DecodeArrayTask for BinaryArrayDecoder {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        debug!("---------> Decoding binary array");
         let data_type = self.data_type;
         let arr = self.inner.decode()?;
         match data_type {

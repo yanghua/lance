@@ -18,7 +18,7 @@ use arrow_array::{ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
-use log::trace;
+use log::{debug, trace};
 use snafu::location;
 
 #[derive(Debug)]
@@ -612,6 +612,7 @@ struct SimpleStructDecodeTask {
 
 impl DecodeArrayTask for SimpleStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        debug!("---------> Decoding struct array");
         let child_arrays = self
             .children
             .into_iter()
