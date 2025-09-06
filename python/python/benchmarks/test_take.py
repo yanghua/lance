@@ -76,7 +76,8 @@ def create_dataset(
     )
 
     blob_size = 10 * 1024 * 1024  # 10MB
-    large_blob_data = b'x' * blob_size
+    large_blob_data = os.urandom(blob_size)
+    #os.urandom(BINARY_SIZE) for _ in range(current_batch_size)
 
     batches = []
     for i in range(num_batches):
@@ -150,7 +151,7 @@ def test_dataset_take(
     random_uuid = str(uuid.uuid4())
     path = f"{path_prefix.rstrip('/')}/{random_uuid}.lance/"
 
-    num_batches = 1024
+    num_batches = 100
     print("creating dataset....")
     ds = create_dataset(
         path, data_storage_version, num_batches, file_size, 1, compression
@@ -159,7 +160,7 @@ def test_dataset_take(
 
     def dataset_take_rows_bench():
         rows = gen_ranges(total_rows, num_rows)
-        batch = ds.take(rows)
+        batch = ds.take(rows, columns=["blob"])
         assert batch.num_rows == num_rows
 
     benchmark.group = (
