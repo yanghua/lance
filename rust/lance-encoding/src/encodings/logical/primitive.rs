@@ -2567,10 +2567,10 @@ impl DecodePageTask for VariableFullZipDecodeTask {
             num_values: self.num_visible_items,
             block_info: BlockInfo::new(),
         };
-        debug!("The block is {:?}", block);
+        // debug!("The block is {:?}", block);
         debug!("The data length is : {:?}", self.data.clone().len());
         let decomopressed = self.decompressor.decompress(block)?;
-        debug!("The decompressed data block is: {:?}", decomopressed);
+        // debug!("The decompressed data block is: {:?}", decomopressed);
         debug!("The length of the decompressed is: {:?}", decomopressed.data_size());
         let rep = self.rep.to_vec();
         let def = self.def.to_vec();
