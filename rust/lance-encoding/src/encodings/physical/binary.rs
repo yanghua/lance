@@ -14,7 +14,7 @@ use bytemuck::cast_slice;
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
-
+use tracing::instrument;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
 };
@@ -412,6 +412,7 @@ impl PerValueCompressor for VariableEncoder {
 pub struct VariableDecoder {}
 
 impl VariablePerValueDecompressor for VariableDecoder {
+    #[instrument(name = "VariableDecoder#decompress", level = "debug", skip_all)]
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
     }

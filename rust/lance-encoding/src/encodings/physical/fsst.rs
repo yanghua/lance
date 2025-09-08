@@ -17,7 +17,7 @@
 
 use lance_core::{Error, Result};
 use snafu::location;
-
+use tracing::instrument;
 use crate::{
     buffer::LanceBuffer,
     compression::{MiniBlockDecompressor, VariablePerValueDecompressor},
@@ -196,6 +196,7 @@ impl FsstPerValueDecompressor {
 }
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    #[instrument(name = "FsstPerValueDecompressor#decompress", level = "debug", skip_all)]
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
         let compressed_variable_data = self

@@ -26,7 +26,7 @@ use lance_core::{Error, Result};
 use snafu::location;
 
 use std::str::FromStr;
-
+use tracing::instrument;
 use crate::format::pb21::{self, CompressiveEncoding};
 use crate::format::ProtobufUtils21;
 use crate::{
@@ -186,6 +186,7 @@ mod zstd {
             }
         }
 
+        #[instrument(name = "ZstdBufferCompressor#decompress_length_prefixed_zstd", level = "debug", skip_all)]
         fn decompress_length_prefixed_zstd(
             &self,
             input_buf: &[u8],
@@ -218,6 +219,7 @@ mod zstd {
             }
         }
 
+        #[instrument(name = "ZstdBufferCompressor#decompress", level = "debug", skip_all)]
         fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             if input_buf.is_empty() {
                 return Ok(());
@@ -445,6 +447,7 @@ impl CompressedBufferEncoder {
         Ok(LanceBuffer::reinterpret_vec(new_offsets))
     }
 
+    #[instrument(name = "CompressedBufferEncoder#per_value_decompress", level = "debug", skip_all)]
     pub fn per_value_decompress<T: ArrowNativeType>(
         &self,
         data: &[u8],
@@ -517,6 +520,7 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    #[instrument(name = "CompressedBufferEncoder#decompress", level = "debug", skip_all)]
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
         let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);

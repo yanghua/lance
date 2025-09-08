@@ -60,6 +60,7 @@ impl AllNullDataBlock {
 
 use std::collections::HashMap;
 use log::debug;
+use tracing::instrument;
 
 // `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
 // `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
@@ -580,6 +581,8 @@ pub struct VariableWidthBlock {
 }
 
 impl VariableWidthBlock {
+
+    #[instrument(name = "VariableWidthBlock#into_arrow", level = "debug", skip_all)]
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         debug!("into_arrow for VariableWidthBlock");
         let data_buffer = self.data.into_buffer();

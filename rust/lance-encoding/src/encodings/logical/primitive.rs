@@ -2559,6 +2559,7 @@ struct VariableFullZipDecodeTask {
 }
 
 impl DecodePageTask for VariableFullZipDecodeTask {
+    #[instrument(name = "VariableFullZipDecodeTask#decode", level = "debug", skip_all)]
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         debug!("----------> Decoding VariableFullZipDecodeTask with {} visible items", self.num_visible_items);
         let block = VariableWidthBlock {
@@ -3048,11 +3049,16 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             debug!("before make_array the decoded data size is : {:?}", decoded.data.data_size());
             use std::mem;
             debug!("The datablock's discriminant: {:?}", mem::discriminant(&decoded.data));
-            let array = make_array(
-                decoded
-                    .data
-                    .into_arrow(self.data_type.clone(), self.should_validate)?,
-            );
+            // let array = make_array(
+            //     decoded
+            //         .data
+            //         .into_arrow(self.data_type.clone(), self.should_validate)?,
+            // );
+            let array = make_array_from_decoded_data(
+                decoded.data,
+                self.data_type.clone(),
+                self.should_validate,
+            )?;
             debug!("After make_array the memory size: {} bytes， data size: {}",
                 array.get_array_memory_size(), array.to_data().get_array_memory_size());
 
@@ -3070,6 +3076,19 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
 
         Ok(DecodedArray { array, repdef })
     }
+}
+
+#[instrument(name = "make_array_from_decoded_data", level = "debug", skip_all)]
+fn make_array_from_decoded_data(
+    decoded_data: DataBlock,
+    data_type: DataType,
+    should_validate: bool,
+) -> Result<Arc<dyn Array>> {
+    let array = make_array(
+        decoded_data
+            .into_arrow(data_type, should_validate)?,
+    );
+    Ok(array)
 }
 
 #[derive(Debug)]
