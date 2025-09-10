@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 
 use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
 use arrow_schema::Schema;
@@ -49,6 +50,61 @@ struct MergeState {
     metrics: MergeInsertMetrics,
     /// Whether the dataset uses stable row ids.
     stable_row_ids: bool,
+    /// Set to track processed row IDs to detect duplicates
+    processed_row_ids: HashSet<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{UInt64Array, UInt8Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_merge_state_duplicate_rowid_detection() {
+        // Test that MergeState detects duplicate _rowids and throws an error
+        let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let mut merge_state = MergeState::new(metrics, false);
+        
+        // Create mock arrays for testing
+        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+        
+        // First call should succeed
+        let result1 = merge_state.process_row_action(
+            Action::UpdateAll,
+            0, // row_idx
+            &row_addr_array,
+            &row_id_array,
+        );
+        assert!(result1.is_ok(), "First call should succeed");
+        
+        // Second call with the same _rowid should fail
+        let result2 = merge_state.process_row_action(
+            Action::UpdateAll,
+            1, // row_idx (different index, same _rowid)
+            &row_addr_array,
+            &row_id_array,
+        );
+        assert!(result2.is_err(), "Second call with duplicate _rowid should fail");
+        
+        let error_msg = result2.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Ambiguous merge insert") && error_msg.contains("multiple source rows"),
+            "Error message should mention ambiguous merge insert and multiple source rows, got: {}",
+            error_msg
+        );
+        
+        // Third call with different _rowid should succeed
+        let result3 = merge_state.process_row_action(
+            Action::UpdateAll,
+            2, // row_idx
+            &row_addr_array,
+            &row_id_array,
+        );
+        assert!(result3.is_ok(), "Third call with different _rowid should succeed");
+    }
 }
 
 impl MergeState {
@@ -58,6 +114,7 @@ impl MergeState {
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(stable_row_ids))),
             metrics,
             stable_row_ids,
+            processed_row_ids: HashSet::new(),
         }
     }
 
@@ -83,13 +140,26 @@ impl MergeState {
                 // Update action - delete old row AND insert new data
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+                    
+                    // Check for duplicate _rowid in the current merge operation
+                    if !self.processed_row_ids.insert(row_id) {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            format!(
+                                "Ambiguous merge insert: multiple source rows match the same target row with _rowid {}. \
+                                This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
+                                row_id
+                            )
+                        ));
+                    }
+                    
                     self.delete_row_addrs.insert(row_addr);
 
                     if self.stable_row_ids {
                         self.updating_row_ids
                             .lock()
                             .unwrap()
-                            .capture(&[row_id_array.value(row_idx)])?;
+                            .capture(&[row_id])?;
                     }
                     // Don't count as actual delete - this is an update
                 }

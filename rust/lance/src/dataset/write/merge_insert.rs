@@ -4290,4 +4290,62 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_duplicate_rowid_detection() {
+        // This test verifies that merge insert detects and errors on duplicate _rowids
+        // which can occur when multiple source rows match the same target row
+        
+        let test_uri = "memory://test_duplicate_rowid.lance";
+        
+        // Create initial dataset with some data using lance_datagen
+        let dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::step_custom::<UInt32Type>(10, 10))
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount(1),
+                FragmentRowCount(3),
+                Some(WriteParams::default()),
+            )
+            .await
+            .unwrap();
+        
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        
+        // Create source data that has multiple rows with the same key
+        // This will cause multiple source rows to match the same target row (key=1)
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 1, 4])), // Two rows with key=1, one with key=4
+                Arc::new(UInt32Array::from(vec![100, 200, 400])),
+            ],
+        )
+        .unwrap();
+        
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        
+        let reader = Box::new(RecordBatchIterator::new([Ok(source_batch)], schema.clone()));
+        let stream = reader_to_stream(reader);
+        
+        // Execute the merge insert and expect it to fail with duplicate _rowid error
+        let result = job.execute(stream).await;
+        
+        assert!(result.is_err(), "Expected merge insert to fail due to duplicate _rowids");
+        
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Ambiguous merge insert") && error_msg.contains("multiple source rows"),
+            "Expected error message to mention ambiguous merge insert and multiple source rows, got: {}",
+            error_msg
+        );
+    }
 }
