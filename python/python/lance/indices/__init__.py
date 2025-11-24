@@ -13,3 +13,9 @@ __all__ = ["IndicesBuilder", "IndexConfig", "PqModel", "IvfModel", "IndexFileVer
 class IndexFileVersion(str, Enum):
     LEGACY = "Legacy"
     V3 = "V3"
+
+
+class SupportedDistributedIndices(str, Enum):
+    VECTOR = "VECTOR"
+    BTREE = "BTREE"
+    INVERTED = "INVERTED"

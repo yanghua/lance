@@ -15,7 +15,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.indices import IndexConfig
+from lance.indices import IndexConfig, SupportedDistributedIndices
 from lance.query import (
     BooleanQuery,
     BoostQuery,
@@ -138,7 +138,9 @@ def btree_comparison_datasets(tmp_path):
         )
 
     # Merge fragment indices
-    fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
+    fragment_ds.merge_index_metadata(
+        fragment_index_id, index_type=SupportedDistributedIndices.BTREE
+    )
 
     # Create Index object for fragment-based index
     from lance.dataset import Index
@@ -2286,7 +2288,9 @@ def build_distributed_fts_index(
         )
 
     # Merge the inverted index metadata
-    dataset.merge_index_metadata(index_id, index_type="INVERTED")
+    dataset.merge_index_metadata(
+        index_id, index_type=SupportedDistributedIndices.INVERTED
+    )
 
     # Create Index object for commit
     field_id = dataset.schema.get_field_index(column)
@@ -3157,7 +3161,7 @@ def test_distribute_fts_index_build(tmp_path):
         print(f"Fragment {fragment_id} index created successfully")
 
     # Merge the inverted index metadata
-    ds.merge_index_metadata(index_id, index_type="INVERTED")
+    ds.merge_index_metadata(index_id, index_type=SupportedDistributedIndices.INVERTED)
 
     # Create an Index object using the new dataclass format
     from lance.dataset import Index
@@ -3349,7 +3353,7 @@ def test_distribute_btree_index_build(tmp_path):
     assert results.num_rows == 1, f"No results found for id = {test_id}"
 
     # Merge the B-tree index metadata
-    ds.merge_index_metadata(index_id, index_type="BTREE")
+    ds.merge_index_metadata(index_id, index_type=SupportedDistributedIndices.BTREE)
 
     # Create an Index object using the new dataclass format
     from lance.dataset import Index

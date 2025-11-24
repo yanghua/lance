@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig
+from .indices import IndexConfig, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -88,11 +88,6 @@ if TYPE_CHECKING:
         Iterable[float],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
-
-# Unified index type constants
-INDEX_TYPE_VECTOR = "VECTOR"
-INDEX_TYPE_BTREE = "BTREE"
-INDEX_TYPE_INVERTED = "INVERTED"
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -3148,7 +3143,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid : str
             The shared UUID used when building fragment-level indices.
         index_type : str
-            One of "VECTOR", "BTREE", or "INVERTED" (case-insensitive).
+            One of enum defined in SupportedDistributedIndices.
         index_name : str, optional
             The logical name of the index. Defaults to "<column>_idx" if not provided.
         column : str, optional
@@ -3164,11 +3159,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         # Normalize type
         t = index_type.upper()
-        valid = {INDEX_TYPE_VECTOR, INDEX_TYPE_BTREE, INDEX_TYPE_INVERTED}
+
+        valid = {member.name for member in SupportedDistributedIndices}
         if t not in valid:
             raise NotImplementedError(
-                f'Only "VECTOR", "BTREE" or "INVERTED" are supported, '
-                f"received {index_type}"
+                f"Only {', '.join(sorted(valid))} are supported, received {index_type}"
             )
 
         # Merge physical index files at the index directory
@@ -3176,11 +3171,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Resolve target column (if not provided) based on type heuristics
         if column is None:
-            if t == INDEX_TYPE_VECTOR:
+            if t == SupportedDistributedIndices.VECTOR:
                 raise ValueError(
                     (
-                        "'column' is required when committing a VECTOR index "
-                        "to avoid ambiguity."
+                        f"'column' is required when committing a "
+                        f"{SupportedDistributedIndices.VECTOR} index "
+                        f"to avoid ambiguity."
                     )
                 )
             else:
@@ -3189,7 +3185,7 @@ class LanceDataset(pa.dataset.Dataset):
                     ft = field.type
                     if hasattr(ft, "storage_type"):
                         ft = ft.storage_type
-                    if t == INDEX_TYPE_BTREE:
+                    if t == SupportedDistributedIndices.BTREE:
                         if (
                             pa.types.is_integer(ft)
                             or pa.types.is_floating(ft)
@@ -3200,7 +3196,7 @@ class LanceDataset(pa.dataset.Dataset):
                         ) and not pa.types.is_list(ft):
                             column = field.name
                             break
-                    elif t == INDEX_TYPE_INVERTED:
+                    elif t == SupportedDistributedIndices.INVERTED:
                         value_type = ft
                         if pa.types.is_list(ft) or pa.types.is_large_list(ft):
                             value_type = ft.value_type

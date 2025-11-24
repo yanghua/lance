@@ -15,7 +15,7 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
-from lance.indices import IndexFileVersion
+from lance.indices import IndexFileVersion, SupportedDistributedIndices
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
@@ -1861,7 +1861,9 @@ def build_distributed_vector_index(
         )
 
     # Merge physical index metadata and commit manifest for VECTOR
-    dataset.merge_index_metadata(shared_uuid, "VECTOR", column=column)
+    dataset.merge_index_metadata(
+        shared_uuid, SupportedDistributedIndices.VECTOR, column=column
+    )
     return dataset
 
 
@@ -2203,7 +2205,9 @@ def test_metadata_merge_pq_success(tmp_path):
             num_sub_vectors=16,
             ivf_centroids=centroids,
         )
-        ds.merge_index_metadata(shared_uuid, "VECTOR", column="vector")
+        ds.merge_index_metadata(
+            shared_uuid, SupportedDistributedIndices.VECTOR, column="vector"
+        )
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
         assert 0 < len(results) <= 10
@@ -2287,7 +2291,9 @@ def test_distributed_workflow_merge_and_search(tmp_path):
             num_sub_vectors=4,
             ivf_centroids=centroids,
         )
-        ds.merge_index_metadata(shared_uuid, "VECTOR", column="vector")
+        ds.merge_index_metadata(
+            shared_uuid, SupportedDistributedIndices.VECTOR, column="vector"
+        )
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
         assert 0 < len(results) <= 10
@@ -2321,7 +2327,9 @@ def test_vector_merge_two_shards_success_flat(tmp_path):
         num_partitions=4,
         num_sub_vectors=128,
     )
-    ds.merge_index_metadata(shared_uuid, "VECTOR", column="vector")
+    ds.merge_index_metadata(
+        shared_uuid, SupportedDistributedIndices.VECTOR, column="vector"
+    )
     q = np.random.rand(128).astype(np.float32)
     result = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(result) <= 5
@@ -2355,7 +2363,9 @@ def test_distributed_ivf_hnsw_pq_success(tmp_path):
             num_sub_vectors=4,
             ivf_centroids=centroids,
         )
-        ds.merge_index_metadata(shared_uuid, "VECTOR", column="vector")
+        ds.merge_index_metadata(
+            shared_uuid, SupportedDistributedIndices.VECTOR, column="vector"
+        )
         q = np.random.rand(128).astype(np.float32)
         results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
         assert 0 < len(results) <= 10
@@ -2390,7 +2400,9 @@ def test_distributed_ivf_hnsw_flat_success(tmp_path):
         num_partitions=4,
         num_sub_vectors=128,
     )
-    ds.merge_index_metadata(shared_uuid, "VECTOR", column="vector")
+    ds.merge_index_metadata(
+        shared_uuid, SupportedDistributedIndices.VECTOR, column="vector"
+    )
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
     assert 0 < len(results) <= 10
