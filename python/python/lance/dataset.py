@@ -2816,19 +2816,6 @@ class LanceDataset(pa.dataset.Dataset):
         # Early detection and gating: Torch detected ⇒ enforce single-node
         # & skip distributed keys. Also normalize index_file_version for
         # downstream accelerator behavior.
-        idx_ver_obj = kwargs.get("index_file_version")
-        idx_ver_str = None
-        try:
-            if isinstance(idx_ver_obj, str):
-                idx_ver_str = idx_ver_obj
-            elif hasattr(idx_ver_obj, "value"):
-                idx_ver_str = str(idx_ver_obj.value)
-            elif hasattr(idx_ver_obj, "name"):
-                idx_ver_str = str(idx_ver_obj.name)
-            else:
-                idx_ver_str = str(idx_ver_obj)
-        except Exception:
-            idx_ver_str = None
         # NOTE: Do not pass any distributed-related params when torch is involved
         torch_detected_early = accelerator is not None
         if torch_detected_early:
