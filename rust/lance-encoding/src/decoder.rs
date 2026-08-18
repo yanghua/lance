@@ -1125,6 +1125,68 @@ impl DecodeBatchScheduler {
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
     ) -> Result<Self> {
+        Self::try_new_internal(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            _decoder_plugins,
+            io,
+            cache,
+            None,
+            filter,
+            decoder_config,
+        )
+        .await
+    }
+
+    /// Creates a decode scheduler while limiting structural page initialization
+    /// to pages that overlap `requested_ranges`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_new_with_ranges<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
+        decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        requested_ranges: &[Range<u64>],
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+    ) -> Result<Self> {
+        Self::try_new_internal(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            decoder_plugins,
+            io,
+            cache,
+            Some(requested_ranges),
+            filter,
+            decoder_config,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_new_internal<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
+        _decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        requested_ranges: Option<&[Range<u64>]>,
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+    ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
             positions_and_sizes: file_buffer_positions_and_sizes,
@@ -1149,7 +1211,13 @@ impl DecodeBatchScheduler {
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
-            root_scheduler.initialize(filter, &context).await?;
+            if let Some(requested_ranges) = requested_ranges {
+                root_scheduler
+                    .initialize_ranges(requested_ranges, filter, &context)
+                    .await?;
+            } else {
+                root_scheduler.initialize(filter, &context).await?;
+            }
 
             Ok(Self {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
@@ -2067,6 +2135,13 @@ impl RequestedRows {
         }
         self
     }
+
+    fn to_ranges(&self) -> Vec<Range<u64>> {
+        match self {
+            Self::Ranges(ranges) => ranges.clone(),
+            Self::Indices(indices) => DecodeBatchScheduler::indices_to_ranges(indices),
+        }
+    }
 }
 
 /// Configuration for decoder behavior
@@ -2269,19 +2344,39 @@ async fn create_scheduler_decoder(
     // unless that metadata is already in the cache.  This metadata loading
     // happens as part of this call and should be parallelized if reading
     // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
-        target_schema.as_ref(),
-        &column_indices,
-        &column_infos,
-        &vec![],
-        num_rows,
-        config.decoder_plugins,
-        config.io.clone(),
-        config.cache,
-        &filter,
-        &config.decoder_config,
-    )
-    .await?;
+    let use_selective_initialization = !config.decoder_config.cache_repetition_index
+        && matches!(&requested_rows, RequestedRows::Indices(_));
+    let mut decode_scheduler = if use_selective_initialization {
+        let requested_ranges = requested_rows.to_ranges();
+        DecodeBatchScheduler::try_new_with_ranges(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &requested_ranges,
+            &filter,
+            &config.decoder_config,
+        )
+        .await?
+    } else {
+        DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+            &config.decoder_config,
+        )
+        .await?
+    };
 
     // For small requests the scheduling cost is dwarfed by the overhead of
     // spawning a task, so we run scheduling inline (still as part of this
@@ -2409,18 +2504,37 @@ pub fn schedule_and_decode_blocking(
 
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
     // runtime.
-    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new(
-        target_schema.as_ref(),
-        &column_indices,
-        &column_infos,
-        &vec![],
-        num_rows,
-        config.decoder_plugins,
-        config.io.clone(),
-        config.cache,
-        &filter,
-        &config.decoder_config,
-    ))?;
+    let use_selective_initialization = !config.decoder_config.cache_repetition_index
+        && matches!(&requested_rows, RequestedRows::Indices(_));
+    let mut decode_scheduler = if use_selective_initialization {
+        let requested_ranges = requested_rows.to_ranges();
+        WAITER_RT.block_on(DecodeBatchScheduler::try_new_with_ranges(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &requested_ranges,
+            &filter,
+            &config.decoder_config,
+        ))?
+    } else {
+        WAITER_RT.block_on(DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+            &config.decoder_config,
+        ))?
+    };
 
     // Schedule the requested rows
     match requested_rows {
@@ -2768,6 +2882,19 @@ pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Initializes metadata for only the pages needed by `requested_ranges`.
+    ///
+    /// Implementations that cannot safely map ranges to pages retain the eager
+    /// behavior by default.
+    fn initialize_ranges<'a>(
+        &'a mut self,
+        _requested_ranges: &'a [Range<u64>],
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.initialize(filter, context)
+    }
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],

@@ -496,6 +496,7 @@ async fn test_decode(
     expected: Option<Arc<dyn Array>>,
     io: Arc<dyn EncodingsIo>,
     is_structural_encoding: bool,
+    requested_ranges: Option<Vec<Range<u64>>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
@@ -506,19 +507,39 @@ async fn test_decode(
         128 * 1024 * 1024,
     ));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
-    let decode_scheduler = DecodeBatchScheduler::try_new(
-        &lance_schema,
-        &column_indices,
-        column_infos,
-        &Vec::new(),
-        num_rows,
-        Arc::<DecoderPlugins>::default(),
-        io,
-        cache,
-        &FilterExpression::no_filter(),
-        &DecoderConfig::default(),
-    )
-    .await
+    let file_buffers = Vec::new();
+    let filter = FilterExpression::no_filter();
+    let decoder_config = DecoderConfig::default();
+    let decode_scheduler = if let Some(requested_ranges) = requested_ranges.as_deref() {
+        DecodeBatchScheduler::try_new_with_ranges(
+            &lance_schema,
+            &column_indices,
+            column_infos,
+            &file_buffers,
+            num_rows,
+            Arc::<DecoderPlugins>::default(),
+            io,
+            cache,
+            requested_ranges,
+            &filter,
+            &decoder_config,
+        )
+        .await
+    } else {
+        DecodeBatchScheduler::try_new(
+            &lance_schema,
+            &column_indices,
+            column_infos,
+            &file_buffers,
+            num_rows,
+            Arc::<DecoderPlugins>::default(),
+            io,
+            cache,
+            &filter,
+            &decoder_config,
+        )
+        .await
+    }
     .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -1329,6 +1350,7 @@ async fn check_round_trip_encoding_inner(
         expected_data.clone(),
         scheduler_copy.clone(),
         is_structural_encoding,
+        None,
         |mut decode_scheduler, tx| {
             async move {
                 decode_scheduler.schedule_range(
@@ -1360,6 +1382,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            Some(vec![range.clone()]),
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_range(
@@ -1416,6 +1439,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            Some(indices.iter().map(|&index| index..index + 1).collect()),
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_take(

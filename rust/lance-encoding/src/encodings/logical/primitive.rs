@@ -115,6 +115,11 @@ struct PageLoadTask {
 /// A trait for figuring out how to schedule the data within
 /// a single page.
 trait StructuralPageScheduler: std::fmt::Debug + Send {
+    /// Whether initialization creates no reusable state for this scheduler.
+    fn initialization_is_stateless(&self) -> bool {
+        false
+    }
+
     /// Fetches any metadata required for the page
     fn initialize<'a>(
         &'a mut self,
@@ -1825,6 +1830,10 @@ impl DecodePageTask for DecodeComplexAllNullTask {
 pub struct SimpleAllNullScheduler {}
 
 impl StructuralPageScheduler for SimpleAllNullScheduler {
+    fn initialization_is_stateless(&self) -> bool {
+        true
+    }
+
     fn initialize<'a>(
         &'a mut self,
         _io: &Arc<dyn EncodingsIo>,
@@ -3213,6 +3222,10 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
+    fn initialization_is_stateless(&self) -> bool {
+        !self.enable_cache || self.rep_index.is_none()
+    }
+
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
@@ -4028,6 +4041,27 @@ pub struct StructuralPrimitiveFieldScheduler {
 }
 
 impl StructuralPrimitiveFieldScheduler {
+    fn pages_overlapping_ranges(&self, ranges: &[Range<u64>]) -> Vec<usize> {
+        let mut overlapping = Vec::new();
+        let mut range_idx = 0;
+        let mut page_start = 0_u64;
+
+        for (page_idx, page) in self.page_schedulers.iter().enumerate() {
+            let page_end = page_start + page.num_rows;
+            while range_idx < ranges.len() && ranges[range_idx].end <= page_start {
+                range_idx += 1;
+            }
+            if range_idx == ranges.len() {
+                break;
+            }
+            if ranges[range_idx].start < page_end && ranges[range_idx].end > page_start {
+                overlapping.push(page_idx);
+            }
+            page_start = page_end;
+        }
+        overlapping
+    }
+
     pub fn try_new(
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
@@ -4284,6 +4318,54 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
             let page_data = page_data.try_collect::<Vec<_>>().await?;
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
             cache.insert_with_key(&cache_key, cached_data).await;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn initialize_ranges<'a>(
+        &'a mut self,
+        requested_ranges: &'a [Range<u64>],
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        let overlapping_pages = self.pages_overlapping_ranges(requested_ranges);
+        if overlapping_pages.len() == self.page_schedulers.len() {
+            return self.initialize(filter, context);
+        }
+        if overlapping_pages.iter().any(|page_idx| {
+            !self.page_schedulers[*page_idx]
+                .scheduler
+                .initialization_is_stateless()
+        }) {
+            return self.initialize(filter, context);
+        }
+
+        let cache_key = FieldDataCacheKey {
+            column_index: self.column_index,
+            view_tag: self.view_tag.clone(),
+        };
+        let cache = context.cache().clone();
+
+        async move {
+            if let Some(cached_data) = cache.get_with_key(&cache_key).await {
+                self.page_schedulers
+                    .iter_mut()
+                    .zip(cached_data.pages.iter())
+                    .for_each(|(page_scheduler, cached_data)| {
+                        page_scheduler.scheduler.load(cached_data);
+                    });
+                return Ok(());
+            }
+
+            let page_data = self
+                .page_schedulers
+                .iter_mut()
+                .enumerate()
+                .filter(|(page_idx, _)| overlapping_pages.binary_search(page_idx).is_ok())
+                .map(|(_, page)| page.scheduler.initialize(context.io()))
+                .collect::<FuturesOrdered<_>>();
+            page_data.try_collect::<Vec<_>>().await?;
             Ok(())
         }
         .boxed()
@@ -7002,8 +7084,9 @@ mod tests {
         FullZipCacheableState, FullZipDecodeDetails, FullZipDecodeTaskItem, FullZipReadSource,
         FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
         MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, MiniblockChunkSize,
-        PerValueDataBlock, PerValueDecompressor, PreambleAction, RunEndsBuilder, RunPosition,
-        RunStorage, StructuralPageScheduler, VariableFullZipDecoder, dense_levels_from_block,
+        NoCachedPageData, PageInfoAndScheduler, PerValueDataBlock, PerValueDecompressor,
+        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler,
+        StructuralPrimitiveFieldScheduler, VariableFullZipDecoder, dense_levels_from_block,
         validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
@@ -7016,7 +7099,10 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::{PageEncoding, StructuralFieldDecoder};
+    use crate::decoder::{
+        FilterExpression, PageEncoding, SchedulerContext, StructuralFieldDecoder,
+        StructuralFieldScheduler,
+    };
     use crate::encodings::logical::primitive::fullzip::PerValueCompressor;
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, LoadedChunk, PrimitiveStructuralEncoder,
@@ -7036,8 +7122,84 @@ mod tests {
     };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
+    use futures::{FutureExt, future::BoxFuture};
+    use lance_core::Result;
     use std::collections::HashMap;
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        ops::Range,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug)]
+    struct CountingStatelessScheduler(Arc<AtomicUsize>);
+
+    impl StructuralPageScheduler for CountingStatelessScheduler {
+        fn initialization_is_stateless(&self) -> bool {
+            true
+        }
+
+        fn initialize<'a>(
+            &'a mut self,
+            _io: &Arc<dyn crate::EncodingsIo>,
+        ) -> BoxFuture<'a, Result<Arc<dyn super::CachedPageData>>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(
+                Arc::new(NoCachedPageData) as Arc<dyn super::CachedPageData>
+            ))
+            .boxed()
+        }
+
+        fn load(&mut self, _data: &Arc<dyn super::CachedPageData>) {}
+
+        fn schedule_ranges(
+            &self,
+            _ranges: &[Range<u64>],
+            _io: &Arc<dyn crate::EncodingsIo>,
+        ) -> Result<Vec<super::PageLoadTask>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_initialization_only_initializes_overlapping_pages() {
+        let counters = (0..4)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let mut scheduler = StructuralPrimitiveFieldScheduler {
+            page_schedulers: [10, 10, 10, 10]
+                .into_iter()
+                .enumerate()
+                .map(|(page_index, num_rows)| PageInfoAndScheduler {
+                    page_index,
+                    num_rows,
+                    scheduler: Box::new(CountingStatelessScheduler(counters[page_index].clone())),
+                })
+                .collect(),
+            column_index: 0,
+            view_tag: "test".to_string(),
+        };
+
+        let io = Arc::new(crate::BufferScheduler::new(bytes::Bytes::new()))
+            as Arc<dyn crate::EncodingsIo>;
+        let cache = Arc::new(lance_core::cache::LanceCache::no_cache());
+        let context = SchedulerContext::new(io, cache);
+        scheduler
+            .initialize_ranges(&[11..12, 25..26], &FilterExpression::no_filter(), &context)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            counters
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 0]
+        );
+    }
 
     #[test]
     fn test_is_narrow() {

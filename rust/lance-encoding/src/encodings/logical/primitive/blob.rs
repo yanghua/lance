@@ -65,6 +65,10 @@ impl BlobDescriptionPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobDescriptionPageScheduler {
+    fn initialization_is_stateless(&self) -> bool {
+        self.inner_scheduler.initialization_is_stateless()
+    }
+
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,

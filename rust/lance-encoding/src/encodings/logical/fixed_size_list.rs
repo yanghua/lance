@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
 
@@ -149,6 +149,46 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
         self.child.initialize(filter, context)
+    }
+
+    fn initialize_ranges<'a>(
+        &'a mut self,
+        requested_ranges: &'a [Range<u64>],
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        let child_ranges = requested_ranges
+            .iter()
+            .map(|range| {
+                let start = range.start.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Fixed-size-list range start overflow: {} * {}",
+                            range.start, self.dimension
+                        )
+                        .into(),
+                    )
+                })?;
+                let end = range.end.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Fixed-size-list range end overflow: {} * {}",
+                            range.end, self.dimension
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok(start..end)
+            })
+            .collect::<Result<Vec<_>>>();
+
+        async move {
+            let child_ranges = child_ranges?;
+            self.child
+                .initialize_ranges(&child_ranges, filter, context)
+                .await
+        }
+        .boxed()
     }
 }
 
