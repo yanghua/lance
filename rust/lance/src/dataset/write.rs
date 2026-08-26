@@ -1324,15 +1324,18 @@ pub async fn write_fragments_internal(
     validate_external_blob_write_params(&params)?;
     let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
-    // If clustering is requested (explicitly or via the dataset's declared
-    // spec), sort the incoming data by the clustering-key space-filling curve
-    // before writing so each fragment is value-coherent across the key columns.
-    let data = match resolve_clustering_spec(&params, dataset)? {
-        Some(spec) => lance_index::clustering::cluster_sort_stream(data, &spec).await?,
+    // If clustering is requested (via `params.cluster_by`), sort the incoming
+    // data by the clustering-key space-filling curve before writing so each
+    // fragment is value-coherent across the key columns. Callers decide when to
+    // set this: user writes inherit the dataset's declared spec (see
+    // `InsertBuilder`), and compaction sets it only for `CompactionMode::Cluster`.
+    let clustering_spec = params.cluster_by.clone();
+    let data = match &clustering_spec {
+        Some(spec) => lance_index::clustering::cluster_sort_stream(data, spec).await?,
         None => data,
     };
 
-    versions::write_fragments(
+    let (mut fragments, out_schema) = versions::write_fragments(
         storage_version,
         dataset,
         object_store,
@@ -1342,14 +1345,27 @@ pub async fn write_fragments_internal(
         params,
         target_bases_info,
     )
-    .await
+    .await?;
+
+    // Stamp the clustering version so a later optimize can tell these fragments
+    // are already clustered under the current layout and skip re-clustering them.
+    if let Some(spec) = &clustering_spec {
+        for fragment in &mut fragments {
+            fragment.clustering_version = Some(spec.version);
+        }
+    }
+
+    Ok((fragments, out_schema))
 }
 
-/// Resolve the clustering spec that governs a write: an explicit
+/// Resolve the clustering spec that governs a user write: an explicit
 /// [`WriteParams::cluster_by`] takes precedence, otherwise (on create/append)
 /// the dataset's declared spec is used. Overwrites do not inherit the existing
 /// dataset's spec, matching the general overwrite semantics of replacing state.
-fn resolve_clustering_spec(
+///
+/// Compaction does not go through this: it sets `cluster_by` directly only for
+/// [`CompactionMode::Cluster`](crate::dataset::optimize::CompactionMode::Cluster).
+pub(crate) fn resolve_clustering_spec(
     params: &WriteParams,
     dataset: Option<&Dataset>,
 ) -> Result<Option<ClusteringSpec>> {
@@ -4108,6 +4124,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(0),
             created_at_version_meta: None,
+            clustering_version: None,
             last_updated_at_version_meta: None,
         }];
 
@@ -4189,6 +4206,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(0),
             created_at_version_meta: None,
+            clustering_version: None,
             last_updated_at_version_meta: None,
         }];
 
@@ -4853,6 +4871,15 @@ mod tests {
         assert!(
             seen.windows(2).all(|w| w[0] <= w[1]),
             "clustered write must lay out rows sorted by the clustering key"
+        );
+
+        // Written fragments carry the clustering-version stamp.
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|f| f.clustering_version == Some(1)),
+            "clustered write must stamp fragments with the clustering version"
         );
     }
 

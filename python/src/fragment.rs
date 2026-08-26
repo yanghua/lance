@@ -828,6 +828,7 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             files,
             deletion_file,
             physical_rows: ob.getattr("physical_rows")?.extract()?,
+            clustering_version: None,
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,

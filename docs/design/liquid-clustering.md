@@ -179,8 +179,10 @@ fragments are already clustered under the current spec. Options, in preference o
 - (B) Infer from zonemap zone overlap on the key columns (highly overlapping zones ⇒ poorly
   clustered). No format change, but heuristic and more expensive.
 
-We propose (A), adding an optional fragment property; this is additive to fragment metadata and does
-not alter any stable file format.
+We chose (A) *(implemented)*: a new optional `DataFragment.clustering_version` proto field
+(number 12, `0` = unset), surfaced as `Fragment::clustering_version: Option<u64>`. It is additive
+and does not alter any stable file-format contract — old readers ignore it, and fragments written
+before clustering was declared simply read back as `None`.
 
 ## 6. Write path
 
@@ -209,10 +211,9 @@ Behavior when `cluster_by` is `Some`:
    (`write.rs:656`), so a fresh clustered write also produces prunable stats without a separate
    index build. *(Not yet wired: seeds are still driven by existing zonemap indices; auto-seeding
    from the clustering spec is Phase 4.)*
-4. **Stamp** each new fragment with the current clustering version (§5, option A). *(Deferred to
-   Phase 3: the only consumer of the stamp is the recluster planner, and stamping needs a new
-   optional `DataFragment` proto field. Adding that on-disk surface is deferred to where its reader
-   exists rather than shipping an unread field now.)*
+4. **Stamp** each new fragment with the current clustering version (§5, option A). *(Implemented in
+   Phase 3: `write_fragments_internal` sets `Fragment::clustering_version` from the resolved spec,
+   backed by the new optional `DataFragment.clustering_version` proto field.)*
 
 Connectors keep their current role: Spark's `RequiresDistributionAndOrdering` can still pre-sort at
 the engine for scale; the core sort is the correctness backstop when the engine does not.
@@ -221,35 +222,37 @@ the engine for scale; the core sort is the correctness backstop when the engine 
 
 This is the part that must live in core because `compact_files` deliberately does not reorder.
 
-**Reorder-enabled rewrite.** Add a clustering mode so the rewrite path sorts by the clustering key
-instead of reading in insertion order:
+**Reorder-enabled rewrite. (implemented)** `CompactionMode::Cluster` makes the rewrite path re-sort
+each task's rows by the clustering key instead of preserving insertion order: `rewrite_files` sets
+`params.cluster_by` from the dataset's spec, so `write_fragments_internal` runs `cluster_sort_stream`
+before writing and stamps the output fragments with the current clustering version. Binary copy is
+disabled for `Cluster` mode. Output still respects `target_rows_per_fragment` / `max_bytes_per_file`.
 
-- Add `CompactionMode::Cluster` (extending the enum at `optimize.rs:142`), or a dedicated
-  `recluster` entry point. When active, `rewrite_files` (`optimize.rs:2160`) sorts the merged input
-  stream by the encoded clustering value rather than using `scan_in_order(true)`
-  (`optimize.rs:1906`), and seeds zonemaps on output.
-- Output still respects `target_rows_per_fragment` / `max_bytes_per_file`, so files stay
-  right-sized (`optimize.rs:2272`).
+**Incremental planner. (implemented)** `ClusteringCompactionPlanner` behind the pluggable
+`CompactionPlanner` trait selects *under-clustered* fragments — those whose
+`Fragment::clustering_version` is absent or below the dataset's current
+`ClusteringSpec::version` — groups adjacent ones up to `target_rows_per_fragment`, and honors the
+existing `max_source_fragments` / `max_source_rows` / `max_source_bytes` budgets so a large table
+converges over successive `optimize` runs rather than one full rewrite. An already-clustered
+fragment breaks adjacency so it is left untouched, and a second run at the same version is a no-op.
 
-**Incremental planner.** Implement a `ClusteringCompactionPlanner` behind the existing pluggable
-`CompactionPlanner` trait (`optimize.rs:698`). It:
+*Not yet done:* pulling in overlapping already-clustered fragments so new data merges into the
+right place (the planner currently only reclusters under-clustered fragments among themselves), and
+per-task combined-key-range grouping. These refine clustering quality and are follow-ups.
 
-1. Selects under-clustered fragments (version marker from §5), plus optionally a bounded set of
-   already-clustered fragments whose key ranges overlap them (so the new data merges into the right
-   place rather than forming an isolated clustered island).
-2. Respects the existing per-run budgets already on `CompactionOptions`
-   (`max_source_fragments` / `max_source_rows` / `max_source_bytes`) for incrementality.
-3. Groups selected fragments into tasks whose combined key range is compact, then rewrites each
-   task through the reorder path.
+**Changing keys without full rewrite.** Bumping the clustering version marks all existing fragments
+as under-clustered *lazily*; they are re-clustered opportunistically over subsequent `OPTIMIZE`
+runs within budget, never in one forced pass. Old data stays readable throughout. (Note the §5
+caveat: the immutable schema marker means the *column set* cannot change today, only the tuning
+version.)
 
-**Changing keys without full rewrite.** Bumping `lance.clustering.version` marks all existing
-fragments as under-clustered *lazily*; they are re-clustered opportunistically over subsequent
-`OPTIMIZE` runs within budget, never in one forced pass. Old data stays readable throughout.
-
-**Interaction with existing compaction machinery.** Re-clustering rewrites fragments, so it flows
-through the same fragment-reuse-index / row-address remapping the current compaction already handles
-(`optimize.rs:2191`+). No new remap semantics; stable row ids and index remapping behave as they do
-for ordinary compaction.
+**Interaction with existing compaction machinery. (partial)** Ordinary compaction preserves row
+order, so its positional old→new row mapping (for index remap and stable-row-id rechunk) holds.
+Reclustering *reorders* rows, which breaks that positional assumption. Rather than silently
+corrupt row ids or a secondary index, `rewrite_files` currently **rejects** `Cluster` mode on
+datasets that use stable row ids or carry a remappable secondary index (drop the index, recluster,
+rebuild). Carrying row identity through the sort and rebuilding the mapping from the sorted order
+is the follow-up that lifts this restriction.
 
 ## 8. Read path
 
@@ -303,13 +306,17 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
 - **Phase 1 — encoder. (implemented)** General multi-column Z-order + Hilbert `SpaceFillingEncoder`
   in `lance-index::clustering`, with tests (order preservation, Hilbert adjacency, null handling,
   mixed types, bit-budget validation).
-- **Phase 2 — write-side clustering. (implemented, partial)** `WriteParams.cluster_by` sorts the
+- **Phase 2 — write-side clustering. (implemented)** `WriteParams.cluster_by` sorts the
   write stream by the space-filling curve (`cluster_sort_stream`), resolving the spec from the
-  dataset on create/append. Inline zonemap seeding from the spec and the per-fragment version stamp
-  are deferred (see §6 notes) to Phase 3/4 where their consumers exist.
-- **Phase 3 — incremental recluster.** `ClusteringCompactionPlanner` + reorder-enabled
-  `rewrite_files` (`CompactionMode::Cluster`), reusing per-run budgets. Adds the per-fragment
-  clustering-version stamp (new optional `DataFragment` field) consumed here.
+  dataset on create/append and stamping written fragments with the clustering version. Inline
+  zonemap seeding from the spec is deferred to Phase 4.
+- **Phase 3 — incremental recluster. (implemented, partial)** `CompactionMode::Cluster` reorders a
+  task's rows by the clustering key in `rewrite_files`; `ClusteringCompactionPlanner` selects
+  under-clustered fragments and honors the per-run source budgets; the per-fragment
+  `clustering_version` stamp (new optional `DataFragment` field) is written and consumed here.
+  Deferred: reclustering on datasets with stable row ids or a remappable index (currently rejected
+  to avoid corrupting the positional row mapping), and pulling in overlapping already-clustered
+  fragments for better merge quality.
 - **Phase 4 — bindings & connectors.** Python/Java wrappers; Spark `CLUSTER BY` + `OPTIMIZE`
   integration; auto zonemap declaration.
 - **Phase 5 — docs & benchmarks.** Data-skipping recall vs unclustered baseline; write/optimize

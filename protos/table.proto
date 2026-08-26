@@ -393,6 +393,13 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // The clustering layout version this fragment's data was written under, if
+  // it was written by a clustering-aware writer (see the `lance.clustering.*`
+  // dataset config). A fragment whose stamp is absent (0) or lower than the
+  // dataset's current clustering version is "under-clustered" and is a
+  // candidate for re-clustering during optimize. Zero means unset.
+  uint64 clustering_version = 12;
 }
 
 message DataFile {

@@ -1541,6 +1541,7 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
+                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
             Fragment {
@@ -1554,6 +1555,7 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
+                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
         ];
@@ -1586,6 +1588,7 @@ mod tests {
             row_id_meta: None,
             physical_rows: None,
             created_at_version_meta: None,
+            clustering_version: None,
             last_updated_at_version_meta: None,
         };
         fragment.overlays = vec![DataOverlayFile {

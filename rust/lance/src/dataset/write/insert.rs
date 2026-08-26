@@ -204,6 +204,15 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
+        // Resolve the clustering spec for this user write: an explicit
+        // `cluster_by` wins, else create/append inherits the dataset's declared
+        // spec. Set it on params so `write_fragments_internal` sorts and stamps.
+        // (Compaction sets `cluster_by` itself and does not pass through here.)
+        if context.params.cluster_by.is_none() {
+            context.params.cluster_by =
+                super::resolve_clustering_spec(&context.params, context.dest.dataset())?;
+        }
+
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
             &mut context.params,

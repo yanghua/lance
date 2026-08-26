@@ -146,6 +146,12 @@ pub enum CompactionMode {
     TryBinaryCopy,
     /// Use binary copy or fail if fragments are not compatible.
     ForceBinaryCopy,
+    /// Decode and re-encode data, re-sorting the combined rows of each task by
+    /// the dataset's clustering-key space-filling curve ("liquid clustering").
+    /// The dataset must have a clustering spec declared (see
+    /// [`Dataset::set_clustering`](crate::Dataset::set_clustering)). Incompatible
+    /// with binary copy.
+    Cluster,
 }
 
 impl TryFrom<&str> for CompactionMode {
@@ -156,8 +162,9 @@ impl TryFrom<&str> for CompactionMode {
             "reencode" => Ok(Self::Reencode),
             "try_binary_copy" => Ok(Self::TryBinaryCopy),
             "force_binary_copy" => Ok(Self::ForceBinaryCopy),
+            "cluster" => Ok(Self::Cluster),
             _ => Err(Error::invalid_input(format!(
-                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
+                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\", \"cluster\"",
                 value
             ))),
         }
@@ -590,8 +597,14 @@ pub(super) async fn can_use_binary_copy_current(
     use lance_file::reader::FileReader as LFReader;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-    if matches!(options.compaction_mode(), CompactionMode::Reencode) {
-        log::debug!("Binary copy disabled: compaction mode is Reencode");
+    if matches!(
+        options.compaction_mode(),
+        CompactionMode::Reencode | CompactionMode::Cluster
+    ) {
+        log::debug!(
+            "Binary copy disabled: compaction mode {:?} always re-encodes",
+            options.compaction_mode()
+        );
         return Ok(false);
     }
 
@@ -884,6 +897,101 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         compaction_plan.extend_tasks(tasks);
 
+        Ok(compaction_plan)
+    }
+}
+
+/// A compaction planner that selects under-clustered fragments for
+/// re-clustering.
+///
+/// A fragment is *under-clustered* when its recorded
+/// [`clustering_version`](lance_table::format::Fragment::clustering_version) is
+/// absent or lower than the dataset's current
+/// [`ClusteringSpec::version`](lance_index::clustering::ClusteringSpec::version)
+/// — i.e. it was written before clustering was declared, or before the layout
+/// was last changed. Selected fragments are grouped, oldest position first, and
+/// emitted as [`CompactionMode::Cluster`] tasks so [`rewrite_files`] re-sorts
+/// them by the clustering key.
+///
+/// The existing per-run budgets on [`CompactionOptions`]
+/// (`max_source_fragments` / `max_source_rows` / `max_source_bytes`) bound how
+/// much is reclustered per run, so a large table converges incrementally over
+/// successive `optimize` calls rather than in one full-table rewrite.
+///
+/// This planner always plans in `Cluster` mode regardless of the incoming
+/// `compaction_mode`, and requires the dataset to have a clustering spec.
+#[derive(Debug, Clone)]
+pub struct ClusteringCompactionPlanner {
+    options: CompactionOptions,
+}
+
+impl ClusteringCompactionPlanner {
+    pub fn new(mut options: CompactionOptions) -> Result<Self> {
+        options.compaction_mode = Some(CompactionMode::Cluster);
+        options.validate()?;
+        Ok(Self { options })
+    }
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for ClusteringCompactionPlanner {
+    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        let Some(spec) = dataset.clustering_spec()? else {
+            return Err(Error::invalid_input(
+                "ClusteringCompactionPlanner requires a clustering spec on the dataset; \
+                 declare one with Dataset::set_clustering first",
+            ));
+        };
+        let current_version = spec.version;
+
+        // A fragment needs reclustering when it was written under an older
+        // clustering version (or none at all).
+        let fragments = dataset.get_fragments();
+        debug_assert!(
+            fragments.windows(2).all(|w| w[0].id() < w[1].id()),
+            "fragments in manifest are not sorted"
+        );
+
+        // Group adjacent under-clustered fragments into tasks up to the target
+        // fragment size, so each rewritten fragment is well sized while a
+        // clustered fragment already at the current version is left untouched.
+        let mut all_tasks: Vec<(TaskData, usize)> = Vec::new();
+        let mut current: Vec<Fragment> = Vec::new();
+        let mut current_rows = 0usize;
+
+        let flush = |group: &mut Vec<Fragment>, tasks: &mut Vec<(TaskData, usize)>| {
+            if !group.is_empty() {
+                let fragments = std::mem::take(group);
+                let live_rows: usize = fragments.iter().map(|f| f.num_rows().unwrap_or(0)).sum();
+                tasks.push((TaskData { fragments }, live_rows));
+            }
+        };
+
+        for fragment in fragments {
+            let stamped = fragment.metadata.clustering_version;
+            let under_clustered = stamped.is_none_or(|v| v < current_version);
+            if !under_clustered {
+                // An already-clustered fragment breaks adjacency so we never
+                // merge across it unnecessarily.
+                flush(&mut current, &mut all_tasks);
+                current_rows = 0;
+                continue;
+            }
+            let rows = fragment.metadata.num_rows().unwrap_or(0);
+            current.push(fragment.metadata.clone());
+            current_rows += rows;
+            if current_rows >= self.options.target_rows_per_fragment {
+                flush(&mut current, &mut all_tasks);
+                current_rows = 0;
+            }
+        }
+        flush(&mut current, &mut all_tasks);
+
+        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+
+        let mut compaction_plan =
+            CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        compaction_plan.extend_tasks(tasks);
         Ok(compaction_plan)
     }
 }
@@ -2286,6 +2394,45 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
+    // In Cluster mode, re-sort the task's combined rows by the dataset's
+    // clustering-key space-filling curve and stamp the output fragments with the
+    // current clustering version. Setting `cluster_by` drives both in
+    // `write_fragments_internal`.
+    //
+    // Reordering rows breaks the *positional* old->new row mapping that both the
+    // index-remap path and the stable-row-id rechunk path assume (they pair a
+    // sorted/insertion-ordered old sequence with positionally-assigned new
+    // addresses). Correctly reclustering those cases means carrying row identity
+    // through the sort and rebuilding the mapping from the sorted order, which is
+    // a follow-up. For now reject the combinations that would otherwise silently
+    // corrupt row ids or a secondary index.
+    if matches!(mode, CompactionMode::Cluster) {
+        let Some(spec) = dataset.clustering_spec()? else {
+            return Err(Error::invalid_input(
+                "compaction mode \"cluster\" requires a clustering spec on the dataset; \
+                 declare one with Dataset::set_clustering before reclustering",
+            ));
+        };
+        if dataset.manifest.uses_stable_row_ids() {
+            return Err(Error::not_supported(
+                "reclustering (compaction mode \"cluster\") is not yet supported on datasets \
+                 with stable row ids: reordering rows would invalidate the positional row-id \
+                 sequence rechunk",
+            ));
+        }
+        if load_indices_for_remapping(dataset.as_ref())
+            .await?
+            .is_some()
+        {
+            return Err(Error::not_supported(
+                "reclustering (compaction mode \"cluster\") is not yet supported on datasets \
+                 with a remappable secondary index: reordering rows would invalidate the \
+                 positional row-address remap. Drop the index, recluster, then rebuild it",
+            ));
+        }
+        params.cluster_by = Some(spec);
+    }
+
     if can_binary_copy {
         let version = dataset.manifest.data_storage_format.lance_file_format();
         new_fragments = versions::rewrite_files_binary_copy(
@@ -2900,6 +3047,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -2947,6 +3095,7 @@ mod tests {
                     deletion_file: None,
                     row_id_meta: None,
                     physical_rows: Some(0),
+                    clustering_version: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                 },
@@ -9782,5 +9931,159 @@ mod tests {
         scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+    }
+
+    #[tokio::test]
+    async fn test_recluster_sorts_and_stamps_and_planner_selects_under_clustered() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        // Build a dataset of shuffled keys across several small fragments, with
+        // no clustering declared yet -> fragments carry no clustering stamp.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let make = |vals: Vec<i32>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vals))])
+                    .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        // Two fragments, deliberately unsorted and interleaved across fragments.
+        let write_params = WriteParams {
+            max_rows_per_file: 500,
+            ..Default::default()
+        };
+        let shuffled: Vec<i32> = (0..1000).map(|i| (i * 37 + 11) % 1000).collect();
+        let mut dataset = Dataset::write(make(shuffled), test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.fragments().len() >= 2);
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|f| f.clustering_version.is_none()),
+            "fragments written before clustering was declared carry no stamp"
+        );
+
+        // Declare clustering. The planner must now see every existing fragment
+        // as under-clustered.
+        let spec =
+            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::Hilbert, 1, 32).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(
+            plan.tasks().len(),
+            1,
+            "all under-clustered frags in one task"
+        );
+
+        compact_files_with_planner(&mut dataset, None, &planner)
+            .await
+            .unwrap();
+
+        // Every row survives, globally sorted by the clustering key, and every
+        // resulting fragment is stamped at the current clustering version.
+        let batches = dataset
+            .scan()
+            .project(&["k"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for b in &batches {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            seen.extend((0..a.len()).map(|i| a.value(i)));
+        }
+        assert_eq!(seen, (0..1000).collect::<Vec<_>>());
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|f| f.clustering_version == Some(1)),
+            "reclustered fragments must be stamped at the current version"
+        );
+
+        // A second recluster at the same version is a no-op: nothing is
+        // under-clustered anymore.
+        let plan2 = planner.plan(&dataset).await.unwrap();
+        assert_eq!(
+            plan2.tasks().len(),
+            0,
+            "no under-clustered fragments remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_respects_source_fragment_budget() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let make = |vals: Vec<i32>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vals))])
+                    .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+        let test_dir = TempStrDir::default();
+        // 4 fragments of 250 rows each.
+        let mut dataset = Dataset::write(
+            make((0..1000).rev().collect()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 250,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 4);
+
+        let spec =
+            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        // Keep each task to one source fragment, and cap the run at two source
+        // fragments: only two fragments should be planned for reclustering.
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1, // force one fragment per task
+            max_source_fragments: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+        let planned_frags: usize = plan.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(
+            planned_frags, 2,
+            "budget caps reclustering to two fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recluster_rejected_without_spec() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![3, 1, 2]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let test_dir = TempStrDir::default();
+        let dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions::default()).unwrap();
+        let err = planner.plan(&dataset).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
     }
 }

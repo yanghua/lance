@@ -1789,6 +1789,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -1847,6 +1848,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
         };
@@ -1904,6 +1906,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
         };
@@ -1961,6 +1964,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: Some(version_meta.clone()),
             created_at_version_meta: Some(version_meta),
         };
@@ -2011,6 +2015,7 @@ mod tests {
                 deletion_file: None,
                 row_id_meta,
                 physical_rows: Some(5),
+                clustering_version: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
             }
@@ -2211,6 +2216,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -2286,6 +2292,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: row_id_meta.clone(),
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: Some(meta_v1.clone()),
             created_at_version_meta: None,
         };
@@ -2306,6 +2313,7 @@ mod tests {
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: Some(meta_v1),
             created_at_version_meta: None,
         };
@@ -2360,6 +2368,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(5),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -2429,6 +2438,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0).into())),
             physical_rows: Some(3),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -2452,6 +2462,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
             physical_rows: Some(4),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };

@@ -635,6 +635,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
+            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }
