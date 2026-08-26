@@ -197,15 +197,22 @@ pub struct WriteParams {
 
 Behavior when `cluster_by` is `Some`:
 
-1. **Resolve** the spec: explicit `WriteParams.cluster_by`, else the dataset's persisted
-   `lance.clustering.*` config (append inherits the table's declared keys).
-2. **Sort** each write's batch stream by the encoded clustering value. For the streaming writer this
-   is a sort within the write unit; global ordering across concurrent writers is not guaranteed
+1. **Resolve** the spec: explicit `WriteParams.cluster_by`, else (on create/append) the dataset's
+   declared spec via `Dataset::clustering_spec()`. Overwrites do not inherit the existing spec.
+   *(Implemented: `resolve_clustering_spec` in `write.rs`.)*
+2. **Sort** the write's batch stream by the encoded clustering value before fragments are written.
+   *(Implemented: `lance_index::clustering::cluster_sort_stream`, a `SortExec` over a hidden
+   `FixedSizeBinary` ordering column, spilling to disk for large inputs.)* For the streaming writer
+   this is a sort within the write unit; global ordering across concurrent writers is not guaranteed
    (that is what re-clustering converges).
 3. **Seed zonemaps** on the key columns inline via the existing `IndexSeedWriter` path
    (`write.rs:656`), so a fresh clustered write also produces prunable stats without a separate
-   index build.
-4. **Stamp** each new fragment with the current clustering version (§5, option A).
+   index build. *(Not yet wired: seeds are still driven by existing zonemap indices; auto-seeding
+   from the clustering spec is Phase 4.)*
+4. **Stamp** each new fragment with the current clustering version (§5, option A). *(Deferred to
+   Phase 3: the only consumer of the stamp is the recluster planner, and stamping needs a new
+   optional `DataFragment` proto field. Adding that on-disk surface is deferred to where its reader
+   exists rather than shipping an unread field now.)*
 
 Connectors keep their current role: Spark's `RequiresDistributionAndOrdering` can still pre-sort at
 the engine for scale; the core sort is the correctness backstop when the engine does not.
@@ -296,10 +303,13 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
 - **Phase 1 — encoder. (implemented)** General multi-column Z-order + Hilbert `SpaceFillingEncoder`
   in `lance-index::clustering`, with tests (order preservation, Hilbert adjacency, null handling,
   mixed types, bit-budget validation).
-- **Phase 2 — write-side clustering.** `WriteParams.cluster_by` sorts + seeds zonemaps + stamps
-  version.
+- **Phase 2 — write-side clustering. (implemented, partial)** `WriteParams.cluster_by` sorts the
+  write stream by the space-filling curve (`cluster_sort_stream`), resolving the spec from the
+  dataset on create/append. Inline zonemap seeding from the spec and the per-fragment version stamp
+  are deferred (see §6 notes) to Phase 3/4 where their consumers exist.
 - **Phase 3 — incremental recluster.** `ClusteringCompactionPlanner` + reorder-enabled
-  `rewrite_files` (`CompactionMode::Cluster`), reusing per-run budgets.
+  `rewrite_files` (`CompactionMode::Cluster`), reusing per-run budgets. Adds the per-fragment
+  clustering-version stamp (new optional `DataFragment` field) consumed here.
 - **Phase 4 — bindings & connectors.** Python/Java wrappers; Spark `CLUSTER BY` + `OPTIMIZE`
   integration; auto zonemap declaration.
 - **Phase 5 — docs & benchmarks.** Data-skipping recall vs unclustered baseline; write/optimize

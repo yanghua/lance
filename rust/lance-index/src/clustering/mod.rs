@@ -48,6 +48,9 @@ use arrow_schema::DataType;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+mod sort;
+pub use sort::cluster_sort_stream;
+
 /// Config key holding the space-filling curve name (`hilbert` or `zorder`).
 pub const CLUSTERING_CURVE_KEY: &str = "lance.clustering.curve";
 /// Config key holding the clustering version, bumped whenever the curve
@@ -271,7 +274,7 @@ impl SpaceFillingEncoder {
     }
 
     /// Number of bytes in each encoded ordering value for the given column count.
-    fn output_width(&self, num_columns: usize) -> usize {
+    pub fn output_width(&self, num_columns: usize) -> usize {
         let total_bits = num_columns * self.bits_per_dim as usize;
         total_bits.div_ceil(8)
     }

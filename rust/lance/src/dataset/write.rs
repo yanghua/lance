@@ -22,6 +22,7 @@ use lance_file::versions::v1::writer::{
     FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
 };
 use lance_file::writer::{self as current_writer};
+use lance_index::clustering::ClusteringSpec;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
@@ -411,6 +412,19 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
+
+    /// If set, incoming data is sorted by the clustering-key space-filling
+    /// curve value before fragments are written, producing value-coherent
+    /// fragments ("liquid clustering"). When `None`, the write preserves input
+    /// order as before.
+    ///
+    /// On append this is normally left `None` and resolved from the dataset's
+    /// declared clustering spec (see [`Dataset::set_clustering`]); set it
+    /// explicitly to cluster a write that has no dataset context or to override
+    /// the declared spec.
+    ///
+    /// [`Dataset::set_clustering`]: crate::Dataset::set_clustering
+    pub cluster_by: Option<ClusteringSpec>,
 }
 
 impl Default for WriteParams {
@@ -441,6 +455,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
+            cluster_by: None,
         }
     }
 }
@@ -1309,6 +1324,14 @@ pub async fn write_fragments_internal(
     validate_external_blob_write_params(&params)?;
     let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
+    // If clustering is requested (explicitly or via the dataset's declared
+    // spec), sort the incoming data by the clustering-key space-filling curve
+    // before writing so each fragment is value-coherent across the key columns.
+    let data = match resolve_clustering_spec(&params, dataset)? {
+        Some(spec) => lance_index::clustering::cluster_sort_stream(data, &spec).await?,
+        None => data,
+    };
+
     versions::write_fragments(
         storage_version,
         dataset,
@@ -1320,6 +1343,25 @@ pub async fn write_fragments_internal(
         target_bases_info,
     )
     .await
+}
+
+/// Resolve the clustering spec that governs a write: an explicit
+/// [`WriteParams::cluster_by`] takes precedence, otherwise (on create/append)
+/// the dataset's declared spec is used. Overwrites do not inherit the existing
+/// dataset's spec, matching the general overwrite semantics of replacing state.
+fn resolve_clustering_spec(
+    params: &WriteParams,
+    dataset: Option<&Dataset>,
+) -> Result<Option<ClusteringSpec>> {
+    if let Some(spec) = &params.cluster_by {
+        return Ok(Some(spec.clone()));
+    }
+    if matches!(params.mode, WriteMode::Append | WriteMode::Create)
+        && let Some(dataset) = dataset
+    {
+        return dataset.clustering_spec();
+    }
+    Ok(None)
 }
 
 pub(super) fn prepare_write_schema(
@@ -4752,6 +4794,128 @@ mod tests {
             covered_writers.len(),
             baseline.len(),
             "a covered index must still produce a seed writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_by_reorders_write() {
+        use crate::Dataset;
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        // Two batches whose key column is shuffled. A single fragment written
+        // with a clustering spec must come out sorted by the key.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("k", DataType::Int32, false),
+        ]));
+        let ids: Vec<i32> = (0..1000).collect();
+        let keys: Vec<i32> = (0..1000).map(|i| (i * 7 + 13) % 1000).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(keys)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let uri = lance_core::utils::tempfile::TempStrDir::default();
+        let params = WriteParams {
+            cluster_by: Some(
+                ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, uri.as_str(), Some(params))
+            .await
+            .unwrap();
+
+        // Read the key column back in storage order and confirm it is sorted.
+        let batches = dataset
+            .scan()
+            .project(&["k"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for b in &batches {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            seen.extend((0..a.len()).map(|i| a.value(i)));
+        }
+        assert_eq!(seen.len(), 1000);
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "clustered write must lay out rows sorted by the clustering key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_by_from_dataset_spec_on_append() {
+        use crate::Dataset;
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "k",
+            DataType::Int32,
+            false,
+        )]));
+        let make = |vals: Vec<i32>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vals))])
+                    .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+
+        let uri = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = Dataset::write(make((0..100).collect()), uri.as_str(), None)
+            .await
+            .unwrap();
+
+        // Declare clustering, then append shuffled data with default params: the
+        // write path must pick up the declared spec and sort the new fragment.
+        let spec =
+            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        let shuffled: Vec<i32> = (0..500).map(|i| (i * 13 + 7) % 500).collect();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(make(shuffled), uri.as_str(), Some(append_params))
+            .await
+            .unwrap();
+
+        // The last fragment (the appended one) must be internally sorted by k.
+        let last = dataset.fragments().last().unwrap().id as usize;
+        let batches = dataset
+            .scan()
+            .project(&["k"])
+            .unwrap()
+            .with_fragments(vec![dataset.get_fragment(last).unwrap().metadata().clone()])
+            .scan_in_order(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for b in &batches {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            seen.extend((0..a.len()).map(|i| a.value(i)));
+        }
+        assert_eq!(seen.len(), 500);
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "append must inherit the dataset's declared clustering spec"
         );
     }
 }
