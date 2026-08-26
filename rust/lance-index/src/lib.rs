@@ -25,6 +25,8 @@ pub mod scalar;
 pub mod traits;
 pub mod vector;
 
+pub mod clustering;
+
 pub use crate::traits::*;
 
 // Re-export core traits from lance-index-core

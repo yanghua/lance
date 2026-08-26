@@ -3966,6 +3966,45 @@ impl Dataset {
         Ok(())
     }
 
+    /// Declare or replace the clustering spec for this dataset.
+    ///
+    /// The spec is stored in the dataset config as `lance.clustering.*` keys via
+    /// the ordinary config-update path, so this is a cheap metadata-only commit
+    /// that never rewrites data. Bump [`ClusteringSpec::version`] when changing
+    /// the key set or curve so already-written fragments are recognized as
+    /// under-clustered and re-clustered opportunistically by `OPTIMIZE`.
+    ///
+    /// The clustering columns must exist in the current schema.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::clustering::{ClusteringSpec, ClusteringCurve};
+    /// # async fn test_set_clustering(dataset: &mut Dataset) -> Result<()> {
+    /// let spec = ClusteringSpec::new(vec!["x".into(), "y".into()], ClusteringCurve::Hilbert)?;
+    /// dataset.set_clustering(&spec).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_clustering(
+        &mut self,
+        spec: &lance_index::clustering::ClusteringSpec,
+    ) -> Result<()> {
+        metadata::set_clustering(self, spec).await
+    }
+
+    /// Read the clustering spec declared on this dataset, if any.
+    pub fn clustering_spec(&self) -> Result<Option<lance_index::clustering::ClusteringSpec>> {
+        metadata::clustering_spec(self)
+    }
+
+    /// Remove the clustering declaration from this dataset.
+    ///
+    /// Existing data keeps its physical layout; only the declaration is dropped,
+    /// so future writes and compactions no longer cluster.
+    pub async fn clear_clustering(&mut self) -> Result<()> {
+        metadata::clear_clustering(self).await
+    }
+
     /// Update field metadata
     ///
     /// ```

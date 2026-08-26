@@ -10,6 +10,7 @@ use crate::Result;
 use futures::future::BoxFuture;
 use lance_core::datatypes::FieldRef;
 use lance_core::datatypes::Schema;
+use lance_index::clustering::ClusteringSpec;
 
 /// Execute a metadata update operation on a dataset.
 /// This is moved from Dataset::update_op to keep metadata logic in this module.
@@ -175,6 +176,93 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
     }
 }
 
+/// Declare the clustering spec on a dataset.
+///
+/// The clustering *columns* are persisted as per-field schema markers (reusing
+/// the existing unenforced-clustering-key mechanism), and the tuning parameters
+/// (curve, version, bit width) are written to the dataset config. Both go
+/// through the ordinary metadata-update path, so this never rewrites data.
+///
+/// The clustering columns are validated against the current schema. Because the
+/// clustering-key markers are immutable once set, declaring a *different* column
+/// set on an already-clustered dataset is rejected; changing the tuning
+/// parameters (e.g. bumping the version to force a recluster) is always allowed.
+pub async fn set_clustering(dataset: &mut Dataset, spec: &ClusteringSpec) -> Result<()> {
+    use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+    for column in &spec.columns {
+        if dataset.schema().field(column).is_none() {
+            return Err(crate::Error::invalid_input(format!(
+                "clustering column {column:?} does not exist in the dataset schema"
+            )));
+        }
+    }
+
+    let existing: Vec<String> = dataset
+        .schema()
+        .unenforced_clustering_key()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+
+    if existing.is_empty() {
+        // Install the clustering-key markers, one per column, 1-based position.
+        let mut builder = dataset.update_field_metadata();
+        for (idx, column) in spec.columns.iter().enumerate() {
+            builder = builder.update(
+                column.as_str(),
+                [(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
+                    (idx + 1).to_string(),
+                )],
+            )?;
+        }
+        builder.await?;
+    } else if existing != spec.columns {
+        return Err(crate::Error::invalid_input(format!(
+            "clustering columns are already set to {existing:?} and cannot be changed to \
+             {:?}; the clustering key is immutable once declared",
+            spec.columns
+        )));
+    }
+
+    // Tuning parameters live in config and are always updatable.
+    let updates = spec
+        .to_config()
+        .into_iter()
+        .map(|(k, v)| (k, Some(v)))
+        .collect::<Vec<_>>();
+    dataset.update_config(updates).await?;
+    Ok(())
+}
+
+/// Read the clustering spec declared on a dataset, if any.
+///
+/// Returns `Ok(None)` when no clustering columns are marked in the schema.
+pub fn clustering_spec(dataset: &Dataset) -> Result<Option<ClusteringSpec>> {
+    let columns: Vec<String> = dataset
+        .schema()
+        .unenforced_clustering_key()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    ClusteringSpec::from_parts(columns, dataset.config())
+}
+
+/// Remove the clustering tuning parameters from a dataset's config.
+///
+/// The clustering-key column markers are immutable and are left in place;
+/// clearing only drops the tuning config so future writes and compactions fall
+/// back to default (unclustered) behavior.
+pub async fn clear_clustering(dataset: &mut Dataset) -> Result<()> {
+    let deletes = ClusteringSpec::config_keys()
+        .into_iter()
+        .map(|k| (k, None))
+        .collect::<Vec<_>>();
+    dataset.update_config(deletes).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -196,7 +284,6 @@ mod tests {
             .col("i", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
         let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
-
         // Insert
         let mut desired_config = dataset.manifest.config.clone();
         desired_config.insert("lance.test".to_string(), "value".to_string());
@@ -876,5 +963,109 @@ mod tests {
             );
             assert!(dataset.schema().unenforced_clustering_key().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_and_read_clustering_spec() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str();
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+
+        assert!(dataset.clustering_spec().unwrap().is_none());
+
+        let spec =
+            ClusteringSpec::with_bits(vec!["x".into(), "y".into()], ClusteringCurve::ZOrder, 1, 20)
+                .unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        // Columns are persisted as schema markers, ordered by position.
+        let ck: Vec<String> = dataset
+            .schema()
+            .unenforced_clustering_key()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(ck, vec!["x".to_string(), "y".to_string()]);
+
+        // Full spec round-trips through schema + config.
+        let read_back = dataset.clustering_spec().unwrap().unwrap();
+        assert_eq!(read_back, spec);
+
+        // Survives reopen.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.clustering_spec().unwrap().unwrap(), spec);
+    }
+
+    #[tokio::test]
+    async fn test_set_clustering_rejects_unknown_column() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let spec = ClusteringSpec::new(vec!["missing".into()], ClusteringCurve::Hilbert).unwrap();
+        let err = dataset.set_clustering(&spec).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(dataset.clustering_spec().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_clustering_bump_version_but_reject_column_change() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let spec = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        // Bumping the version (forcing a recluster) with the same columns is allowed.
+        let bumped =
+            ClusteringSpec::with_bits(vec!["x".into()], ClusteringCurve::Hilbert, 2, 16).unwrap();
+        dataset.set_clustering(&bumped).await.unwrap();
+        assert_eq!(dataset.clustering_spec().unwrap().unwrap().version, 2);
+
+        // Changing the column set is rejected: the clustering key is immutable.
+        let changed =
+            ClusteringSpec::new(vec!["x".into(), "y".into()], ClusteringCurve::Hilbert).unwrap();
+        let err = dataset.set_clustering(&changed).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_clear_clustering_drops_config_keeps_markers() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let spec = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        dataset.clear_clustering().await.unwrap();
+        // Tuning config is gone, so the spec falls back to defaults over the
+        // still-marked column rather than disappearing entirely.
+        let after = dataset.clustering_spec().unwrap().unwrap();
+        assert_eq!(after.columns, vec!["x".to_string()]);
+        assert_eq!(after.curve, ClusteringCurve::Hilbert);
+        assert_eq!(after.version, 1);
+        assert!(
+            !dataset
+                .config()
+                .contains_key(lance_index::clustering::CLUSTERING_CURVE_KEY)
+        );
     }
 }
