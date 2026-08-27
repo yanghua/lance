@@ -285,12 +285,16 @@ impl PyCompactionTask {
     pub fn execute(&self, dataset: Bound<PyAny>) -> PyResult<PyRewriteResult> {
         let dataset = unwrap_dataset(dataset)?;
         let dataset = dataset.borrow().clone();
-        let result = rt()
-            .block_on(
-                None,
-                async move { self.0.execute(dataset.ds.as_ref()).await },
-            )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let is_clustering = matches!(self.0.options.compaction_mode(), CompactionMode::Cluster);
+        let result = rt().block_on(
+            None,
+            async move { self.0.execute(dataset.ds.as_ref()).await },
+        )?;
+        let result = if is_clustering {
+            result.infer_error()?
+        } else {
+            result.io_error()?
+        };
 
         Ok(PyRewriteResult(result))
     }
@@ -508,11 +512,15 @@ impl PyCompaction {
         let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
+        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
-        let metrics = rt().block_on(None, async move {
-            fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
-        })??;
+        let result = rt().block_on(None, fut)?;
+        let metrics = if is_clustering {
+            result.infer_error()?
+        } else {
+            result.io_error()?
+        };
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         Ok(metrics.into())
     }
@@ -542,11 +550,15 @@ impl PyCompaction {
         let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
         let opts = parse_compaction_options(options, &config)?;
-        let plan = rt()
-            .block_on(None, async move {
-                plan_compaction(dataset.ds.as_ref(), &opts).await
-            })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
+        let result = rt().block_on(None, async move {
+            plan_compaction(dataset.ds.as_ref(), &opts).await
+        })?;
+        let plan = if is_clustering {
+            result.infer_error()?
+        } else {
+            result.io_error()?
+        };
         Ok(PyCompactionPlan(plan))
     }
 
@@ -585,6 +597,7 @@ impl PyCompaction {
             Some(ref dict) => parse_compaction_options(dict, &config)?,
             None => CompactionOptions::default(),
         };
+        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = commit_compaction(
@@ -593,9 +606,12 @@ impl PyCompaction {
             Arc::new(DatasetIndexRemapperOptions::default()),
             &opts,
         );
-        let metrics = rt()
-            .block_on(None, fut)?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let result = rt().block_on(None, fut)?;
+        let metrics = if is_clustering {
+            result.infer_error()?
+        } else {
+            result.io_error()?
+        };
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         Ok(metrics.into())
     }

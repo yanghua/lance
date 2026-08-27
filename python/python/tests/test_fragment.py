@@ -145,6 +145,71 @@ def test_write_fragments(tmp_path: Path):
     assert progress.complete_called == 2
 
 
+def test_write_fragments_cluster_by(tmp_path: Path):
+    dataset_uri = tmp_path / "dataset"
+    keys = [((i * 7 + 13) % 100) * 2_000_000 for i in range(100)]
+    data = pa.table({"k": pa.array(keys, pa.int32())})
+
+    fragments = write_fragments(
+        data,
+        dataset_uri,
+        mode="create",
+        cluster_by=["k"],
+    )
+    assert all(fragment.clustering_version is None for fragment in fragments)
+
+    dataset = LanceDataset.commit(
+        dataset_uri, LanceOperation.Overwrite(data.schema, fragments)
+    )
+    assert dataset.to_table()["k"].to_pylist() == sorted(keys)
+
+
+@pytest.mark.parametrize("return_transaction", [False, True])
+def test_write_fragments_cluster_by_stamps_declared_version(
+    tmp_path: Path, return_transaction: bool
+):
+    dataset_uri = tmp_path / "dataset"
+    data = pa.table({"k": pa.array([6_000_000, 2_000_000, 4_000_000], pa.int32())})
+    dataset = lance.write_dataset([], dataset_uri, schema=data.schema)
+    dataset.set_clustering(["k"])
+
+    result = write_fragments(
+        data,
+        dataset,
+        return_transaction=return_transaction,
+        cluster_by=["k"],
+    )
+    if return_transaction:
+        transaction = result
+    else:
+        transaction = lance.Transaction(
+            read_version=dataset.version,
+            operation=LanceOperation.Append(result),
+        )
+
+    assert all(
+        fragment.clustering_version == 1 for fragment in transaction.operation.fragments
+    )
+
+    dataset = LanceDataset.commit(dataset, transaction)
+    assert dataset.to_table()["k"].to_pylist() == [2_000_000, 4_000_000, 6_000_000]
+
+    committed = dataset.read_transaction(dataset.version)
+    assert all(
+        fragment.clustering_version == 1 for fragment in committed.operation.fragments
+    )
+
+
+def test_write_fragments_cluster_by_rejects_unknown_column(tmp_path: Path):
+    with pytest.raises(ValueError, match="not present"):
+        write_fragments(
+            pa.table({"k": [1, 2, 3]}),
+            tmp_path,
+            mode="create",
+            cluster_by=["missing"],
+        )
+
+
 def test_write_fragments_schema_holes(tmp_path: Path):
     # Create table with 3 cols
     data = pa.table({"a": range(3)})
@@ -268,6 +333,7 @@ def test_fragment_meta():
     meta = FragmentMetadata.from_json(json.dumps(data))
 
     assert meta.id == 0
+    assert meta.clustering_version is None
     assert len(meta.files) == 2
     with pytest.warns(DeprecationWarning):
         assert meta.files[0].path() == "0.lance"
@@ -279,7 +345,8 @@ def test_fragment_meta():
         "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
         "physical_rows=100, deletion_file=None, row_id_meta=None, "
-        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[])"
+        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[], "
+        "clustering_version=None)"
     )
 
 
@@ -481,6 +548,14 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     assert frag_meta.physical_rows == json_round_trip.physical_rows
     if enable_stable_row_ids:
         assert json_round_trip.row_id_meta is not None
+
+
+def test_fragment_metadata_clustering_version_json_round_trip():
+    metadata = FragmentMetadata(id=1, files=[], physical_rows=0, clustering_version=7)
+
+    json_data = metadata.to_json()
+    assert json_data["clustering_version"] == 7
+    assert FragmentMetadata.from_json(json.dumps(json_data)) == metadata
 
 
 def test_deletion_file_with_base_id_serialization():

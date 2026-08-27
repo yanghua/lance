@@ -53,6 +53,7 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    cluster_by_columns: Option<Vec<String>>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -61,6 +62,7 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            cluster_by_columns: None,
         }
     }
 
@@ -78,6 +80,16 @@ impl<'a> InsertBuilder<'a> {
     /// This overrides any `write_progress` set in [`WriteParams`].
     pub fn progress(mut self, callback: impl Fn(WriteStats) + Send + Sync + 'static) -> Self {
         self.write_progress = Some(WriteProgressFn::new(callback));
+        self
+    }
+
+    /// Cluster this write by a list of columns.
+    ///
+    /// If the destination has an active declaration with the same columns,
+    /// that declaration supplies the authoritative curve, version, and bit
+    /// width. Otherwise this performs a one-shot sort with default tuning.
+    pub fn with_cluster_by_columns(mut self, columns: Vec<String>) -> Self {
+        self.cluster_by_columns = Some(columns);
         self
     }
 
@@ -204,14 +216,22 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
-        // Resolve the clustering spec for this user write: an explicit
-        // `cluster_by` wins, else create/append inherits the dataset's declared
-        // spec. Set it on params so `write_fragments_internal` sorts and stamps.
+        // Resolve the clustering spec for this user write. This also validates
+        // that an explicit append spec matches an active dataset declaration.
         // (Compaction sets `cluster_by` itself and does not pass through here.)
-        if context.params.cluster_by.is_none() {
-            context.params.cluster_by =
-                super::resolve_clustering_spec(&context.params, context.dest.dataset())?;
-        }
+        context.params.cluster_by = if let Some(columns) = &self.cluster_by_columns {
+            if context.params.cluster_by.is_some() {
+                return Err(Error::invalid_input(
+                    "cannot set both WriteParams::cluster_by and InsertBuilder::with_cluster_by_columns",
+                ));
+            }
+            Some(super::resolve_clustering_columns(
+                columns,
+                context.dest.dataset(),
+            )?)
+        } else {
+            super::resolve_clustering_spec(&context.params, context.dest.dataset())?
+        };
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
@@ -310,6 +330,16 @@ impl<'a> InsertBuilder<'a> {
                 context.params.mode = WriteMode::Create;
             }
             _ => {}
+        }
+
+        if matches!(context.params.mode, WriteMode::Overwrite)
+            && let WriteDestination::Dataset(dataset) = &context.dest
+        {
+            crate::dataset::schema_evolution::validate_active_clustering_schema(
+                dataset,
+                data_schema,
+                "overwrite dataset",
+            )?;
         }
 
         // Validate schema

@@ -3890,7 +3890,11 @@ impl Dataset {
     ///
     /// Pass `None` for a value to remove that key.
     ///
-    /// Use `.replace()` to replace the entire config map instead of merging.
+    /// Use `.replace()` to replace the entire config map instead of merging. If
+    /// clustering is declared, call [`Self::clear_clustering`] first because
+    /// replacement cannot implicitly remove reserved clustering configuration.
+    /// Keys in the reserved `lance.clustering.*` namespace must be managed with
+    /// [`Self::set_clustering`] and [`Self::clear_clustering`].
     ///
     /// Returns the updated config map after the operation.
     ///
@@ -3966,15 +3970,17 @@ impl Dataset {
         Ok(())
     }
 
-    /// Declare or replace the clustering spec for this dataset.
+    /// Declare or evolve the clustering spec for this dataset.
     ///
     /// The spec is stored in the dataset config as `lance.clustering.*` keys via
     /// the ordinary config-update path, so this is a cheap metadata-only commit
-    /// that never rewrites data. Bump [`ClusteringSpec::version`] when changing
-    /// the key set or curve so already-written fragments are recognized as
-    /// under-clustered and re-clustered opportunistically by `OPTIMIZE`.
+    /// that never rewrites data. Changing the columns, curve, or bit width
+    /// requires a strictly higher [`ClusteringSpec::version`] so already-written
+    /// fragments are recognized as under-clustered and re-clustered
+    /// opportunistically by `OPTIMIZE`.
     ///
-    /// The clustering columns must exist in the current schema.
+    /// The clustering columns must be supported top-level scalar columns in the
+    /// current schema.
     ///
     /// ```
     /// # use lance::{Dataset, Result};

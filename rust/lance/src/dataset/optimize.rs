@@ -906,12 +906,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 ///
 /// A fragment is *under-clustered* when its recorded
 /// [`clustering_version`](lance_table::format::Fragment::clustering_version) is
-/// absent or lower than the dataset's current
+/// different from the dataset's current
 /// [`ClusteringSpec::version`](lance_index::clustering::ClusteringSpec::version)
-/// — i.e. it was written before clustering was declared, or before the layout
-/// was last changed. Selected fragments are grouped, oldest position first, and
-/// emitted as [`CompactionMode::Cluster`] tasks so [`rewrite_files`] re-sorts
-/// them by the clustering key.
+/// — i.e. it was written before clustering was declared, under an older layout,
+/// or carries an unexpected future version. Selected fragments are grouped,
+/// oldest position first, and emitted as [`CompactionMode::Cluster`] tasks so
+/// [`rewrite_files`] re-sorts them by the clustering key.
 ///
 /// The existing per-run budgets on [`CompactionOptions`]
 /// (`max_source_fragments` / `max_source_rows` / `max_source_bytes`) bound how
@@ -923,13 +923,18 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 #[derive(Debug, Clone)]
 pub struct ClusteringCompactionPlanner {
     options: CompactionOptions,
+    excluded_fragment_ids: RoaringBitmap,
 }
 
 impl ClusteringCompactionPlanner {
     pub fn new(mut options: CompactionOptions) -> Result<Self> {
         options.compaction_mode = Some(CompactionMode::Cluster);
         options.validate()?;
-        Ok(Self { options })
+        let excluded_fragment_ids = options.excluded_fragment_ids.iter().copied().collect();
+        Ok(Self {
+            options,
+            excluded_fragment_ids,
+        })
     }
 }
 
@@ -944,48 +949,214 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
         };
         let current_version = spec.version;
 
-        // A fragment needs reclustering when it was written under an older
-        // clustering version (or none at all).
+        // A fragment needs reclustering unless its stamp exactly matches the
+        // current clustering version. This also repairs unexpected future
+        // stamps instead of silently treating them as current.
         let fragments = dataset.get_fragments();
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
         );
 
+        // Resolve live row counts through FileFragment instead of relying on
+        // optional manifest metadata. Legacy fragments may not record physical
+        // rows or deletion counts, and treating either as zero could make a task
+        // silently exceed max_source_rows. The ordered buffering preserves
+        // adjacency while allowing legacy metadata reads to run concurrently.
+        let has_source_budget = self.options.max_source_fragments.is_some()
+            || self.options.max_source_rows.is_some()
+            || self.options.max_source_bytes.is_some();
+        let metric_concurrency = if has_source_budget {
+            // Incremental planning must not eagerly touch fragments beyond the
+            // selected prefix: an unrelated legacy-metadata failure there must
+            // not prevent this run from making progress.
+            1
+        } else {
+            dataset.object_store.as_ref().io_parallelism()
+        };
+        let candidate_fragments = futures::stream::iter(fragments)
+            .map(|fragment| async {
+                let is_excluded = u32::try_from(fragment.id())
+                    .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id));
+                let stamped = fragment.metadata.clustering_version;
+                let under_clustered = stamped != Some(current_version);
+                if is_excluded || !under_clustered {
+                    Ok(None)
+                } else {
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| Some((fragment.metadata, metrics.num_rows())))
+                }
+            })
+            .buffered(metric_concurrency);
+        futures::pin_mut!(candidate_fragments);
+
         // Group adjacent under-clustered fragments into tasks up to the target
-        // fragment size, so each rewritten fragment is well sized while a
-        // clustered fragment already at the current version is left untouched.
+        // fragment size. Source budgets also bound each group so a natural
+        // target-sized group cannot permanently block an otherwise feasible
+        // incremental run. The final limiter still applies the budgets across
+        // all tasks in the run.
         let mut all_tasks: Vec<(TaskData, usize)> = Vec::new();
         let mut current: Vec<Fragment> = Vec::new();
         let mut current_rows = 0usize;
+        let mut current_bytes = 0u64;
+        let mut selected_fragments = 0usize;
+        let mut selected_rows = 0usize;
+        let mut selected_bytes = 0u64;
+        let source_fragment_limit = self.options.max_source_fragments;
+        let schema_field_ids: HashSet<i32> = if self.options.max_source_bytes.is_some() {
+            dataset.schema().field_ids().into_iter().collect()
+        } else {
+            HashSet::new()
+        };
 
-        let flush = |group: &mut Vec<Fragment>, tasks: &mut Vec<(TaskData, usize)>| {
+        let flush = |group: &mut Vec<Fragment>,
+                     group_rows: &mut usize,
+                     group_bytes: &mut u64,
+                     tasks: &mut Vec<(TaskData, usize)>| {
             if !group.is_empty() {
                 let fragments = std::mem::take(group);
-                let live_rows: usize = fragments.iter().map(|f| f.num_rows().unwrap_or(0)).sum();
-                tasks.push((TaskData { fragments }, live_rows));
+                tasks.push((TaskData { fragments }, *group_rows));
+                *group_rows = 0;
+                *group_bytes = 0;
             }
         };
 
-        for fragment in fragments {
-            let stamped = fragment.metadata.clustering_version;
-            let under_clustered = stamped.is_none_or(|v| v < current_version);
-            if !under_clustered {
-                // An already-clustered fragment breaks adjacency so we never
-                // merge across it unnecessarily.
-                flush(&mut current, &mut all_tasks);
-                current_rows = 0;
-                continue;
+        loop {
+            if source_fragment_limit.is_some_and(|max| selected_fragments >= max) {
+                break;
             }
-            let rows = fragment.metadata.num_rows().unwrap_or(0);
-            current.push(fragment.metadata.clone());
-            current_rows += rows;
-            if current_rows >= self.options.target_rows_per_fragment {
-                flush(&mut current, &mut all_tasks);
-                current_rows = 0;
+            let Some(candidate) = candidate_fragments.next().await else {
+                break;
+            };
+            let Some((fragment, rows)) = candidate? else {
+                // Already-clustered and explicitly excluded fragments both
+                // break adjacency. In particular, never combine candidates on
+                // opposite sides of an excluded fragment.
+                flush(
+                    &mut current,
+                    &mut current_rows,
+                    &mut current_bytes,
+                    &mut all_tasks,
+                );
+                continue;
+            };
+            let bytes = if self.options.max_source_bytes.is_some() {
+                fragment_source_bytes(&fragment, &schema_field_ids)?
+            } else {
+                0
+            };
+            let exceeds_run_budget = self
+                .options
+                .max_source_fragments
+                .is_some_and(|max| selected_fragments + 1 > max)
+                || self
+                    .options
+                    .max_source_rows
+                    .is_some_and(|max| selected_rows.saturating_add(rows) > max)
+                || self
+                    .options
+                    .max_source_bytes
+                    .is_some_and(|max| selected_bytes.saturating_add(bytes) > max);
+            if exceeds_run_budget {
+                flush(
+                    &mut current,
+                    &mut current_rows,
+                    &mut current_bytes,
+                    &mut all_tasks,
+                );
+                if selected_fragments == 0 {
+                    warn!(
+                        "Clustering compaction plan is empty: the first candidate fragment \
+                         already exceeds a source budget (max_source_fragments={:?}, \
+                         max_source_rows={:?}, max_source_bytes={:?}); compaction cannot make \
+                         progress until the budget is raised",
+                        self.options.max_source_fragments,
+                        self.options.max_source_rows,
+                        self.options.max_source_bytes
+                    );
+                }
+                break;
+            }
+
+            let would_exceed_source_budget = !current.is_empty()
+                && (self
+                    .options
+                    .max_source_fragments
+                    .is_some_and(|max| current.len() + 1 > max)
+                    || self
+                        .options
+                        .max_source_rows
+                        .is_some_and(|max| current_rows.saturating_add(rows) > max)
+                    || self
+                        .options
+                        .max_source_bytes
+                        .is_some_and(|max| current_bytes.saturating_add(bytes) > max));
+            if would_exceed_source_budget {
+                flush(
+                    &mut current,
+                    &mut current_rows,
+                    &mut current_bytes,
+                    &mut all_tasks,
+                );
+            }
+
+            current.push(fragment);
+            current_rows = current_rows.saturating_add(rows);
+            current_bytes = current_bytes.saturating_add(bytes);
+            selected_fragments += 1;
+            selected_rows = selected_rows.saturating_add(rows);
+            selected_bytes = selected_bytes.saturating_add(bytes);
+
+            let reached_source_budget = self
+                .options
+                .max_source_fragments
+                .is_some_and(|max| current.len() >= max)
+                || self
+                    .options
+                    .max_source_rows
+                    .is_some_and(|max| current_rows >= max)
+                || self
+                    .options
+                    .max_source_bytes
+                    .is_some_and(|max| current_bytes >= max);
+            if current_rows >= self.options.target_rows_per_fragment || reached_source_budget {
+                flush(
+                    &mut current,
+                    &mut current_rows,
+                    &mut current_bytes,
+                    &mut all_tasks,
+                );
+            }
+
+            let reached_run_budget = self
+                .options
+                .max_source_fragments
+                .is_some_and(|max| selected_fragments >= max)
+                || self
+                    .options
+                    .max_source_rows
+                    .is_some_and(|max| selected_rows >= max)
+                || self
+                    .options
+                    .max_source_bytes
+                    .is_some_and(|max| selected_bytes >= max);
+            if reached_run_budget {
+                flush(
+                    &mut current,
+                    &mut current_rows,
+                    &mut current_bytes,
+                    &mut all_tasks,
+                );
+                break;
             }
         }
-        flush(&mut current, &mut all_tasks);
+        flush(
+            &mut current,
+            &mut current_rows,
+            &mut current_bytes,
+            &mut all_tasks,
+        );
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
@@ -1178,24 +1349,31 @@ fn limit_tasks_to_source_budget(
 fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
     let mut total_bytes = 0_u64;
     for fragment in &task.fragments {
-        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
-        for data_file in fragment.files.iter().chain(overlay_files) {
-            if !data_file
-                .fields
-                .iter()
-                .any(|field_id| schema_field_ids.contains(field_id))
-            {
-                continue;
-            }
-            let size = data_file.file_size_bytes.get().ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
-                     in the manifest; unset max_source_bytes to compact this dataset",
-                    data_file.path, fragment.id
-                ))
-            })?;
-            total_bytes = total_bytes.saturating_add(size.get());
+        total_bytes =
+            total_bytes.saturating_add(fragment_source_bytes(fragment, schema_field_ids)?);
+    }
+    Ok(total_bytes)
+}
+
+fn fragment_source_bytes(fragment: &Fragment, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+    let mut total_bytes = 0_u64;
+    let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+    for data_file in fragment.files.iter().chain(overlay_files) {
+        if !data_file
+            .fields
+            .iter()
+            .any(|field_id| schema_field_ids.contains(field_id))
+        {
+            continue;
         }
+        let size = data_file.file_size_bytes.get().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
+                 in the manifest; unset max_source_bytes to compact this dataset",
+                data_file.path, fragment.id
+            ))
+        })?;
+        total_bytes = total_bytes.saturating_add(size.get());
     }
     Ok(total_bytes)
 }
@@ -10036,49 +10214,159 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_recluster_planner_respects_source_fragment_budget() {
+    async fn dataset_for_recluster_planning(
+        test_uri: &str,
+        num_rows: i32,
+        rows_per_fragment: usize,
+    ) -> Dataset {
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        let make = |vals: Vec<i32>| {
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vals))])
-                    .unwrap();
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
-        };
-        let test_dir = TempStrDir::default();
-        // 4 fragments of 250 rows each.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values((0..num_rows).rev()))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(
-            make((0..1000).rev().collect()),
-            &test_dir,
+            reader,
+            test_uri,
             Some(WriteParams {
-                max_rows_per_file: 250,
+                max_rows_per_file: rows_per_fragment,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        assert_eq!(dataset.fragments().len(), 4);
-
         let spec =
             ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
         dataset.set_clustering(&spec).await.unwrap();
+        dataset
+    }
 
-        // Keep each task to one source fragment, and cap the run at two source
-        // fragments: only two fragments should be planned for reclustering.
+    fn planned_fragment_ids(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+        plan.tasks()
+            .iter()
+            .map(|task| task.fragments.iter().map(|fragment| fragment.id).collect())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_treats_excluded_fragments_as_boundaries() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_for_recluster_planning(&test_dir, 1_000, 200).await;
+        assert_eq!(dataset.fragments().len(), 5);
+
         let planner = ClusteringCompactionPlanner::new(CompactionOptions {
-            target_rows_per_fragment: 1, // force one fragment per task
+            target_rows_per_fragment: 1_000,
+            excluded_fragment_ids: vec![2, 2, u32::MAX],
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1], vec![3, 4]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_reclusters_unexpected_future_stamp() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
+        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[0].clustering_version =
+            Some(2);
+        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[1].clustering_version =
+            Some(1);
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_splits_target_group_for_source_fragment_budget() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        assert_eq!(dataset.fragments().len(), 4);
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
             max_source_fragments: Some(2),
             ..Default::default()
         })
         .unwrap();
         let plan = planner.plan(&dataset).await.unwrap();
-        let planned_frags: usize = plan.tasks().iter().map(|t| t.fragments.len()).sum();
-        assert_eq!(
-            planned_frags, 2,
-            "budget caps reclustering to two fragments"
-        );
+
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_stops_before_unselected_invalid_byte_metadata() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        assert_eq!(dataset.fragments().len(), 4);
+        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[2].files[0]
+            .file_size_bytes = lance_io::utils::CachedFileSize::unknown();
+
+        let schema_field_ids = dataset.schema().field_ids().into_iter().collect();
+        let first_two_bytes: u64 = dataset.fragments()[..2]
+            .iter()
+            .map(|fragment| fragment_source_bytes(fragment, &schema_field_ids).unwrap())
+            .sum();
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_fragments: Some(2),
+            max_source_bytes: Some(first_two_bytes),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_uses_legacy_row_metrics_for_source_budget() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[0].physical_rows = None;
+        assert_eq!(dataset.fragments()[0].num_rows(), None);
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_rows: Some(500),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_splits_target_group_for_source_byte_budget() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        let schema_field_ids = dataset.schema().field_ids().into_iter().collect();
+        let first_two_bytes: u64 = dataset.fragments()[..2]
+            .iter()
+            .map(|fragment| fragment_source_bytes(fragment, &schema_field_ids).unwrap())
+            .sum();
+        assert!(fragment_source_bytes(&dataset.fragments()[2], &schema_field_ids).unwrap() > 0);
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_bytes: Some(first_two_bytes),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
     }
 
     #[tokio::test]

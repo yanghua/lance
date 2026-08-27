@@ -34,6 +34,7 @@ public class FragmentMetadata implements Serializable {
   private final RowIdMeta rowIdMeta;
   private final VersionMeta createdAtVersionMeta;
   private final VersionMeta lastUpdatedAtVersionMeta;
+  private final Long clusteringVersion;
 
   public FragmentMetadata(
       int id,
@@ -41,7 +42,7 @@ public class FragmentMetadata implements Serializable {
       Long physicalRows,
       DeletionFile deletionFile,
       RowIdMeta rowIdMeta) {
-    this(id, files, physicalRows, deletionFile, rowIdMeta, null, null);
+    this(id, files, physicalRows, deletionFile, rowIdMeta, null, null, null);
   }
 
   public FragmentMetadata(
@@ -52,6 +53,30 @@ public class FragmentMetadata implements Serializable {
       RowIdMeta rowIdMeta,
       VersionMeta createdAtVersionMeta,
       VersionMeta lastUpdatedAtVersionMeta) {
+    this(
+        id,
+        files,
+        physicalRows,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta,
+        null);
+  }
+
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta,
+      Long clusteringVersion) {
+    if (clusteringVersion != null && clusteringVersion <= 0) {
+      throw new IllegalArgumentException(
+          "clusteringVersion must be positive, got " + clusteringVersion);
+    }
     this.id = id;
     this.files = files;
     this.physicalRows = physicalRows;
@@ -59,6 +84,7 @@ public class FragmentMetadata implements Serializable {
     this.rowIdMeta = rowIdMeta;
     this.createdAtVersionMeta = createdAtVersionMeta;
     this.lastUpdatedAtVersionMeta = lastUpdatedAtVersionMeta;
+    this.clusteringVersion = clusteringVersion;
   }
 
   public int getId() {
@@ -104,6 +130,15 @@ public class FragmentMetadata implements Serializable {
     return lastUpdatedAtVersionMeta;
   }
 
+  /**
+   * Returns the clustering layout version under which this fragment was written.
+   *
+   * @return the clustering version, or null when the fragment is not stamped as clustered
+   */
+  public Long getClusteringVersion() {
+    return clusteringVersion;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -119,7 +154,8 @@ public class FragmentMetadata implements Serializable {
         && Objects.equals(deletionFile, that.deletionFile)
         && Objects.equals(rowIdMeta, that.rowIdMeta)
         && Objects.equals(createdAtVersionMeta, that.createdAtVersionMeta)
-        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta);
+        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta)
+        && Objects.equals(clusteringVersion, that.clusteringVersion);
   }
 
   @Override
@@ -131,7 +167,8 @@ public class FragmentMetadata implements Serializable {
         deletionFile,
         rowIdMeta,
         createdAtVersionMeta,
-        lastUpdatedAtVersionMeta);
+        lastUpdatedAtVersionMeta,
+        clusteringVersion);
   }
 
   @Override
@@ -144,6 +181,7 @@ public class FragmentMetadata implements Serializable {
         .add("rowIdMeta", rowIdMeta)
         .add("createdAtVersionMeta", createdAtVersionMeta)
         .add("lastUpdatedAtVersionMeta", lastUpdatedAtVersionMeta)
+        .add("clusteringVersion", clusteringVersion)
         .toString();
   }
 }

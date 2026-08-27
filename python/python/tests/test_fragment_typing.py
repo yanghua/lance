@@ -30,7 +30,10 @@ def test_write_fragments_accepts_none_max_rows_per_group(tmp_path: Path) -> None
     table = pa.table({"a": range(8)})
 
     fragments: List[FragmentMetadata] = write_fragments(
-        table, str(tmp_path / "fragments"), max_rows_per_group=None
+        table,
+        str(tmp_path / "fragments"),
+        max_rows_per_group=None,
+        cluster_by=["a"],
     )
     assert len(fragments) == 1
     assert fragments[0].physical_rows == 8
@@ -46,6 +49,7 @@ def test_write_fragments_transaction_accepts_none_max_rows_per_group(
         str(tmp_path / "transaction"),
         max_rows_per_group=None,
         return_transaction=True,
+        cluster_by=["a"],
     )
     assert transaction.operation is not None
 

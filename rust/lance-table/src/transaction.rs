@@ -27,6 +27,7 @@
 //! ```
 
 mod builder;
+mod clustering_config;
 mod conflicts;
 mod index_maintenance;
 mod manifest_build;

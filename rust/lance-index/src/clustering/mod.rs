@@ -30,12 +30,11 @@
 //!
 //! # Persistence
 //!
-//! The clustering *columns* (and their order) are persisted as per-field schema
-//! markers (`lance-schema:unenforced-clustering-key:position`), reusing the
-//! existing unenforced-clustering-key mechanism. Only the tuning parameters
-//! that the schema marker cannot express — the curve, layout version, and
-//! per-dimension bit width — are stored in the dataset config under
-//! `lance.clustering.*`. A [`ClusteringSpec`] is the in-memory bundle of both.
+//! The ordered clustering columns, curve, layout version, and per-dimension bit
+//! width are stored together in dataset configuration under
+//! `lance.clustering.*`. Keeping the liquid-clustering policy separate from
+//! schema-level physical-ordering hints lets the policy be changed or cleared
+//! without mutating those stable hints.
 
 use std::collections::HashMap;
 
@@ -53,12 +52,16 @@ pub use sort::cluster_sort_stream;
 
 /// Config key holding the space-filling curve name (`hilbert` or `zorder`).
 pub const CLUSTERING_CURVE_KEY: &str = "lance.clustering.curve";
+/// Config key holding the ordered clustering column names as a JSON array.
+pub const CLUSTERING_COLUMNS_KEY: &str = "lance.clustering.columns";
 /// Config key holding the clustering version, bumped whenever the curve
 /// changes or a full recluster is forced so already-written fragments can be
 /// detected as under-clustered.
 pub const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
 /// Config key holding the per-column bit width used when quantizing values.
 pub const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
+
+const CLUSTERING_CONFIG_PREFIX: &str = "lance.clustering.";
 
 /// Default per-column bit width. 16 bits per dimension keeps four columns
 /// inside a 64-bit index while still distinguishing 65,536 buckets per column.
@@ -68,6 +71,36 @@ pub const DEFAULT_BITS_PER_DIM: u32 = 16;
 /// accumulates the interleaved index in a `u128`, so the total cannot exceed
 /// 128 bits.
 pub const MAX_TOTAL_BITS: u32 = 128;
+
+/// Validate that a data type can be encoded as a clustering coordinate.
+///
+/// Clustering currently supports booleans, signed and unsigned integers, and
+/// floating-point values. Callers should validate declared clustering columns
+/// before persisting the clustering config so an unsupported declaration is
+/// not committed.
+pub fn validate_clustering_data_type(data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64 => Ok(()),
+        other => Err(unsupported_clustering_type(other)),
+    }
+}
+
+fn unsupported_clustering_type(data_type: &DataType) -> Error {
+    Error::invalid_input(format!(
+        "clustering does not support column type {data_type:?}; supported types are \
+         integers, floats, and boolean"
+    ))
+}
 
 /// The space-filling curve used to order clustering-key values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -107,12 +140,9 @@ impl std::str::FromStr for ClusteringCurve {
 
 /// Description of how a dataset is clustered.
 ///
-/// The clustering columns are persisted as schema markers; the remaining tuning
-/// parameters (`curve`, `version`, `bits_per_dim`) are persisted in the dataset
-/// config under `lance.clustering.*`. This type carries both together so the
-/// write and compaction paths have everything they need in one place. Splitting
-/// persistence this way is additive and readable by every reader without a
-/// format change.
+/// All fields are persisted in dataset config under `lance.clustering.*`, with
+/// `columns` encoded as a JSON array to preserve ordering and arbitrary column
+/// names. This policy is independent of schema-level physical-ordering hints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusteringSpec {
     /// Ordered list of clustering-key column names.
@@ -143,28 +173,58 @@ impl ClusteringSpec {
         version: u64,
         bits_per_dim: u32,
     ) -> Result<Self> {
-        if columns.is_empty() {
-            return Err(Error::invalid_input(
-                "clustering spec must have at least one column",
-            ));
-        }
-        validate_bits(columns.len(), bits_per_dim)?;
-        Ok(Self {
+        let spec = Self {
             columns,
             curve,
             version,
             bits_per_dim,
-        })
+        };
+        spec.validate()?;
+        Ok(spec)
     }
 
-    /// Serialize the tuning parameters into `lance.clustering.*` configuration
-    /// entries.
+    /// Validate the spec invariants.
     ///
-    /// The clustering *columns* are not included: they are persisted separately
-    /// as schema markers. Use [`ClusteringSpec::from_parts`] to reassemble a
-    /// spec from schema columns plus these config entries.
+    /// This also validates specs built through struct literals or
+    /// deserialization instead of [`ClusteringSpec::new`] or
+    /// [`ClusteringSpec::with_bits`]. Callers that persist a caller-provided
+    /// spec should invoke this before committing metadata.
+    pub fn validate(&self) -> Result<()> {
+        if self.columns.is_empty() {
+            return Err(Error::invalid_input(
+                "clustering spec must have at least one column",
+            ));
+        }
+        if self.version == 0 {
+            return Err(Error::invalid_input(
+                "clustering version must be at least 1, got 0",
+            ));
+        }
+        let mut first_positions = HashMap::with_capacity(self.columns.len());
+        for (position, column) in self.columns.iter().enumerate() {
+            if let Some(first_position) = first_positions.insert(column.as_str(), position) {
+                return Err(Error::invalid_input(format!(
+                    "clustering columns must be unique; duplicate column {column:?} at \
+                     positions {first_position} and {position}"
+                )));
+            }
+        }
+        validate_bits(self.columns.len(), self.bits_per_dim)
+    }
+
+    /// Serialize the complete spec into `lance.clustering.*` configuration
+    /// entries.
     pub fn to_config(&self) -> Vec<(String, String)> {
+        let columns = serde_json::Value::Array(
+            self.columns
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string();
         vec![
+            (CLUSTERING_COLUMNS_KEY.to_string(), columns),
             (
                 CLUSTERING_CURVE_KEY.to_string(),
                 self.curve.as_str().to_string(),
@@ -178,53 +238,67 @@ impl ClusteringSpec {
     }
 
     /// The config keys this spec writes, for use when clearing a declaration.
-    pub fn config_keys() -> [&'static str; 3] {
+    pub fn config_keys() -> [&'static str; 4] {
         [
+            CLUSTERING_COLUMNS_KEY,
             CLUSTERING_CURVE_KEY,
             CLUSTERING_VERSION_KEY,
             CLUSTERING_BITS_PER_DIM_KEY,
         ]
     }
 
-    /// Reassemble a spec from clustering columns (read from schema markers) plus
-    /// the tuning parameters in a table configuration map.
+    /// Read a clustering spec from a table configuration map.
     ///
-    /// Returns `Ok(None)` when `columns` is empty (no clustering declared), and
-    /// an error when the config carries a malformed tuning value.
-    pub fn from_parts(
-        columns: Vec<String>,
-        config: &HashMap<String, String>,
-    ) -> Result<Option<Self>> {
-        if columns.is_empty() {
+    /// No `lance.clustering.*` entries means clustering is not declared. A
+    /// declaration must contain all four keys written by [`Self::to_config`]; a
+    /// partial declaration is rejected instead of being silently defaulted.
+    pub fn from_config(config: &HashMap<String, String>) -> Result<Option<Self>> {
+        if !config
+            .keys()
+            .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
+        {
             return Ok(None);
         }
-        let curve = config
-            .get(CLUSTERING_CURVE_KEY)
-            .map(|s| s.parse::<ClusteringCurve>())
-            .transpose()?
-            .unwrap_or_default();
-        let version = config
-            .get(CLUSTERING_VERSION_KEY)
-            .map(|s| {
-                s.parse::<u64>().map_err(|e| {
-                    Error::invalid_input(format!(
-                        "invalid {CLUSTERING_VERSION_KEY} value {s:?}: {e}"
-                    ))
-                })
+        let required_value = |key| {
+            config.get(key).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "incomplete clustering config: missing required {key}; all of \
+                     {CLUSTERING_COLUMNS_KEY}, {CLUSTERING_CURVE_KEY}, \
+                     {CLUSTERING_VERSION_KEY}, and {CLUSTERING_BITS_PER_DIM_KEY} must be set \
+                     together"
+                ))
             })
-            .transpose()?
-            .unwrap_or(1);
-        let bits_per_dim = config
-            .get(CLUSTERING_BITS_PER_DIM_KEY)
-            .map(|s| {
-                s.parse::<u32>().map_err(|e| {
-                    Error::invalid_input(format!(
-                        "invalid {CLUSTERING_BITS_PER_DIM_KEY} value {s:?}: {e}"
-                    ))
-                })
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_BITS_PER_DIM);
+        };
+        let columns = required_value(CLUSTERING_COLUMNS_KEY)?;
+        let curve = required_value(CLUSTERING_CURVE_KEY)?;
+        let version = required_value(CLUSTERING_VERSION_KEY)?;
+        let bits_per_dim = required_value(CLUSTERING_BITS_PER_DIM_KEY)?;
+        let columns = serde_json::from_str::<Vec<String>>(columns).map_err(|e| {
+            Error::invalid_input(format!(
+                "invalid {CLUSTERING_COLUMNS_KEY} value {columns:?}: expected a JSON array of \
+                 column-name strings: {e}"
+            ))
+        })?;
+        let curve = match curve.as_str() {
+            "hilbert" => ClusteringCurve::Hilbert,
+            "zorder" => ClusteringCurve::ZOrder,
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "invalid {CLUSTERING_CURVE_KEY} value {other:?}: expected \
+                     \"hilbert\" or \"zorder\""
+                )));
+            }
+        };
+        let version = version.parse::<u64>().map_err(|e| {
+            Error::invalid_input(format!(
+                "invalid {CLUSTERING_VERSION_KEY} value {version:?}: {e}"
+            ))
+        })?;
+        let bits_per_dim = bits_per_dim.parse::<u32>().map_err(|e| {
+            Error::invalid_input(format!(
+                "invalid {CLUSTERING_BITS_PER_DIM_KEY} value {bits_per_dim:?}: {e}"
+            ))
+        })?;
         Some(Self::with_bits(columns, curve, version, bits_per_dim)).transpose()
     }
 }
@@ -235,8 +309,10 @@ fn validate_bits(num_columns: usize, bits_per_dim: u32) -> Result<()> {
             "clustering bits_per_dim must be in 1..=64, got {bits_per_dim}"
         )));
     }
-    let total = num_columns as u64 * bits_per_dim as u64;
-    if total > MAX_TOTAL_BITS as u64 {
+    let total = num_columns
+        .checked_mul(bits_per_dim as usize)
+        .ok_or_else(|| Error::invalid_input("clustering key bit width overflowed usize"))?;
+    if total > MAX_TOTAL_BITS as usize {
         return Err(Error::invalid_input(format!(
             "clustering key is too wide: {num_columns} columns * {bits_per_dim} bits = \
                  {total} bits exceeds the {MAX_TOTAL_BITS}-bit limit; reduce the column count \
@@ -270,13 +346,17 @@ impl SpaceFillingEncoder {
 
     /// Build an encoder matching a [`ClusteringSpec`].
     pub fn from_spec(spec: &ClusteringSpec) -> Result<Self> {
+        spec.validate()?;
         Self::new(spec.curve, spec.bits_per_dim)
     }
 
     /// Number of bytes in each encoded ordering value for the given column count.
-    pub fn output_width(&self, num_columns: usize) -> usize {
-        let total_bits = num_columns * self.bits_per_dim as usize;
-        total_bits.div_ceil(8)
+    pub fn output_width(&self, num_columns: usize) -> Result<usize> {
+        validate_bits(num_columns, self.bits_per_dim)?;
+        let total_bits = num_columns
+            .checked_mul(self.bits_per_dim as usize)
+            .ok_or_else(|| Error::invalid_input("clustering key bit width overflowed usize"))?;
+        Ok(total_bits.div_ceil(8))
     }
 
     /// Encode the clustering-key columns into one ordering value per row.
@@ -284,7 +364,9 @@ impl SpaceFillingEncoder {
     /// The output is a big-endian [`FixedSizeBinaryArray`]; comparing two
     /// outputs lexicographically yields the same order as comparing their
     /// curve indices. Null values are mapped to the maximum coordinate in their
-    /// dimension, so they sort to the end of the clustering order.
+    /// dimension, where they can tie the maximum non-null value at full
+    /// precision. A multi-dimensional space-filling curve does not provide
+    /// row-level `NULLS LAST` ordering.
     pub fn encode(&self, key_columns: &[ArrayRef]) -> Result<ArrayRef> {
         if key_columns.is_empty() {
             return Err(Error::invalid_input(
@@ -312,21 +394,20 @@ impl SpaceFillingEncoder {
             .collect::<Result<_>>()?;
 
         let num_columns = key_columns.len();
-        let width = self.output_width(num_columns);
+        let width = self.output_width(num_columns)?;
         let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, width as i32);
         let mut point = vec![0u64; num_columns];
         for row in 0..num_rows {
             for (col, coord) in coords.iter().enumerate() {
                 point[col] = coord[row];
             }
-            let index = match self.curve {
-                ClusteringCurve::ZOrder => interleave(&point, bits),
-                ClusteringCurve::Hilbert => {
-                    let mut transposed = point.clone();
-                    axes_to_transpose(&mut transposed, bits);
-                    interleave(&transposed, bits)
-                }
-            };
+            if self.curve == ClusteringCurve::Hilbert {
+                // Every coordinate is overwritten at the start of the next
+                // iteration, so the reusable row buffer can be transformed in
+                // place without allocating a clone per row.
+                axes_to_transpose(&mut point, bits);
+            }
+            let index = interleave(&point, bits);
             let be = index.to_be_bytes();
             builder.append_value(&be[be.len() - width..]).map_err(|e| {
                 Error::invalid_input(format!("failed to build clustering index array: {e}"))
@@ -338,6 +419,13 @@ impl SpaceFillingEncoder {
 
 /// Quantize one column to `bits` bits per value, mapping each value to an
 /// order-preserving unsigned coordinate. Nulls become the maximum coordinate.
+///
+/// Quantization keeps the most-significant bits of a fixed mapping for the
+/// value's complete type domain. It deliberately does not rescale using batch
+/// min/max: the encoder is evaluated independently for each input batch, so a
+/// data-dependent scale would make identical values encode differently across
+/// batches and invalidate the global sort. As a consequence, a small range of
+/// a wide integer type can share a coordinate at low `bits` values.
 fn quantize_column(array: &ArrayRef, bits: u32) -> Result<Vec<u64>> {
     let keys = order_preserving_keys(array)?;
     let shift = 64 - bits;
@@ -426,10 +514,7 @@ fn order_preserving_keys(array: &ArrayRef) -> Result<Vec<u64>> {
                 .collect()
         }
         other => {
-            return Err(Error::invalid_input(format!(
-                "clustering does not support column type {other:?}; supported types are \
-                     integers, floats, and boolean"
-            )));
+            return Err(unsupported_clustering_type(other));
         }
     };
     Ok(keys)
@@ -567,6 +652,16 @@ mod tests {
     }
 
     #[test]
+    fn output_width_rejects_invalid_dimension_counts() {
+        let encoder = SpaceFillingEncoder::new(ClusteringCurve::Hilbert, 64).unwrap();
+        let error = encoder
+            .output_width(usize::MAX)
+            .expect_err("an overflowing dimension count must be rejected");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("bit width"));
+    }
+
+    #[test]
     fn hilbert_two_columns_is_a_bijection_with_adjacency() {
         // Enumerate a 4x4 grid (2 bits per dimension). Hilbert indices must be a
         // permutation of 0..16, and consecutive indices must be spatial
@@ -636,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn nulls_sort_last() {
+    fn null_uses_max_coordinate_in_one_dimension() {
         let values = Int32Array::from(vec![Some(10), None, Some(-5), Some(1000)]);
         let col: ArrayRef = Arc::new(values);
         let encoder = SpaceFillingEncoder::new(ClusteringCurve::Hilbert, 32).unwrap();
@@ -644,6 +739,21 @@ mod tests {
         let mut order: Vec<usize> = (0..encoded.len()).collect();
         order.sort_by(|&a, &b| encoded[a].cmp(&encoded[b]));
         assert_eq!(*order.last().unwrap(), 1, "null row must sort last");
+    }
+
+    #[test]
+    fn multidimensional_null_is_not_globally_last() {
+        // A maximum coordinate is a per-dimension policy, not a row-level
+        // NULLS LAST policy. Z-order interleaves (0, max) before (max, 0).
+        let x: ArrayRef = Arc::new(UInt8Array::from(vec![0, 128]));
+        let y: ArrayRef = Arc::new(UInt8Array::from(vec![None, Some(0)]));
+        let encoder = SpaceFillingEncoder::new(ClusteringCurve::ZOrder, 1).unwrap();
+        let encoded = encode_rows(&encoder, &[x, y]);
+
+        assert!(
+            encoded[0] < encoded[1],
+            "a row containing null can precede a fully non-null row on a multi-dimensional curve"
+        );
     }
 
     #[test]
@@ -666,7 +776,35 @@ mod tests {
     fn rejects_unsupported_type() {
         let col: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["a", "b"]));
         let encoder = SpaceFillingEncoder::new(ClusteringCurve::Hilbert, 16).unwrap();
-        assert!(encoder.encode(std::slice::from_ref(&col)).is_err());
+        let error = encoder
+            .encode(std::slice::from_ref(&col))
+            .expect_err("strings must not be accepted as clustering coordinates");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Utf8"));
+    }
+
+    #[test]
+    fn validates_clustering_data_types() {
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            validate_clustering_data_type(&data_type).unwrap();
+        }
+
+        let error = validate_clustering_data_type(&DataType::Utf8)
+            .expect_err("strings must not be accepted as clustering columns");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Utf8"));
     }
 
     #[test]
@@ -692,6 +830,72 @@ mod tests {
     }
 
     #[test]
+    fn spec_rejects_zero_version() {
+        let error = ClusteringSpec::with_bits(
+            vec!["a".into()],
+            ClusteringCurve::Hilbert,
+            0,
+            DEFAULT_BITS_PER_DIM,
+        )
+        .expect_err("version zero must not be accepted");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("version must be at least 1"));
+
+        ClusteringSpec::with_bits(
+            vec!["a".into()],
+            ClusteringCurve::Hilbert,
+            u64::MAX,
+            DEFAULT_BITS_PER_DIM,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn spec_rejects_duplicate_columns() {
+        let error = ClusteringSpec::new(
+            vec!["a".into(), "b".into(), "a".into()],
+            ClusteringCurve::Hilbert,
+        )
+        .expect_err("duplicate clustering columns must not be accepted");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("duplicate column \"a\""));
+        assert!(message.contains("positions 0 and 2"));
+
+        ClusteringSpec::new(vec!["a".into(), "A".into()], ClusteringCurve::Hilbert).unwrap();
+    }
+
+    #[test]
+    fn from_spec_validates_manually_constructed_spec() {
+        let spec = ClusteringSpec {
+            columns: vec!["a".into()],
+            curve: ClusteringCurve::Hilbert,
+            version: 0,
+            bits_per_dim: DEFAULT_BITS_PER_DIM,
+        };
+        let error = SpaceFillingEncoder::from_spec(&spec)
+            .expect_err("the encoder must reject an invalid manually constructed spec");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("version must be at least 1"));
+    }
+
+    #[test]
+    fn fixed_domain_quantization_is_batch_independent() {
+        let encoder =
+            SpaceFillingEncoder::new(ClusteringCurve::ZOrder, DEFAULT_BITS_PER_DIM).unwrap();
+        let full: ArrayRef = Arc::new(Int32Array::from(vec![-100_000, 0, 65_536, 1_000_000]));
+        let first: ArrayRef = Arc::new(Int32Array::from(vec![-100_000, 0]));
+        let second: ArrayRef = Arc::new(Int32Array::from(vec![65_536, 1_000_000]));
+
+        let expected = encode_rows(&encoder, &[full]);
+        let actual: Vec<Vec<u8>> = encode_rows(&encoder, &[first])
+            .into_iter()
+            .chain(encode_rows(&encoder, &[second]))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn spec_config_round_trip() {
         let spec = ClusteringSpec::with_bits(
             vec!["a".into(), "b".into()],
@@ -701,39 +905,105 @@ mod tests {
         )
         .unwrap();
         let config: HashMap<String, String> = spec.to_config().into_iter().collect();
-        // Columns are persisted as schema markers, not config, so they must be
-        // supplied back to `from_parts`.
-        let parsed = ClusteringSpec::from_parts(spec.columns.clone(), &config)
-            .unwrap()
-            .unwrap();
+        assert_eq!(config[CLUSTERING_COLUMNS_KEY], r#"["a","b"]"#);
+        assert_eq!(
+            ClusteringSpec::config_keys(),
+            [
+                CLUSTERING_COLUMNS_KEY,
+                CLUSTERING_CURVE_KEY,
+                CLUSTERING_VERSION_KEY,
+                CLUSTERING_BITS_PER_DIM_KEY,
+            ]
+        );
+        let parsed = ClusteringSpec::from_config(&config).unwrap().unwrap();
         assert_eq!(parsed, spec);
     }
 
     #[test]
-    fn from_parts_no_columns_is_none() {
+    fn from_config_without_clustering_keys_is_none() {
         let config = HashMap::new();
-        assert!(
-            ClusteringSpec::from_parts(vec![], &config)
-                .unwrap()
-                .is_none()
-        );
+        assert!(ClusteringSpec::from_config(&config).unwrap().is_none());
+
+        let unrelated = HashMap::from([("other.key".to_string(), "value".to_string())]);
+        assert!(ClusteringSpec::from_config(&unrelated).unwrap().is_none());
     }
 
     #[test]
-    fn from_parts_defaults_curve_and_bits() {
-        let config = HashMap::new();
-        let spec = ClusteringSpec::from_parts(vec!["x".into()], &config)
-            .unwrap()
-            .unwrap();
-        assert_eq!(spec.curve, ClusteringCurve::Hilbert);
-        assert_eq!(spec.bits_per_dim, DEFAULT_BITS_PER_DIM);
-        assert_eq!(spec.version, 1);
+    fn from_config_rejects_partial_declaration() {
+        let cases = [
+            (CLUSTERING_COLUMNS_KEY, r#"["x"]"#),
+            (CLUSTERING_VERSION_KEY, "1"),
+            (CLUSTERING_CURVE_KEY, "zorder"),
+            (CLUSTERING_BITS_PER_DIM_KEY, "8"),
+            ("lance.clustering.future_option", "value"),
+        ];
+        for (key, value) in cases {
+            let config = HashMap::from([(key.to_string(), value.to_string())]);
+            let error = ClusteringSpec::from_config(&config)
+                .expect_err("a partial clustering declaration must be rejected");
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("incomplete clustering config"));
+        }
     }
 
     #[test]
-    fn from_parts_rejects_bad_curve() {
-        let mut config = HashMap::new();
-        config.insert(CLUSTERING_CURVE_KEY.to_string(), "spiral".to_string());
-        assert!(ClusteringSpec::from_parts(vec!["x".into()], &config).is_err());
+    fn from_config_rejects_invalid_active_config() {
+        for version in ["0", "not-a-version"] {
+            let config = HashMap::from([
+                (CLUSTERING_COLUMNS_KEY.to_string(), r#"["x"]"#.to_string()),
+                (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
+                (CLUSTERING_VERSION_KEY.to_string(), version.to_string()),
+                (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+            ]);
+            let error = ClusteringSpec::from_config(&config)
+                .expect_err("an invalid active clustering version must be rejected");
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            if version == "0" {
+                assert!(error.to_string().contains("version must be at least 1"));
+            } else {
+                assert!(error.to_string().contains(CLUSTERING_VERSION_KEY));
+            }
+        }
+
+        let config = HashMap::from([
+            (CLUSTERING_COLUMNS_KEY.to_string(), r#"["x"]"#.to_string()),
+            (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
+            (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+            (
+                CLUSTERING_BITS_PER_DIM_KEY.to_string(),
+                "not-a-width".to_string(),
+            ),
+        ]);
+        let error = ClusteringSpec::from_config(&config)
+            .expect_err("an invalid active bit width must be rejected");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(CLUSTERING_BITS_PER_DIM_KEY));
+    }
+
+    #[test]
+    fn from_config_rejects_bad_columns_and_curve() {
+        for columns in [r#"{"x":1}"#, r#"["x",1]"#, "not-json"] {
+            let config = HashMap::from([
+                (CLUSTERING_COLUMNS_KEY.to_string(), columns.to_string()),
+                (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
+                (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+                (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+            ]);
+            let error = ClusteringSpec::from_config(&config)
+                .expect_err("invalid clustering columns JSON must be rejected");
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(CLUSTERING_COLUMNS_KEY));
+        }
+
+        let config = HashMap::from([
+            (CLUSTERING_COLUMNS_KEY.to_string(), r#"["x"]"#.to_string()),
+            (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+            (CLUSTERING_CURVE_KEY.to_string(), "spiral".to_string()),
+            (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+        ]);
+        let error = ClusteringSpec::from_config(&config)
+            .expect_err("an invalid active curve must be rejected");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("spiral"));
     }
 }

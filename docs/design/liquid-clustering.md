@@ -137,38 +137,32 @@ Encoding sketch:
 3. **Interleave** (Z-order) or apply the Hilbert transform across dimensions to produce the
    ordering value.
 
+The current encoder uses fixed-domain most-significant-bit truncation so the same value receives
+the same coordinate in every input batch. This can collapse small ranges of wide integer and
+floating-point types at low bit widths. Null maps to the maximum coordinate in its own dimension;
+a multi-dimensional curve does not promise row-level `NULLS LAST`.
+
 Precision/whitening (per-column bit width, handling skew) is an open question — see §10.
 
 ## 5. Format / metadata changes (additive, no stable-format break)
 
-Persistence is split between the schema and the table config:
-
-**Clustering columns → per-field schema markers.** The clustering-key columns (and their order)
-reuse the existing *unenforced clustering key* mechanism: each key field carries the
-`lance-schema:unenforced-clustering-key:position` metadata marker (1-based), read back through
-`Schema::unenforced_clustering_key()`. This already exists in the schema layer but had no layout
-consumer; liquid clustering becomes that consumer. Reusing it avoids a second, parallel column list
-and inherits its immutability (`manifest_build.rs` rejects changing the key once set).
-
-**Tuning parameters → `manifest.config`.** The remaining knobs that the schema marker cannot
-express are reserved config keys:
+The complete desired layout is stored in `manifest.config`. It deliberately does not reuse the
+existing `lance-schema:unenforced-clustering-key:position` marker: that stable marker asserts an
+already-achieved physical ordering for query-engine optimizations, while liquid clustering is a
+policy to which existing fragments may only converge incrementally.
 
 | Key | Type | Meaning |
 |---|---|---|
+| `lance.clustering.columns` | JSON array of strings | Ordered clustering-key columns |
 | `lance.clustering.curve` | string (`hilbert` \| `zorder`) | Space-filling curve |
 | `lance.clustering.version` | int | Bumped on curve change or a forced recluster; used to detect under-clustered fragments |
 | `lance.clustering.bits_per_dim` | int | Per-column quantization bit width |
 
 Rationale: `config` is already an additive `HashMap<String,String>` mutated through the existing
-`UpdateConfig` operation (`rust/lance/src/dataset/metadata.rs`), so changing tuning is a cheap
-metadata-only commit and every reader tolerates unknown keys. `ClusteringSpec` is the in-memory
-bundle of both surfaces (`ClusteringSpec::from_parts(columns, config)` /
-`ClusteringSpec::to_config()`).
-
-> Consequence of reusing the immutable marker: the **column set is fixed once declared**. Changing
-> curve/bits/version is always allowed (that is what drives a recluster), but changing *which*
-> columns cluster is rejected. Full "change the clustering key without rewrite" (§2 goal 4) is
-> therefore deferred until the marker's immutability is relaxed — tracked as an open question.
+`UpdateConfig` operation (`rust/lance/src/dataset/metadata.rs`), so changing the desired layout is a
+cheap metadata-only commit and every reader tolerates unknown keys. The complete declaration is
+updated atomically. Any change to columns, curve, or bit width must increase the layout version so
+existing fragments become eligible for incremental reclustering.
 
 **Per-fragment "clustered-at" marker.** To make re-clustering incremental we must know which
 fragments are already clustered under the current spec. Options, in preference order:
@@ -181,8 +175,9 @@ fragments are already clustered under the current spec. Options, in preference o
 
 We chose (A) *(implemented)*: a new optional `DataFragment.clustering_version` proto field
 (number 12, `0` = unset), surfaced as `Fragment::clustering_version: Option<u64>`. It is additive
-and does not alter any stable file-format contract — old readers ignore it, and fragments written
-before clustering was declared simply read back as `None`.
+and does not break reads: old readers ignore it, and fragments written before clustering was
+declared simply read back as `None`. A writer-only feature flag prevents older writers from
+dropping existing stamps or appending unstamped data while liquid clustering is active.
 
 ## 6. Write path
 
@@ -230,7 +225,7 @@ disabled for `Cluster` mode. Output still respects `target_rows_per_fragment` / 
 
 **Incremental planner. (implemented)** `ClusteringCompactionPlanner` behind the pluggable
 `CompactionPlanner` trait selects *under-clustered* fragments — those whose
-`Fragment::clustering_version` is absent or below the dataset's current
+`Fragment::clustering_version` does not equal the dataset's current
 `ClusteringSpec::version` — groups adjacent ones up to `target_rows_per_fragment`, and honors the
 existing `max_source_fragments` / `max_source_rows` / `max_source_bytes` budgets so a large table
 converges over successive `optimize` runs rather than one full rewrite. An already-clustered
@@ -240,11 +235,10 @@ fragment breaks adjacency so it is left untouched, and a second run at the same 
 right place (the planner currently only reclusters under-clustered fragments among themselves), and
 per-task combined-key-range grouping. These refine clustering quality and are follow-ups.
 
-**Changing keys without full rewrite.** Bumping the clustering version marks all existing fragments
-as under-clustered *lazily*; they are re-clustered opportunistically over subsequent `OPTIMIZE`
-runs within budget, never in one forced pass. Old data stays readable throughout. (Note the §5
-caveat: the immutable schema marker means the *column set* cannot change today, only the tuning
-version.)
+**Changing keys without full rewrite.** Bumping the clustering version while changing the columns
+or other layout parameters marks all existing fragments as under-clustered *lazily*; they are
+re-clustered opportunistically over subsequent `OPTIMIZE` runs within budget, never in one forced
+pass. Old data stays readable throughout.
 
 **Interaction with existing compaction machinery. (partial)** Ordinary compaction preserves row
 order, so its positional old→new row mapping (for index remap and stable-row-id rechunk) holds.
@@ -271,8 +265,8 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
 `clustering`).
 
 - **Rust:** `WriteParams.cluster_by`; `Dataset::set_clustering` / `Dataset::clustering_spec` /
-  `Dataset::clear_clustering` to declare/read/drop the spec (columns via schema markers, tuning via
-  config); `CompactionMode::Cluster` on `CompactionOptions`. *(Implemented.)*
+  `Dataset::clear_clustering` to declare/read/drop the config-backed spec;
+  `CompactionMode::Cluster` on `CompactionOptions`. *(Implemented.)*
 - **Python: (implemented)** `write_dataset(..., cluster_by=["a", "b"])`;
   `dataset.set_clustering(columns, *, curve, version, bits_per_dim)` /
   `dataset.clustering_spec()` (returns a dict or `None`) / `dataset.clear_clustering()`;
@@ -299,15 +293,14 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
    fine enough; do we couple the default zone size to the clustering config?
 5. **Concurrency.** Recluster is a rewrite; confirm conflict resolution with concurrent
    appends/updates matches existing compaction guarantees (it should, since it reuses that path).
-6. **Changing the clustering key without rewrite (goal 4).** The column set is currently persisted
-   via the *immutable* unenforced-clustering-key markers, so today only curve/bits/version can
-   change on an existing dataset — not the columns. Delivering full key changes needs the marker's
-   immutability relaxed (or a separate mutable column list). Deferred pending maintainer input.
+6. **Changing the clustering key without rewrite (goal 4).** The desired column set is stored in
+   table config and can change together with a strictly increasing layout version; old fragments
+   converge incrementally under the normal reclustering budget.
 
 ## 11. Phased delivery
 
-- **Phase 0 — spec plumbing. (implemented)** `ClusteringSpec` type, `lance.clustering.*` tuning
-  config, columns via reused schema markers, and `Dataset::set_clustering` /
+- **Phase 0 — spec plumbing. (implemented)** `ClusteringSpec` type, the complete declaration in
+  `lance.clustering.*` config, and `Dataset::set_clustering` /
   `clustering_spec` / `clear_clustering`. No layout behavior change yet.
 - **Phase 1 — encoder. (implemented)** General multi-column Z-order + Hilbert `SpaceFillingEncoder`
   in `lance-index::clustering`, with tests (order preservation, Hilbert adjacency, null handling,

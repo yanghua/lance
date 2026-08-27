@@ -1737,13 +1737,13 @@ public class Dataset implements Closeable {
    *
    * <p>The clustering key lays data out along a multi-column space-filling curve so that zone-map
    * data skipping is effective across every key column at once. This is a metadata-only commit that
-   * never rewrites data: the column set is persisted as schema markers and the tuning parameters in
-   * the dataset config. Data already written stays in place until it is re-clustered by a
-   * compaction run with {@link org.lance.compaction.CompactionMode#CLUSTER}.
+   * never rewrites data: the complete declaration is persisted in the dataset config. Data already
+   * written stays in place until it is re-clustered by a compaction run with {@link
+   * org.lance.compaction.CompactionMode#CLUSTER}.
    *
-   * <p>The column set is immutable once declared: re-declaring a different set throws. Bump {@link
-   * ClusteringSpec#getVersion()} (or change the curve or bits-per-dimension) to force existing data
-   * to be treated as under-clustered and re-clustered on the next optimize.
+   * <p>An identical declaration is a no-op. Any layout change, including changing the columns,
+   * curve, or bits-per-dimension, requires a strictly higher {@link ClusteringSpec#getVersion()} so
+   * existing data is treated as under-clustered on the next optimize.
    *
    * @param spec the clustering spec to declare; its columns must exist in the schema
    */

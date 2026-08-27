@@ -82,6 +82,7 @@ public class WriteDatasetBuilder {
   private Optional<List<String>> targetBases = Optional.empty();
   private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
   private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
+  private Optional<List<String>> clusterBy = Optional.empty();
   private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
@@ -347,6 +348,21 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Clusters the written data by these columns. New or undeclared datasets use the default
+   * space-filling curve settings. For a dataset with a matching active declaration, its curve,
+   * version, and bit width are authoritative.
+   *
+   * @param clusterBy clustering-key columns, in priority order
+   * @return this builder instance
+   * @throws NullPointerException if the list is null or contains a null column name
+   * @throws IllegalArgumentException if the list is empty or contains duplicate column names
+   */
+  public WriteDatasetBuilder clusterBy(List<String> clusterBy) {
+    this.clusterBy = Optional.of(WriteParams.validateClusterBy(clusterBy));
+    return this;
+  }
+
+  /**
    * Sets the session to share caches with other datasets.
    *
    * <p>Note: For write operations, the session is currently not used during the write itself, but
@@ -486,6 +502,7 @@ public class WriteDatasetBuilder {
     targetBases.ifPresent(paramsBuilder::withTargetBases);
     allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
     blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
+    clusterBy.ifPresent(paramsBuilder::withClusterBy);
 
     WriteParams params = paramsBuilder.build();
 
@@ -523,6 +540,7 @@ public class WriteDatasetBuilder {
     targetBases.ifPresent(paramsBuilder::withTargetBases);
     allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
     blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
+    clusterBy.ifPresent(paramsBuilder::withClusterBy);
 
     WriteParams params = paramsBuilder.build();
 

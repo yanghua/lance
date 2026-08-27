@@ -2044,18 +2044,17 @@ class LanceDataset(pa.dataset.Dataset):
         The clustering key lays data out along a multi-column space-filling
         curve so zone-map data skipping is effective across every key column at
         once. This is a metadata-only commit that never rewrites data: the
-        column set is persisted as schema markers and the tuning parameters in
-        the dataset config. Data already written stays in place until it is
-        re-clustered by :py:meth:`DatasetOptimizer.compact_files` with
+        clustering declaration is persisted in the dataset config. Data already
+        written stays in place until it is re-clustered by
+        :py:meth:`DatasetOptimizer.compact_files` with
         ``compaction_mode="cluster"`` (or a clustered ``write_dataset``).
 
         Parameters
         ----------
         columns : List[str]
             The clustering-key columns, in priority order. Must exist in the
-            schema. The column set is immutable once declared: re-declaring a
-            different set raises an error. Bump ``version`` (or change the curve
-            or ``bits_per_dim``) to force existing data to be treated as
+            schema. A changed column set, curve, or ``bits_per_dim`` requires a
+            strictly higher ``version`` so existing data is treated as
             under-clustered and re-clustered on the next optimize.
         curve : {"hilbert", "zorder"}, default "hilbert"
             The space-filling curve. Hilbert has better locality; Z-order is
@@ -2082,13 +2081,11 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.clustering_spec()
 
     def clear_clustering(self) -> None:
-        """Drop the clustering tuning parameters from this dataset.
+        """Drop the clustering declaration from this dataset.
 
-        Existing data keeps its physical layout. Because the clustering-key
-        column markers are immutable, only the tuning config (curve, version,
-        bits-per-dimension) is removed; :py:meth:`clustering_spec` then falls
-        back to the default tuning over the still-marked columns rather than
-        returning None.
+        Existing data keeps its physical layout. The persisted clustering
+        declaration is removed, so :py:meth:`clustering_spec` returns None and
+        future writes and compactions no longer cluster by default.
         """
         self._ds.clear_clustering()
 
@@ -7955,10 +7952,11 @@ def write_dataset(
         ("liquid clustering"). The write stream is sorted by the multi-column
         curve before fragments are rolled, so each fragment is value-coherent
         across every key column and zone-map data skipping is effective on all
-        of them. Uses the default curve and bit width. For non-default tuning
-        that also persists on the dataset and is inherited by later appends,
-        declare a spec with :py:meth:`LanceDataset.set_clustering` instead of
-        passing this argument.
+        of them. On a new or undeclared dataset this is a one-shot sort using
+        the default curve and bit width. On a dataset with an active declaration,
+        the columns must match and the declaration's curve, version, and bit
+        width are authoritative. Omitting this argument also inherits an active
+        declaration for normal dataset writes.
 
     Notes
     -----

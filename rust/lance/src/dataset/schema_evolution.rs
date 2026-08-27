@@ -27,6 +27,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
 use lance_file::version::ConcreteFileVersion;
+use lance_index::clustering::{ClusteringSpec, validate_clustering_data_type};
 use lance_table::format::Fragment;
 
 pub mod optimize;
@@ -64,6 +65,47 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         }
     }
 
+    Ok(())
+}
+
+fn validate_clustering_spec_schema(
+    spec: &ClusteringSpec,
+    schema: &Schema,
+    operation: &str,
+) -> Result<()> {
+    for column in &spec.columns {
+        let Some(field) = schema.fields.iter().find(|field| field.name == *column) else {
+            return Err(Error::invalid_input(format!(
+                "Cannot {operation}: active clustering column {column:?} is missing from the \
+                 resulting schema. Change the clustering declaration with \
+                 Dataset::set_clustering (using a higher version) or remove it with \
+                 Dataset::clear_clustering before changing the schema"
+            )));
+        };
+
+        let data_type = field.data_type();
+        if let Err(error) = validate_clustering_data_type(&data_type) {
+            return Err(Error::invalid_input(format!(
+                "Cannot {operation}: active clustering column {column:?} has unsupported type \
+                 {data_type:?} in the resulting schema ({error}). Change the clustering \
+                 declaration with Dataset::set_clustering (using a higher version) or remove it \
+                 with Dataset::clear_clustering before changing the schema"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that an existing dataset's clustering declaration remains usable
+/// with a candidate replacement schema.
+pub(super) fn validate_active_clustering_schema(
+    dataset: &Dataset,
+    schema: &Schema,
+    operation: &str,
+) -> Result<()> {
+    if let Some(spec) = dataset.clustering_spec()? {
+        validate_clustering_spec_schema(&spec, schema, operation)?;
+    }
     Ok(())
 }
 
@@ -738,6 +780,28 @@ pub(super) async fn alter_columns(
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
     let version = dataset.manifest.data_storage_format.lance_file_format();
+    let clustering_spec = dataset.clustering_spec()?;
+    if let Some(spec) = &clustering_spec {
+        for alteration in alterations {
+            if spec.columns.iter().any(|column| column == &alteration.path)
+                && (alteration.rename.is_some() || alteration.data_type.is_some())
+            {
+                let change = if alteration.rename.is_some() && alteration.data_type.is_some() {
+                    "rename and cast"
+                } else if alteration.rename.is_some() {
+                    "rename"
+                } else {
+                    "cast"
+                };
+                return Err(Error::invalid_input(format!(
+                    "Cannot {change} active clustering column {:?}. Change the clustering \
+                     declaration with Dataset::set_clustering (using a higher version) or remove \
+                     it with Dataset::clear_clustering before altering the column",
+                    alteration.path
+                )));
+            }
+        }
+    }
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -790,6 +854,9 @@ pub(super) async fn alter_columns(
     }
 
     new_schema.validate()?;
+    if let Some(spec) = &clustering_spec {
+        validate_clustering_spec_schema(spec, &new_schema, "alter columns")?;
+    }
 
     // If any column being cast has an attached index, fail fast. Cast operations
     // rewrite the underlying column data and silently invalidate any index on the
@@ -957,6 +1024,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
     let new_schema =
         super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
+    validate_active_clustering_schema(dataset, &new_schema, "drop columns")?;
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -1094,7 +1162,7 @@ mod test {
         }
     }
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::{WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
     };
@@ -1103,6 +1171,7 @@ mod test {
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_index::clustering::ClusteringCurve;
     use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
@@ -1150,6 +1219,190 @@ mod test {
 
     fn data_file_paths_in(base_dir: &str) -> Vec<String> {
         file_paths_in(StdPath::new(base_dir).join("data"))
+    }
+
+    async fn make_clustered_schema_evolution_dataset()
+    -> Result<(TempStrDir, Dataset, ClusteringSpec)> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("key", DataType::Int32, true),
+            ArrowField::new("value", DataType::Int32, true),
+            ArrowField::new("drop_me", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 1])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![30, 40])),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_dir.as_str(),
+            None,
+        )
+        .await?;
+        let spec = ClusteringSpec::with_bits(vec!["key".into()], ClusteringCurve::ZOrder, 1, 32)?;
+        dataset.set_clustering(&spec).await?;
+        Ok((test_dir, dataset, spec))
+    }
+
+    #[rstest]
+    #[case::rename(ColumnAlteration::new("key".into()).rename("renamed_key".into()), "Cannot rename active clustering column")]
+    #[case::cast(ColumnAlteration::new("key".into()).cast_to(DataType::Int64), "Cannot cast active clustering column")]
+    #[tokio::test]
+    async fn test_alter_active_clustering_column_rejected(
+        #[case] alteration: ColumnAlteration,
+        #[case] expected_message: &str,
+    ) -> Result<()> {
+        let (_test_dir, mut dataset, spec) = make_clustered_schema_evolution_dataset().await?;
+        let version = dataset.version().version;
+
+        let error = dataset
+            .alter_columns(&[alteration])
+            .await
+            .expect_err("altering an active clustering column should fail");
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("clear_clustering"),
+            "error should explain how to change the schema: {error}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.clustering_spec()?, Some(spec));
+        assert!(dataset.schema().field("key").is_some());
+        assert!(dataset.schema().field("renamed_key").is_none());
+        assert_eq!(
+            dataset.schema().field("key").unwrap().data_type(),
+            DataType::Int32
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_key_schema_changes_allowed_with_active_clustering() -> Result<()> {
+        let (_test_dir, mut dataset, spec) = make_clustered_schema_evolution_dataset().await?;
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("renamed".into())])
+            .await?;
+        dataset.drop_columns(&["drop_me"]).await?;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("key".into()).set_nullable(false)])
+            .await?;
+
+        assert_eq!(dataset.clustering_spec()?, Some(spec));
+        assert!(dataset.schema().field("key").is_some());
+        assert!(!dataset.schema().field("key").unwrap().nullable);
+        assert!(dataset.schema().field("value").is_none());
+        assert!(dataset.schema().field("renamed").is_some());
+        assert!(dataset.schema().field("drop_me").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drop_active_clustering_column_requires_clearing_policy() -> Result<()> {
+        let (_test_dir, mut dataset, spec) = make_clustered_schema_evolution_dataset().await?;
+        let version = dataset.version().version;
+
+        let error = dataset
+            .drop_columns(&["key"])
+            .await
+            .expect_err("dropping an active clustering column should fail");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("active clustering column \"key\" is missing"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("clear_clustering"));
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.clustering_spec()?, Some(spec));
+        assert!(dataset.schema().field("key").is_some());
+
+        dataset.clear_clustering().await?;
+        dataset.drop_columns(&["key"]).await?;
+        assert!(dataset.clustering_spec()?.is_none());
+        assert!(dataset.schema().field("key").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_rejects_schema_without_active_clustering_column() -> Result<()> {
+        let (test_dir, dataset, spec) = make_clustered_schema_evolution_dataset().await?;
+        let version = dataset.version().version;
+        let overwrite_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let overwrite_batch = RecordBatch::try_new(
+            overwrite_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )?;
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(overwrite_batch)], overwrite_schema),
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("overwrite must preserve the active clustering policy");
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot overwrite dataset: active clustering column \"key\" is missing"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("clear_clustering"));
+
+        let unsupported_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "key",
+            DataType::Utf8,
+            true,
+        )]));
+        let unsupported_batch = RecordBatch::try_new(
+            unsupported_schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["one", "two"]))],
+        )?;
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(unsupported_batch)], unsupported_schema),
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("overwrite must preserve a supported clustering-key type");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(
+                "Cannot overwrite dataset: active clustering column \"key\" has unsupported type Utf8"
+            ),
+            "unexpected error: {error}"
+        );
+
+        let reopened = Dataset::open(test_dir.as_str()).await?;
+        assert_eq!(reopened.version().version, version);
+        assert_eq!(reopened.clustering_spec()?, Some(spec));
+        assert!(reopened.schema().field("key").is_some());
+
+        Ok(())
     }
 
     #[tokio::test]

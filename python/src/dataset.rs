@@ -3407,10 +3407,10 @@ impl Dataset {
     ///
     /// `columns` are the clustering-key columns (order matters). `curve` is
     /// "hilbert" or "zorder"; `bits_per_dim` is the per-column quantization
-    /// width. This is a metadata-only commit: the column set is persisted as
-    /// schema markers and the tuning parameters in the dataset config. The
-    /// column set is immutable once declared; bumping `version` (or changing the
-    /// curve/bits) marks existing data under-clustered for a later recluster.
+    /// width. This is a metadata-only commit persisted in the dataset config.
+    /// Changing the column set, curve, or bit width requires a strictly higher
+    /// `version`, which marks existing data under-clustered for a later
+    /// recluster.
     #[pyo3(signature = (columns, curve, version, bits_per_dim))]
     fn set_clustering(
         &mut self,
@@ -4709,9 +4709,20 @@ pub fn write_dataset(
     dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options, &dest.table_root_uri()?)?;
+    let mut params = get_write_params(options, &dest.table_root_uri()?)?;
+    let cluster_by_columns = params
+        .as_mut()
+        .and_then(|params| params.cluster_by.take())
+        .map(|spec| spec.columns);
+    let mut builder = lance::dataset::InsertBuilder::new(dest.as_dest());
+    if let Some(params) = params.as_ref() {
+        builder = builder.with_params(params);
+    }
+    if let Some(columns) = cluster_by_columns {
+        builder = builder.with_cluster_by_columns(columns);
+    }
     let py = options.py();
-    let ds = if reader.is_instance_of::<Scanner>() {
+    let result = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = rt()
             .block_on(Some(py), scanner.to_reader())?
@@ -4719,21 +4730,32 @@ pub fn write_dataset(
 
         rt().block_on(
             Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
+            builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>),
         )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
         rt().block_on(
             Some(py),
-            LanceDataset::write(batches, dest.as_dest(), params),
+            builder.execute_stream(batches),
         )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
+    let ds = result.map_err(write_error_to_pyerr)?;
     Ok(Dataset {
         uri: ds.uri().to_string(),
         ds: Arc::new(ds),
     })
+}
+
+pub(crate) fn write_error_to_pyerr(error: lance::Error) -> PyErr {
+    let is_clustering_input = matches!(
+        &error,
+        lance::Error::InvalidInput { source, .. } if source.to_string().contains("clustering")
+    );
+    if is_clustering_input {
+        PyValueError::new_err(error.to_string())
+    } else {
+        PyIOError::new_err(error.to_string())
+    }
 }
 
 fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
@@ -4938,11 +4960,9 @@ pub fn get_write_params(
             p = p.with_blob_pack_file_size_threshold(max_bytes);
         }
 
-        // When `cluster_by` is a list of column names, the write stream is
-        // sorted by the clustering-key space-filling curve before fragments are
-        // rolled. Tuning (curve, bit width) uses the defaults; declare a spec on
-        // the dataset with `set_clustering` for non-default tuning that also
-        // persists and is inherited by later appends.
+        // A column-list request uses default tuning for a one-shot write. If the
+        // destination already declares these columns, the Rust write path
+        // resolves the declaration's full curve, version, and bit width.
         if let Some(columns) = get_dict_opt::<Vec<String>>(options, "cluster_by")? {
             p.cluster_by = Some(
                 lance_index::clustering::ClusteringSpec::new(

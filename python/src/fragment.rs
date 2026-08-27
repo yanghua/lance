@@ -37,7 +37,7 @@ use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
-use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
+use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python, write_error_to_pyerr};
 use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
@@ -473,18 +473,20 @@ fn do_write_fragments(
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
-    let params = match kwargs {
+    let mut params = match kwargs {
         Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
         None => WriteParams::default(),
     };
-
-    rt().block_on(
+    let cluster_by_columns = params.cluster_by.take().map(|spec| spec.columns);
+    let mut builder = InsertBuilder::new(dest.as_dest()).with_params(&params);
+    if let Some(columns) = cluster_by_columns {
+        builder = builder.with_cluster_by_columns(columns);
+    }
+    let result = rt().block_on(
         Some(reader.py()),
-        InsertBuilder::new(dest.as_dest())
-            .with_params(&params)
-            .execute_uncommitted_stream(batches),
-    )?
-    .map_err(|err| PyIOError::new_err(err.to_string()))
+        builder.execute_uncommitted_stream(batches),
+    )?;
+    result.map_err(write_error_to_pyerr)
 }
 
 #[pyfunction(name = "_write_fragments")]
@@ -822,13 +824,20 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
         let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
             ob.getattr("created_at_version_meta")?.extract()?;
         let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
+        // Objects serialized before this field was exposed have no attribute.
+        let clustering_version = ob
+            .getattr("clustering_version")
+            .ok()
+            .map(|value| value.extract::<Option<u64>>())
+            .transpose()?
+            .flatten();
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
             files,
             deletion_file,
             physical_rows: ob.getattr("physical_rows")?.extract()?,
-            clustering_version: None,
+            clustering_version,
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
@@ -879,6 +888,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             created_at_version_meta,
             last_updated_at_version_meta,
             overlays,
+            self.0.clustering_version,
         ))
     }
 }

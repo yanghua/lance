@@ -50,16 +50,27 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// that exposure comes with the reclamation and is inherited by whichever flag
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
+/// The dataset has an active liquid-clustering configuration or fragments with
+/// clustering layout version stamps. Readers can safely ignore the stamps, but
+/// writers must preserve existing stamps and honor the active configuration
+/// when adding or rewriting fragments.
+pub const FLAG_CLUSTERING_VERSION: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 512;
 
 // The highest flag allocated must stay below the unknown boundary, or
-// `supported_flags` would refuse a bit this code claims to understand. The next
-// flag takes 256, so it has to move the boundary to 512 with it.
-const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
+// `supported_flags` would refuse a bit this code claims to understand.
+const _: () = assert!(FLAG_CLUSTERING_VERSION < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (128).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 128);
+// Builds predating fragment clustering stamps reject bits at and above 256.
+const _: () = assert!(FLAG_CLUSTERING_VERSION >= 256);
+
+// This is the declaration sentinel defined as `CLUSTERING_VERSION_KEY` in
+// `lance-index`. Keeping the persisted key local avoids a dependency cycle:
+// `lance-index` already depends on `lance-table`.
+const CLUSTERING_VERSION_CONFIG_KEY: &str = "lance.clustering.version";
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -133,6 +144,19 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
+    // An older writer drops the unknown protobuf field when it rewrites a
+    // manifest and does not honor an active clustering declaration when it
+    // creates new fragments. Reading remains safe because clustering metadata
+    // affects data layout and optimization eligibility, not logical values.
+    let has_clustering_metadata = manifest.config.contains_key(CLUSTERING_VERSION_CONFIG_KEY)
+        || manifest
+            .fragments
+            .iter()
+            .any(|fragment| fragment.clustering_version.is_some());
+    if has_clustering_metadata {
+        manifest.writer_feature_flags |= FLAG_CLUSTERING_VERSION;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -189,6 +213,9 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::format::BasePath;
+
     /// The covering fence only works if the bit is one the current released
     /// build already rejects. That build's unknown boundary is 128, so the bit
     /// has to be 128 and this build has to have moved its own boundary past it
@@ -209,9 +236,6 @@ mod tests {
         // the module-level `const _` assertion keeps it at or above that boundary.
     }
 
-    use super::*;
-    use crate::format::BasePath;
-
     #[test]
     fn test_read_check() {
         assert!(can_read_dataset(0));
@@ -228,6 +252,7 @@ mod tests {
             can_read_dataset(super::FLAG_UNSTABLE_DATA_OVERLAY_FILES),
             data_overlay_files_enabled()
         );
+        assert!(can_read_dataset(super::FLAG_CLUSTERING_VERSION));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -289,6 +314,69 @@ mod tests {
     }
 
     #[test]
+    fn test_clustering_version_fences_older_writers_only() {
+        assert_eq!(
+            FLAG_CLUSTERING_VERSION, 256,
+            "the fence must sit on the boundary pre-clustering builds shipped with"
+        );
+        assert!(can_read_dataset(FLAG_CLUSTERING_VERSION));
+        assert!(can_write_dataset(FLAG_CLUSTERING_VERSION));
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_clustering_version_writer_flag() {
+        use crate::format::{DataStorageFormat, Fragment};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let mut configured_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        configured_manifest
+            .config
+            .insert(CLUSTERING_VERSION_CONFIG_KEY.to_string(), "1".to_string());
+        apply_feature_flags(&mut configured_manifest, false, false).unwrap();
+        assert_eq!(
+            configured_manifest.reader_feature_flags & FLAG_CLUSTERING_VERSION,
+            0
+        );
+        assert_ne!(
+            configured_manifest.writer_feature_flags & FLAG_CLUSTERING_VERSION,
+            0
+        );
+
+        let mut stamped_fragment = Fragment::new(0);
+        stamped_fragment.clustering_version = Some(1);
+        let mut stamped_manifest = Manifest::new(
+            schema,
+            Arc::new(vec![stamped_fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut stamped_manifest, false, false).unwrap();
+        assert_eq!(
+            stamped_manifest.reader_feature_flags & FLAG_CLUSTERING_VERSION,
+            0
+        );
+        assert_ne!(
+            stamped_manifest.writer_feature_flags & FLAG_CLUSTERING_VERSION,
+            0
+        );
+    }
+
+    #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
@@ -304,6 +392,7 @@ mod tests {
             can_write_dataset(super::FLAG_UNSTABLE_DATA_OVERLAY_FILES),
             data_overlay_files_enabled()
         );
+        assert!(can_write_dataset(super::FLAG_CLUSTERING_VERSION));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS

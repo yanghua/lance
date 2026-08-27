@@ -16,6 +16,7 @@ package org.lance.compaction;
 import com.google.common.base.MoreObjects;
 
 import java.io.IOException;
+import java.io.InvalidObjectException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OptionalDataException;
@@ -198,6 +199,9 @@ public class CompactionOptions implements Serializable {
           this.compactionMode = Optional.of(m);
           break;
         }
+      }
+      if (!this.compactionMode.isPresent()) {
+        throw new InvalidObjectException("unknown compaction mode: " + modeStr);
       }
     }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());

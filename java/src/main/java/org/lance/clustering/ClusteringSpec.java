@@ -16,16 +16,18 @@ package org.lance.clustering;
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Describes how a dataset is clustered ("liquid clustering").
  *
  * <p>The clustering key lays data out along a multi-column space-filling curve so that zone-map
- * data skipping is effective across every key column at once. The column set is persisted as schema
- * markers and the tuning parameters (curve, version, bits-per-dimension) in the dataset config; see
- * {@code rust/lance-index/src/clustering/mod.rs} for the layout.
+ * data skipping is effective across every key column at once. The complete declaration (columns,
+ * curve, version, and bits-per-dimension) is persisted in the dataset config; see {@code
+ * rust/lance-index/src/clustering/mod.rs} for the layout.
  *
  * <p>Mirrors the Rust {@code ClusteringSpec} and the Python {@code clustering_spec} shape.
  */
@@ -45,15 +47,44 @@ public class ClusteringSpec implements Serializable {
    *
    * @param columns the clustering-key columns, in priority order; must be non-empty
    * @param curve the space-filling curve used to order key values
-   * @param version the clustering layout version; bump it to mark existing data under-clustered
-   * @param bitsPerDim the per-column quantization bit width; {@code columns.size() * bitsPerDim}
-   *     must not exceed 128
+   * @param version the positive clustering layout version; bump it to mark existing data
+   *     under-clustered
+   * @param bitsPerDim the per-column quantization bit width in {@code 1..=64}; {@code
+   *     columns.size() * bitsPerDim} must not exceed 128
+   * @throws NullPointerException if {@code columns}, {@code curve}, or a column name is null
+   * @throws IllegalArgumentException if the columns are empty or duplicated, the version is not
+   *     positive, or the bit-width constraints are violated
    */
   public ClusteringSpec(List<String> columns, ClusteringCurve curve, long version, int bitsPerDim) {
     Objects.requireNonNull(columns, "columns");
     Objects.requireNonNull(curve, "curve");
     if (columns.isEmpty()) {
       throw new IllegalArgumentException("clustering spec must have at least one column");
+    }
+    Set<String> uniqueColumns = new HashSet<>();
+    for (String column : columns) {
+      Objects.requireNonNull(column, "clustering column names must not be null");
+      if (!uniqueColumns.add(column)) {
+        throw new IllegalArgumentException("duplicate clustering column: " + column);
+      }
+    }
+    if (version <= 0) {
+      throw new IllegalArgumentException("clustering version must be positive, got " + version);
+    }
+    if (bitsPerDim < 1 || bitsPerDim > 64) {
+      throw new IllegalArgumentException(
+          "clustering bitsPerDim must be in 1..=64, got " + bitsPerDim);
+    }
+    long totalBits = (long) columns.size() * bitsPerDim;
+    if (totalBits > 128) {
+      throw new IllegalArgumentException(
+          "clustering key is too wide: "
+              + columns.size()
+              + " columns * "
+              + bitsPerDim
+              + " bits = "
+              + totalBits
+              + " bits exceeds the 128-bit limit");
     }
     this.columns = List.copyOf(columns);
     this.curve = curve;

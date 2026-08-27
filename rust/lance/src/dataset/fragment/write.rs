@@ -75,6 +75,7 @@ pub struct FragmentCreateBuilder<'a> {
     dataset_uri: &'a str,
     schema: Option<&'a Schema>,
     write_params: Option<&'a WriteParams>,
+    cluster_by_columns: Option<Vec<String>>,
 }
 
 impl<'a> FragmentCreateBuilder<'a> {
@@ -83,6 +84,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             dataset_uri,
             schema: None,
             write_params: None,
+            cluster_by_columns: None,
         }
     }
 
@@ -103,6 +105,16 @@ impl<'a> FragmentCreateBuilder<'a> {
         self
     }
 
+    /// Cluster a multi-fragment write by a list of columns.
+    ///
+    /// If the destination has an active declaration with the same columns,
+    /// that declaration supplies the authoritative curve, version, and bit
+    /// width. Otherwise this performs a one-shot sort with default tuning.
+    pub fn with_cluster_by_columns(mut self, columns: Vec<String>) -> Self {
+        self.cluster_by_columns = Some(columns);
+        self
+    }
+
     /// Write a fragment.
     pub async fn write(
         &self,
@@ -110,6 +122,16 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
+        if self.cluster_by_columns.is_some()
+            || self
+                .write_params
+                .is_some_and(|params| params.cluster_by.is_some())
+        {
+            return Err(Error::invalid_input(
+                "cluster_by is only supported by multi-fragment writes; use \
+                 FileFragment::create_fragments or InsertBuilder",
+            ));
+        }
         // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
         // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
         // multi-fragment and dataset write paths perform this through
@@ -217,12 +239,20 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut params = self.write_params.cloned().unwrap_or_default();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
+        if self.cluster_by_columns.is_some() && params.cluster_by.is_some() {
+            return Err(Error::invalid_input(
+                "cannot set both WriteParams::cluster_by and \
+                 FragmentCreateBuilder::with_cluster_by_columns",
+            ));
+        }
+        let clustering_requested = self.cluster_by_columns.is_some() || params.cluster_by.is_some();
 
         let version = params.storage_version_or_default();
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
             || params.target_all_bases.is_some()
-            || params.initial_bases.is_some();
+            || params.initial_bases.is_some()
+            || clustering_requested;
         let existing_dataset = if needs_existing_dataset {
             self.existing_dataset(&params).await?
         } else {
@@ -246,6 +276,48 @@ impl<'a> FragmentCreateBuilder<'a> {
                 self.dataset_uri,
             )
             .await?
+        } else {
+            None
+        };
+        let declared_spec = existing_dataset
+            .as_ref()
+            .map(Dataset::clustering_spec)
+            .transpose()?
+            .flatten();
+        let effective_spec = if let Some(columns) = &self.cluster_by_columns {
+            Some(crate::dataset::write::resolve_clustering_columns(
+                columns,
+                existing_dataset.as_ref(),
+            )?)
+        } else if params.cluster_by.is_some() {
+            crate::dataset::write::resolve_clustering_spec(&params, existing_dataset.as_ref())?
+        } else {
+            None
+        };
+        let stream = if let Some(spec) = &effective_spec {
+            spec.validate()?;
+            for column in &spec.columns {
+                let index = stream.schema().index_of(column).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "clustering column {column:?} is not present in the data being written"
+                    ))
+                })?;
+                lance_index::clustering::validate_clustering_data_type(
+                    stream.schema().field(index).data_type(),
+                )?;
+            }
+            lance_index::clustering::cluster_sort_stream(stream, spec).await?
+        } else {
+            stream
+        };
+        // `do_write_fragments_impl` derives both the persisted stamp and the
+        // metadata passed to `progress.complete` from `params.cluster_by`. Keep
+        // only the authoritative dataset declaration here: a one-shot sort has
+        // no persistent layout to stamp, while an active declaration may carry
+        // non-default tuning and a version different from the caller's
+        // column-list convenience spec.
+        params.cluster_by = if clustering_requested {
+            declared_spec
         } else {
             None
         };
@@ -373,12 +445,13 @@ impl<'a> FragmentCreateBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{
         Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use async_trait::async_trait;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::{TempDir, TempStrDir};
     use lance_table::format::BasePath;
@@ -386,6 +459,27 @@ mod tests {
 
     use super::*;
     use crate::dataset::InsertBuilder;
+    use crate::dataset::progress::WriteFragmentProgress;
+
+    #[derive(Debug, Default)]
+    struct RecordingFragmentProgress {
+        completed_versions: Mutex<Vec<Option<u64>>>,
+    }
+
+    #[async_trait]
+    impl WriteFragmentProgress for RecordingFragmentProgress {
+        async fn begin(&self, _fragment: &Fragment) -> Result<()> {
+            Ok(())
+        }
+
+        async fn complete(&self, fragment: &Fragment) -> Result<()> {
+            self.completed_versions
+                .lock()
+                .unwrap()
+                .push(fragment.clustering_version);
+            Ok(())
+        }
+    }
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -599,6 +693,63 @@ mod tests {
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_reports_only_authoritative_clustering_stamps() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let one_shot_dir = TempStrDir::default();
+        let one_shot_progress = Arc::new(RecordingFragmentProgress::default());
+        let one_shot_params = WriteParams {
+            progress: one_shot_progress.clone(),
+            ..Default::default()
+        };
+        let one_shot_fragments = FragmentCreateBuilder::new(one_shot_dir.as_str())
+            .write_params(&one_shot_params)
+            .with_cluster_by_columns(vec!["a".into()])
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert!(
+            one_shot_fragments
+                .iter()
+                .all(|fragment| fragment.clustering_version.is_none())
+        );
+        assert_eq!(
+            *one_shot_progress.completed_versions.lock().unwrap(),
+            vec![None]
+        );
+
+        let declared_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(test_data(), declared_dir.as_str(), None)
+            .await
+            .unwrap();
+        let declared =
+            ClusteringSpec::with_bits(vec!["a".into()], ClusteringCurve::ZOrder, 7, 32).unwrap();
+        dataset.set_clustering(&declared).await.unwrap();
+        let declared_progress = Arc::new(RecordingFragmentProgress::default());
+        let declared_params = WriteParams {
+            mode: WriteMode::Append,
+            progress: declared_progress.clone(),
+            ..Default::default()
+        };
+        let declared_fragments = FragmentCreateBuilder::new(dataset.uri())
+            .schema(dataset.schema())
+            .write_params(&declared_params)
+            .with_cluster_by_columns(vec!["a".into()])
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert!(
+            declared_fragments
+                .iter()
+                .all(|fragment| fragment.clustering_version == Some(7))
+        );
+        assert_eq!(
+            *declared_progress.completed_versions.lock().unwrap(),
+            vec![Some(7)]
+        );
     }
 
     #[tokio::test]

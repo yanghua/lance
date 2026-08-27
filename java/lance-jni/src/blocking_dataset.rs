@@ -39,7 +39,7 @@ use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
-    Version, WriteParams,
+    Version,
 };
 use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -152,15 +152,6 @@ impl BlockingDataset {
                 .with_read_params(params)
                 .list_manifest_locations(),
         )?)
-    }
-
-    pub fn write(
-        reader: impl RecordBatchReader + Send + 'static,
-        uri: &str,
-        params: Option<WriteParams>,
-    ) -> Result<Self> {
-        let inner = block_on(Dataset::write(reader, uri, params))?;
-        Ok(Self { inner })
     }
 
     pub fn new(dataset: Dataset) -> Self {
@@ -779,7 +770,15 @@ fn create_dataset<'local>(
         });
     }
 
-    let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
+    let cluster_by_columns = write_params.cluster_by.take().map(|spec| spec.columns);
+    let mut builder =
+        lance::dataset::InsertBuilder::new(path_str.as_str()).with_params(&write_params);
+    if let Some(columns) = cluster_by_columns {
+        builder = builder.with_cluster_by_columns(columns);
+    }
+    let dataset = BlockingDataset::new(block_on(
+        builder.execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>),
+    )?);
     dataset.into_java(env)
 }
 
@@ -2253,6 +2252,16 @@ fn inner_set_clustering(
     version: jlong,
     bits_per_dim: jint,
 ) -> Result<()> {
+    if version <= 0 {
+        return Err(Error::input_error(format!(
+            "clustering version must be positive, got {version}"
+        )));
+    }
+    if !(1..=64).contains(&bits_per_dim) {
+        return Err(Error::input_error(format!(
+            "clustering bitsPerDim must be in 1..=64, got {bits_per_dim}"
+        )));
+    }
     let columns = env
         .get_strings(&columns)
         .map_err(|e| Error::input_error(format!("failed to read clustering columns: {e}")))?;

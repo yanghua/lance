@@ -783,6 +783,7 @@ def _write_fragments(
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     session: Optional[_Session] = None,
+    cluster_by: Optional[List[str]] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -804,6 +805,7 @@ def _write_fragments_transaction(
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     session: Optional[_Session] = None,
+    cluster_by: Optional[List[str]] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

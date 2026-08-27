@@ -296,6 +296,24 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Clusters the fragment data by these columns using the default space-filling curve settings.
+   *
+   * <p>For a dataset with an active clustering declaration, distributed writers must pass exactly
+   * the declared columns so the authoritative declared curve, version, and bit width are used and
+   * the resulting fragments receive the declaration's clustering-version stamp. This low-level
+   * builder does not inherit a declaration when this option is omitted. On a new or undeclared
+   * dataset, the rows are sorted with the defaults but the fragments remain unstamped.
+   *
+   * @param clusterBy clustering-key columns, in priority order
+   * @return this builder
+   */
+  public WriteFragmentBuilder clusterBy(List<String> clusterBy) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withClusterBy(clusterBy);
+    return this;
+  }
+
+  /**
    * Execute the fragment write operation.
    *
    * @return the list of fragment metadata for the created fragments

@@ -867,6 +867,34 @@ def test_write_cluster_by_sorts_fragments(tmp_path: Path):
     # A clustered write lays rows out sorted by the clustering key.
     seen = _fragment_order(dataset, "k")
     assert seen == sorted(keys)
+    assert all(
+        fragment.metadata.clustering_version is None
+        for fragment in dataset.get_fragments()
+    )
+
+
+def test_write_dataset_inherits_declared_clustering_tuning(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    dataset = lance.write_dataset(pa.table({"k": [1, 2, 3]}), base_dir)
+    dataset.set_clustering(["k"], curve="zorder", version=7, bits_per_dim=32)
+
+    dataset = lance.write_dataset(
+        pa.table({"k": [6, 4, 5]}),
+        dataset,
+        mode="append",
+        cluster_by=["k"],
+    )
+
+    assert dataset.get_fragments()[-1].metadata.clustering_version == 7
+
+
+def test_write_cluster_by_rejects_unknown_column(tmp_path: Path):
+    with pytest.raises(ValueError, match="not present"):
+        lance.write_dataset(
+            pa.table({"k": [1, 2, 3]}),
+            tmp_path,
+            cluster_by=["missing"],
+        )
 
 
 def test_set_and_read_and_clear_clustering(tmp_path: Path):
@@ -888,21 +916,17 @@ def test_set_and_read_and_clear_clustering(tmp_path: Path):
     reopened = lance.dataset(base_dir)
     assert reopened.clustering_spec() == spec
 
-    # The column set is immutable once declared, but the version can be bumped.
+    # Changing the clustering declaration requires a strictly higher version.
     dataset.set_clustering(["a", "b"], curve="zorder", version=2, bits_per_dim=20)
     assert dataset.clustering_spec()["version"] == 2
-    with pytest.raises(ValueError, match="immutable"):
-        dataset.set_clustering(["a"], curve="zorder", version=3)
+    with pytest.raises(ValueError, match="version greater than 2"):
+        dataset.set_clustering(["a"], curve="zorder", version=2)
+    dataset.set_clustering(["a"], curve="zorder", version=3)
+    assert dataset.clustering_spec()["columns"] == ["a"]
 
-    # Clearing drops the tuning config but the column markers are immutable, so
-    # the spec falls back to defaults over the still-marked columns.
+    # Clearing removes the declaration and leaves the existing layout alone.
     dataset.clear_clustering()
-    assert dataset.clustering_spec() == {
-        "columns": ["a", "b"],
-        "curve": "hilbert",
-        "version": 1,
-        "bits_per_dim": 16,
-    }
+    assert dataset.clustering_spec() is None
 
 
 def test_set_clustering_rejects_unknown_column(tmp_path: Path):
@@ -945,5 +969,5 @@ def test_recluster_compaction_sorts_under_clustered(tmp_path: Path):
 def test_recluster_compaction_requires_spec(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     dataset = lance.write_dataset(pa.table({"k": [3, 1, 2]}), base_dir)
-    with pytest.raises(OSError, match="clustering spec"):
+    with pytest.raises(ValueError, match="clustering spec"):
         dataset.optimize.compact_files(compaction_mode="cluster", num_threads=1)

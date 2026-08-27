@@ -77,7 +77,7 @@ pub async fn cluster_sort_stream(
             Arc::new(DFColumn::new(input_schema.field(idx).name(), idx)) as Arc<dyn PhysicalExpr>
         })
         .collect();
-    let udf = ClusteringOrderUdf::new(SpaceFillingEncoder::from_spec(spec)?, spec.columns.len());
+    let udf = ClusteringOrderUdf::new(SpaceFillingEncoder::from_spec(spec)?, spec.columns.len())?;
     let order_width = udf.output_width;
     let order_expr = Arc::new(ScalarFunctionExpr::new(
         CLUSTERING_ORDER_FIELD,
@@ -146,14 +146,14 @@ struct ClusteringOrderUdf {
 }
 
 impl ClusteringOrderUdf {
-    fn new(encoder: SpaceFillingEncoder, num_columns: usize) -> Self {
-        let output_width = encoder.output_width(num_columns);
-        Self {
+    fn new(encoder: SpaceFillingEncoder, num_columns: usize) -> Result<Self> {
+        let output_width = encoder.output_width(num_columns)?;
+        Ok(Self {
             signature: Signature::any(num_columns, Volatility::Immutable),
             encoder,
             num_columns,
             output_width,
-        }
+        })
     }
 }
 

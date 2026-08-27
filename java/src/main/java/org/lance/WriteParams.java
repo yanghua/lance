@@ -16,9 +16,12 @@ package org.lance;
 import com.google.common.base.MoreObjects;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** Write Params for Write Operations of Lance. */
 public class WriteParams {
@@ -153,14 +156,30 @@ public class WriteParams {
    *
    * <p>When set, the write stream is sorted by the multi-column space-filling curve before
    * fragments are rolled, so each fragment is value-coherent across every key column. Uses the
-   * default curve and bit width. For non-default tuning that also persists on the dataset and is
-   * inherited by later appends, declare a spec with {@link org.lance.Dataset#setClustering}
-   * instead.
+   * default curve and bit width for a new or undeclared dataset. For an existing dataset with a
+   * matching active declaration, the declaration supplies the authoritative curve, version, and bit
+   * width. Low-level distributed fragment writes must explicitly pass the same column list;
+   * omitting this option does not inherit the declaration.
    *
    * @return Optional containing the clustering-key columns, or empty if not set
    */
   public Optional<List<String>> getClusterBy() {
     return clusterBy;
+  }
+
+  static List<String> validateClusterBy(List<String> clusterBy) {
+    Objects.requireNonNull(clusterBy, "clusterBy");
+    if (clusterBy.isEmpty()) {
+      throw new IllegalArgumentException("clusterBy must contain at least one column");
+    }
+    Set<String> uniqueColumns = new HashSet<>();
+    for (String column : clusterBy) {
+      Objects.requireNonNull(column, "clusterBy column names must not be null");
+      if (!uniqueColumns.add(column)) {
+        throw new IllegalArgumentException("duplicate clusterBy column: " + column);
+      }
+    }
+    return List.copyOf(clusterBy);
   }
 
   @Override
@@ -301,15 +320,18 @@ public class WriteParams {
      *
      * <p>The write stream is sorted by the multi-column curve before fragments are rolled, so each
      * fragment is value-coherent across every key column and zone-map data skipping is effective on
-     * all of them. Uses the default curve and bit width. For non-default tuning that also persists
-     * on the dataset and is inherited by later appends, declare a spec with {@link
-     * org.lance.Dataset#setClustering} instead of setting this.
+     * all of them. A new or undeclared dataset uses the default tuning. For an existing dataset
+     * with a matching declaration, that declaration supplies the authoritative curve, version, and
+     * bit width. Low-level distributed fragment writes must explicitly pass the same column list;
+     * omitting this option does not inherit the declaration.
      *
      * @param clusterBy the clustering-key columns, in priority order
      * @return this builder
+     * @throws NullPointerException if the list is null or contains a null column name
+     * @throws IllegalArgumentException if the list is empty or contains duplicate column names
      */
     public Builder withClusterBy(List<String> clusterBy) {
-      this.clusterBy = Optional.of(clusterBy);
+      this.clusterBy = Optional.of(validateClusterBy(clusterBy));
       return this;
     }
 

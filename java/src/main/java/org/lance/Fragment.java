@@ -311,6 +311,7 @@ public class Fragment {
               tableId,
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
+              params.getClusterBy(),
               lanceSchema.memoryAddress(),
               sessionHandle);
         }
@@ -333,6 +334,7 @@ public class Fragment {
           tableId,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold(),
+          params.getClusterBy(),
           0L,
           sessionHandle);
     }
@@ -383,6 +385,7 @@ public class Fragment {
             tableId,
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getClusterBy(),
             lanceSchema.memoryAddress(),
             sessionHandle);
       }
@@ -404,6 +407,7 @@ public class Fragment {
         tableId,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold(),
+        params.getClusterBy(),
         0L,
         sessionHandle);
   }
@@ -435,6 +439,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      Optional<List<String>> clusterBy,
       long schemaMemoryAddress,
       long sessionHandle);
 
@@ -456,6 +461,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      Optional<List<String>> clusterBy,
       long schemaMemoryAddress,
       long sessionHandle);
 }

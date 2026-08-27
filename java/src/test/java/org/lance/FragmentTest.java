@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.lance.clustering.ClusteringCurve;
+import org.lance.clustering.ClusteringSpec;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -21,16 +23,22 @@ import org.lance.operation.Project;
 import org.lance.operation.Update;
 import org.lance.schema.LanceField;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -54,6 +62,83 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
+  @Test
+  void testFragmentCreateFfiArrayForwardsClusterBy(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("clustered_fragment_array").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        VectorSchemaRoot root =
+            VectorSchemaRoot.create(
+                new TestUtils.SimpleTestDataset(allocator, datasetPath).getSchema(), allocator)) {
+      root.allocateNew();
+      ((IntVector) root.getVector("id")).setSafe(0, 1);
+      ((VarCharVector) root.getVector("name"))
+          .setSafe(0, "Person 1".getBytes(StandardCharsets.UTF_8));
+      root.setRowCount(1);
+
+      WriteParams params =
+          new WriteParams.Builder().withClusterBy(Arrays.asList("missing")).build();
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Fragment.create(datasetPath, allocator, root, params));
+      assertTrue(error.getMessage().contains("clustering column \"missing\""));
+    }
+  }
+
+  @Test
+  void testFragmentCreateFfiStreamForwardsClusterBy(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("clustered_fragment_stream").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        VectorSchemaRoot root =
+            VectorSchemaRoot.create(
+                new TestUtils.SimpleTestDataset(allocator, datasetPath).getSchema(), allocator)) {
+      root.allocateNew();
+      ((IntVector) root.getVector("id")).setSafe(0, 1);
+      ((VarCharVector) root.getVector("name"))
+          .setSafe(0, "Person 1".getBytes(StandardCharsets.UTF_8));
+      root.setRowCount(1);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(
+                  new ByteArrayReadableSeekableByteChannel(out.toByteArray()), allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        WriteParams params =
+            new WriteParams.Builder().withClusterBy(Arrays.asList("missing")).build();
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class, () -> Fragment.create(datasetPath, stream, params));
+        assertTrue(error.getMessage().contains("clustering column \"missing\""));
+      }
+    }
+  }
+
+  @Test
+  void testFragmentCreateUsesDeclaredClusteringTuning(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("clustered_fragment_declared").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        dataset.setClustering(
+            new ClusteringSpec(Arrays.asList("id"), ClusteringCurve.ZORDER, 3, 32));
+      }
+
+      WriteParams params = new WriteParams.Builder().withClusterBy(Arrays.asList("id")).build();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(4, params);
+
+      assertEquals(1, fragments.size());
+      assertEquals(Long.valueOf(3), fragments.get(0).getClusteringVersion());
+    }
+  }
+
   @Test
   void testFragmentCreateFfiArray(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();

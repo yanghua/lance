@@ -125,6 +125,10 @@ message Manifest {
   //   merely-carried column with an index keyed on a different column. Writers must
   //   refuse it too: one that treats every entry of fields as keyed would maintain
   //   the index against the wrong dependency set.
+  // * 1 << 8: the dataset has an active liquid-clustering configuration or fragments
+  //   with clustering layout version stamps. Readers may ignore this metadata, but
+  //   writers must preserve existing stamps and honor the active configuration.
+  //   This bit is therefore set only in writer_feature_flags.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -396,9 +400,10 @@ message DataFragment {
 
   // The clustering layout version this fragment's data was written under, if
   // it was written by a clustering-aware writer (see the `lance.clustering.*`
-  // dataset config). A fragment whose stamp is absent (0) or lower than the
+  // dataset config). A fragment whose stamp is absent (0) or does not equal the
   // dataset's current clustering version is "under-clustered" and is a
   // candidate for re-clustering during optimize. Zero means unset.
+  // Writers require feature flag 256 when this field is nonzero.
   uint64 clustering_version = 12;
 }
 

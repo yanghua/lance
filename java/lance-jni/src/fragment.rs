@@ -111,6 +111,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    cluster_by: JObject,                        // Optional<List<String>>
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
@@ -135,6 +136,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            cluster_by,
             schema_addr,
             session_handle,
         ),
@@ -162,6 +164,7 @@ fn inner_create_with_ffi_array<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    cluster_by: JObject,                        // Optional<List<String>>
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -195,6 +198,7 @@ fn inner_create_with_ffi_array<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        cluster_by,
         schema_addr,
         session_handle,
         reader,
@@ -221,6 +225,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    cluster_by: JObject,                        // Optional<List<String>>
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
@@ -244,6 +249,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            cluster_by,
             schema_addr,
             session_handle,
         ),
@@ -270,6 +276,7 @@ fn inner_create_with_ffi_stream<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    cluster_by: JObject,                        // Optional<List<String>>
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -293,6 +300,7 @@ fn inner_create_with_ffi_stream<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        cluster_by,
         schema_addr,
         session_handle,
         reader,
@@ -317,6 +325,7 @@ fn create_fragment<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    cluster_by: JObject,                        // Optional<List<String>>
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
@@ -338,7 +347,7 @@ fn create_fragment<'a>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
-        None,
+        Some(&cluster_by),
     )?;
 
     write_params.session = session_from_handle(session_handle);
@@ -369,7 +378,11 @@ fn create_fragment<'a>(
         });
     }
 
+    let cluster_by_columns = write_params.cluster_by.take().map(|spec| spec.columns);
     let mut builder = FragmentCreateBuilder::new(&path_str).write_params(&write_params);
+    if let Some(columns) = cluster_by_columns {
+        builder = builder.with_cluster_by_columns(columns);
+    }
     let schema;
     if schema_addr != 0 {
         let c_schema_ptr = schema_addr as *mut FFI_ArrowSchema;
@@ -692,7 +705,7 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/lang/Long;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -847,6 +860,17 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        let clustering_version = match self.clustering_version {
+            Some(version) => {
+                let version = i64::try_from(version).map_err(|_| {
+                    Error::runtime_error(format!(
+                        "clustering version {version} exceeds the Java long range"
+                    ))
+                })?;
+                JLance(version).into_java(env)?
+            }
+            None => JObject::null(),
+        };
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -859,6 +883,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&clustering_version),
             ],
         )
         .map_err(|e| {
@@ -930,15 +955,31 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
         let last_updated_at_version_meta =
             extract_nullable_field(env, self, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
+        let clustering_version_obj = env
+            .call_method(self, "getClusteringVersion", "()Ljava/lang/Long;", &[])?
+            .l()?;
+        let clustering_version: Option<i64> = clustering_version_obj.extract_object(env)?;
+        let clustering_version = clustering_version
+            .map(|version| {
+                if version <= 0 {
+                    return Err(Error::input_error(format!(
+                        "clustering version must be positive, got {version}"
+                    )));
+                }
+                u64::try_from(version).map_err(|_| {
+                    Error::input_error(format!(
+                        "clustering version must be positive, got {version}"
+                    ))
+                })
+            })
+            .transpose()?;
 
         Ok(Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
-            // Clustering is not exposed to Java yet, and the reverse conversion
-            // does not export it, so this round-trip is clustering-unaware.
-            clustering_version: None,
+            clustering_version,
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,

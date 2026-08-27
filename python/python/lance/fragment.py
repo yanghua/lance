@@ -98,6 +98,9 @@ class FragmentMetadata:
         Overlays are created via :class:`LanceOperation.DataOverlay`; they are
         carried here so they survive operations that round-trip fragment
         metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
+    clustering_version : Optional[int]
+        The clustering layout version under which this fragment was written,
+        or None when the fragment has not been clustered.
     """
 
     id: int
@@ -108,6 +111,7 @@ class FragmentMetadata:
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
     overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
+    clustering_version: Optional[int] = None
 
     @property
     def num_deletions(self) -> int:
@@ -151,6 +155,7 @@ class FragmentMetadata:
             files=files,
             overlays=overlays,
             physical_rows=self.physical_rows,
+            clustering_version=self.clustering_version,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
             ),
@@ -216,6 +221,7 @@ class FragmentMetadata:
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
             overlays=overlays,
+            clustering_version=json_data.get("clustering_version"),
         )
 
 
@@ -1099,6 +1105,7 @@ if TYPE_CHECKING:
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
         session: Optional[Session] = None,
+        cluster_by: Optional[List[str]] = None,
     ) -> Transaction: ...
 
     @overload
@@ -1126,6 +1133,7 @@ if TYPE_CHECKING:
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
         session: Optional[Session] = None,
+        cluster_by: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -1153,6 +1161,7 @@ def write_fragments(
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
     session: Optional[Session] = None,
+    cluster_by: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -1265,6 +1274,12 @@ def write_fragments(
     session : optional, Session
         A session to reuse across operations. The session holds shared caches
         (metadata and index) and the object store registry.
+    cluster_by : optional, List[str]
+        Cluster the written data by these columns using the default
+        space-filling curve and bit width. When the destination dataset has an
+        exactly matching clustering declaration, returned fragments are stamped
+        with its layout version. A one-shot sort on a new or undeclared dataset
+        remains unstamped because there is no authoritative persisted layout.
 
     Returns
     -------
@@ -1343,6 +1358,7 @@ def write_fragments(
         external_blob_mode=external_blob_mode,
         allow_external_blob_outside_bases=allow_external_blob_outside_bases,
         session=session,
+        cluster_by=cluster_by,
     )
 
 

@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.lance.clustering.ClusteringCurve;
+import org.lance.clustering.ClusteringSpec;
 import org.lance.compaction.Compaction;
 import org.lance.compaction.CompactionMetrics;
 import org.lance.compaction.CompactionMode;
@@ -32,13 +34,18 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Add test for distributed compaction. */
 public class CompactionTest {
@@ -223,6 +230,83 @@ public class CompactionTest {
     }
   }
 
+  @Test
+  public void testClusterCompactionSerializationPreservesClusteringVersions(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("test_cluster_compaction_serialization").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        dataset.setClustering(
+            new ClusteringSpec(Collections.singletonList("id"), ClusteringCurve.HILBERT, 1, 16));
+      }
+
+      WriteParams clusteredWriteParams =
+          new WriteParams.Builder()
+              .withMaxRowsPerFile(10)
+              .withClusterBy(Collections.singletonList("id"))
+              .build();
+      List<FragmentMetadata> clusteredFragments =
+          testDataset.createNewFragment(20, clusteredWriteParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator,
+              datasetPath,
+              new FragmentOperation.Append(clusteredFragments),
+              Optional.of(2L))) {
+        assertClusteringVersion(dataset.getFragments(), 1L);
+
+        dataset.setClustering(
+            new ClusteringSpec(Collections.singletonList("id"), ClusteringCurve.HILBERT, 2, 16));
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withCompactionMode(CompactionMode.CLUSTER)
+                .build();
+        CompactionPlan plan = Compaction.planCompaction(dataset, options);
+        assertEquals(1, plan.getCompactionTasks().size());
+
+        CompactionTask task = plan.getCompactionTasks().get(0);
+        assertEquals(2, task.getTaskData().getFragments().size());
+        assertFragmentMetadataClusteringVersion(task.getTaskData().getFragments(), 1L);
+        task = serializeAndDeserialize(task);
+        assertEquals(2, task.getTaskData().getFragments().size());
+        assertFragmentMetadataClusteringVersion(task.getTaskData().getFragments(), 1L);
+
+        RewriteResult result = task.execute(dataset);
+        assertEquals(2, result.getOriginalFragments().size());
+        assertEquals(1, result.getNewFragments().size());
+        assertFragmentMetadataClusteringVersion(result.getOriginalFragments(), 1L);
+        assertFragmentMetadataClusteringVersion(result.getNewFragments(), 2L);
+        result = serializeAndDeserialize(result);
+        assertEquals(2, result.getOriginalFragments().size());
+        assertEquals(1, result.getNewFragments().size());
+        assertFragmentMetadataClusteringVersion(result.getOriginalFragments(), 1L);
+        assertFragmentMetadataClusteringVersion(result.getNewFragments(), 2L);
+
+        Compaction.commitCompaction(dataset, Collections.singletonList(result), options);
+        dataset.checkoutLatest();
+        assertEquals(1, dataset.getFragments().size());
+        assertEquals(20, dataset.getFragments().get(0).countRows());
+        assertClusteringVersion(dataset.getFragments(), 2L);
+        assertEquals(0, Compaction.planCompaction(dataset, options).getCompactionTasks().size());
+      }
+    }
+  }
+
+  @Test
+  public void testDeserializeOptionsRejectsUnknownCompactionMode() throws Exception {
+    CompactionOptions options =
+        CompactionOptions.builder().withCompactionMode(CompactionMode.REENCODE).build();
+    byte[] serialized = serialize(options);
+    replaceSerializedToken(serialized, "reencode", "unknown!");
+
+    IOException exception = assertThrows(IOException.class, () -> deserialize(serialized));
+    assertTrue(exception.getMessage().contains("unknown!"));
+  }
+
   /**
    * A serialized CompactionOptions produced by the class as it existed before maxSourceRows and
    * maxSourceBytes were added (no declared serialVersionUID, stream ends after maxSourceFragments),
@@ -259,16 +343,55 @@ public class CompactionTest {
 
   private static <T> T serializeAndDeserialize(T object)
       throws IOException, ClassNotFoundException {
+    return deserialize(serialize(object));
+  }
+
+  private static byte[] serialize(Object object) throws IOException {
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
     try (ObjectOutputStream out = new ObjectOutputStream(outputStream)) {
       out.writeObject(object);
     }
-    byte[] serialized = outputStream.toByteArray();
+    return outputStream.toByteArray();
+  }
+
+  private static <T> T deserialize(byte[] serialized) throws IOException, ClassNotFoundException {
     ByteArrayInputStream inputStream = new ByteArrayInputStream(serialized);
     try (ObjectInputStream in = new ObjectInputStream(inputStream)) {
       @SuppressWarnings("unchecked")
       T deserialized = (T) in.readObject();
       return deserialized;
+    }
+  }
+
+  private static void replaceSerializedToken(byte[] serialized, String oldValue, String newValue) {
+    byte[] oldBytes = oldValue.getBytes(StandardCharsets.UTF_8);
+    byte[] newBytes = newValue.getBytes(StandardCharsets.UTF_8);
+    assertEquals(oldBytes.length, newBytes.length);
+    for (int i = 0; i <= serialized.length - oldBytes.length; i++) {
+      boolean matches = true;
+      for (int j = 0; j < oldBytes.length; j++) {
+        if (serialized[i + j] != oldBytes[j]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        System.arraycopy(newBytes, 0, serialized, i, newBytes.length);
+        return;
+      }
+    }
+    throw new AssertionError("Serialized token not found: " + oldValue);
+  }
+
+  private static void assertClusteringVersion(List<Fragment> fragments, long expectedVersion) {
+    assertFragmentMetadataClusteringVersion(
+        fragments.stream().map(Fragment::metadata).collect(Collectors.toList()), expectedVersion);
+  }
+
+  private static void assertFragmentMetadataClusteringVersion(
+      List<FragmentMetadata> fragments, long expectedVersion) {
+    for (FragmentMetadata fragment : fragments) {
+      assertEquals(Long.valueOf(expectedVersion), fragment.getClusteringVersion());
     }
   }
 }

@@ -870,6 +870,68 @@ public class DirectoryNamespaceTest {
   }
 
   @Test
+  void testWriteDatasetBuilderNamespaceForwardsClusterBy() throws Exception {
+    List<String> tableId = Arrays.asList("clustered_table");
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null),
+                new Field("value", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      ((IntVector) root.getVector("id")).setSafe(0, 1);
+      ((IntVector) root.getVector("value")).setSafe(0, 2);
+      root.setRowCount(1);
+
+      ArrowReader reader =
+          new ArrowReader(allocator) {
+            private boolean batchLoaded;
+
+            @Override
+            public boolean loadNextBatch() {
+              if (batchLoaded) {
+                return false;
+              }
+              batchLoaded = true;
+              return true;
+            }
+
+            @Override
+            public long bytesRead() {
+              return 0;
+            }
+
+            @Override
+            protected void closeReadSource() {}
+
+            @Override
+            protected Schema readSchema() {
+              return schema;
+            }
+
+            @Override
+            public VectorSchemaRoot getVectorSchemaRoot() {
+              return root;
+            }
+          };
+
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  Dataset.write()
+                      .allocator(allocator)
+                      .reader(reader)
+                      .namespaceClient(namespaceClient)
+                      .tableId(tableId)
+                      .clusterBy(Arrays.asList("missing"))
+                      .execute());
+      assertTrue(error.getMessage().contains("clustering column \"missing\""));
+    }
+  }
+
+  @Test
   void testConcurrentCreateAndDropWithSingleInstance() throws Exception {
     // Initialize namespace first - create parent namespace to ensure __manifest table
     // is created before concurrent operations

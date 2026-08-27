@@ -10,7 +10,7 @@ use crate::Result;
 use futures::future::BoxFuture;
 use lance_core::datatypes::FieldRef;
 use lance_core::datatypes::Schema;
-use lance_index::clustering::ClusteringSpec;
+use lance_index::clustering::{ClusteringSpec, validate_clustering_data_type};
 
 /// Execute a metadata update operation on a dataset.
 /// This is moved from Dataset::update_op to keep metadata logic in this module.
@@ -73,6 +73,32 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            if matches!(&self.metadata_type, MetadataType::Config) {
+                let reserved_update = self
+                    .values
+                    .iter()
+                    .find(|entry| entry.key.starts_with("lance.clustering."));
+                let replaces_reserved = self.replace
+                    && self
+                        .dataset
+                        .config()
+                        .keys()
+                        .any(|key| key.starts_with("lance.clustering."));
+                if let Some(entry) = reserved_update {
+                    return Err(crate::Error::invalid_input(format!(
+                        "config key {:?} is reserved; use set_clustering or \
+                         clear_clustering to update clustering configuration",
+                        entry.key
+                    )));
+                }
+                if replaces_reserved {
+                    return Err(crate::Error::invalid_input(
+                        "replacing dataset config would remove reserved lance.clustering.* \
+                         keys; use clear_clustering first",
+                    ));
+                }
+            }
+
             let update_map = Self::create_update_map(self.values, self.replace);
 
             let operation = match self.metadata_type {
@@ -178,89 +204,109 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
 
 /// Declare the clustering spec on a dataset.
 ///
-/// The clustering *columns* are persisted as per-field schema markers (reusing
-/// the existing unenforced-clustering-key mechanism), and the tuning parameters
-/// (curve, version, bit width) are written to the dataset config. Both go
-/// through the ordinary metadata-update path, so this never rewrites data.
+/// The complete declaration (columns, curve, version, and bit width) is stored
+/// in the dataset config in one metadata-only commit.
 ///
-/// The clustering columns are validated against the current schema. Because the
-/// clustering-key markers are immutable once set, declaring a *different* column
-/// set on an already-clustered dataset is rejected; changing the tuning
-/// parameters (e.g. bumping the version to force a recluster) is always allowed.
+/// The clustering columns must be supported top-level scalar columns in the
+/// current schema. An identical declaration is a no-op; every other layout
+/// update, including a column change, must strictly increase the version.
 pub async fn set_clustering(dataset: &mut Dataset, spec: &ClusteringSpec) -> Result<()> {
-    use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+    spec.validate()?;
 
     for column in &spec.columns {
-        if dataset.schema().field(column).is_none() {
+        let Some(field) = dataset
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.name == *column)
+        else {
+            if dataset.schema().field(column).is_some() {
+                return Err(crate::Error::invalid_input(format!(
+                    "clustering column {column:?} is a nested path; only top-level columns \
+                     are currently supported"
+                )));
+            }
             return Err(crate::Error::invalid_input(format!(
                 "clustering column {column:?} does not exist in the dataset schema"
             )));
-        }
+        };
+        validate_clustering_data_type(&field.data_type())?;
     }
 
-    let existing: Vec<String> = dataset
-        .schema()
-        .unenforced_clustering_key()
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
-
-    if existing.is_empty() {
-        // Install the clustering-key markers, one per column, 1-based position.
-        let mut builder = dataset.update_field_metadata();
-        for (idx, column) in spec.columns.iter().enumerate() {
-            builder = builder.update(
-                column.as_str(),
-                [(
-                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
-                    (idx + 1).to_string(),
-                )],
-            )?;
+    if let Some(current) = clustering_spec(dataset)? {
+        if current == *spec {
+            return Ok(());
         }
-        builder.await?;
-    } else if existing != spec.columns {
+        if spec.version < current.version {
+            return Err(crate::Error::invalid_input(format!(
+                "clustering version cannot decrease from {} to {}",
+                current.version, spec.version
+            )));
+        }
+        if spec.version == current.version {
+            return Err(crate::Error::invalid_input(format!(
+                "changing clustering columns, curve, or bits_per_dim requires a version \
+                 greater than {}; got {}",
+                current.version, spec.version
+            )));
+        }
+    } else if let Some(max_fragment_version) = dataset
+        .iter_fragments()
+        .filter_map(|fragment| fragment.clustering_version)
+        .max()
+        && spec.version <= max_fragment_version
+    {
         return Err(crate::Error::invalid_input(format!(
-            "clustering columns are already set to {existing:?} and cannot be changed to \
-             {:?}; the clustering key is immutable once declared",
-            spec.columns
+            "clustering version must be greater than the maximum existing fragment \
+             clustering version {max_fragment_version} when re-enabling clustering; got {}",
+            spec.version
         )));
     }
 
-    // Tuning parameters live in config and are always updatable.
-    let updates = spec
-        .to_config()
-        .into_iter()
-        .map(|(k, v)| (k, Some(v)))
-        .collect::<Vec<_>>();
-    dataset.update_config(updates).await?;
-    Ok(())
+    let config_updates = UpdateMap {
+        update_entries: spec.to_config().into_iter().map(Into::into).collect(),
+        replace: false,
+    };
+    execute_metadata_update(
+        dataset,
+        Operation::UpdateConfig {
+            config_updates: Some(config_updates),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+    )
+    .await
 }
 
 /// Read the clustering spec declared on a dataset, if any.
 ///
-/// Returns `Ok(None)` when no clustering columns are marked in the schema.
+/// Returns `Ok(None)` when the dataset config has no clustering declaration.
 pub fn clustering_spec(dataset: &Dataset) -> Result<Option<ClusteringSpec>> {
-    let columns: Vec<String> = dataset
-        .schema()
-        .unenforced_clustering_key()
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
-    ClusteringSpec::from_parts(columns, dataset.config())
+    ClusteringSpec::from_config(dataset.config())
 }
 
-/// Remove the clustering tuning parameters from a dataset's config.
-///
-/// The clustering-key column markers are immutable and are left in place;
-/// clearing only drops the tuning config so future writes and compactions fall
-/// back to default (unclustered) behavior.
+/// Remove the clustering declaration from the dataset config.
 pub async fn clear_clustering(dataset: &mut Dataset) -> Result<()> {
-    let deletes = ClusteringSpec::config_keys()
-        .into_iter()
-        .map(|k| (k, None))
-        .collect::<Vec<_>>();
-    dataset.update_config(deletes).await?;
-    Ok(())
+    let config_updates = UpdateMap {
+        update_entries: dataset
+            .config()
+            .keys()
+            .filter(|key| key.starts_with("lance.clustering."))
+            .map(|key| (key.clone(), None).into())
+            .collect(),
+        replace: false,
+    };
+    execute_metadata_update(
+        dataset,
+        Operation::UpdateConfig {
+            config_updates: Some(config_updates),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -849,6 +895,10 @@ mod tests {
         let ck = reopened.schema().unenforced_clustering_key();
         assert_eq!(ck.len(), 1);
         assert_eq!(ck[0].name, "a");
+        assert!(
+            reopened.clustering_spec().unwrap().is_none(),
+            "a legacy physical-layout marker must not activate liquid clustering"
+        );
     }
 
     #[tokio::test]
@@ -978,24 +1028,29 @@ mod tests {
         let mut dataset = Dataset::write(data, uri, None).await.unwrap();
 
         assert!(dataset.clustering_spec().unwrap().is_none());
+        let version_before = dataset.version_id();
 
         let spec =
             ClusteringSpec::with_bits(vec!["x".into(), "y".into()], ClusteringCurve::ZOrder, 1, 20)
                 .unwrap();
         dataset.set_clustering(&spec).await.unwrap();
+        assert_eq!(dataset.version_id(), version_before + 1);
 
-        // Columns are persisted as schema markers, ordered by position.
-        let ck: Vec<String> = dataset
-            .schema()
-            .unenforced_clustering_key()
-            .iter()
-            .map(|f| f.name.clone())
-            .collect();
-        assert_eq!(ck, vec!["x".to_string(), "y".to_string()]);
+        // The entire declaration is stored in config without claiming that the
+        // existing physical layout satisfies an unenforced clustering key.
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
+        for key in ClusteringSpec::config_keys() {
+            assert!(dataset.config().contains_key(key));
+        }
 
-        // Full spec round-trips through schema + config.
+        // Full spec round-trips through config.
         let read_back = dataset.clustering_spec().unwrap().unwrap();
         assert_eq!(read_back, spec);
+
+        // Reapplying the exact declaration is idempotent and does not commit.
+        let declared_version = dataset.version_id();
+        dataset.set_clustering(&spec).await.unwrap();
+        assert_eq!(dataset.version_id(), declared_version);
 
         // Survives reopen.
         let reopened = Dataset::open(uri).await.unwrap();
@@ -1018,7 +1073,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_clustering_bump_version_but_reject_column_change() {
+    async fn test_set_clustering_rejects_unsupported_and_nested_columns_before_commit() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let mut dataset = test_dataset_nested().await;
+        let version_before = dataset.version_id();
+
+        let unsupported =
+            ClusteringSpec::new(vec!["name".into()], ClusteringCurve::Hilbert).unwrap();
+        let err = dataset.set_clustering(&unsupported).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("does not support column type"),
+            "got {err}"
+        );
+        assert_eq!(dataset.version_id(), version_before);
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
+        assert!(dataset.clustering_spec().unwrap().is_none());
+
+        let nested =
+            ClusteringSpec::new(vec!["nested.sub_field".into()], ClusteringCurve::Hilbert).unwrap();
+        let err = dataset.set_clustering(&nested).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains("nested path"), "got {err}");
+        assert_eq!(dataset.version_id(), version_before);
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
+        assert!(dataset.clustering_spec().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_clustering_allows_column_change_with_higher_version() {
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
         let data = gen_batch()
@@ -1036,15 +1120,85 @@ mod tests {
         dataset.set_clustering(&bumped).await.unwrap();
         assert_eq!(dataset.clustering_spec().unwrap().unwrap().version, 2);
 
-        // Changing the column set is rejected: the clustering key is immutable.
-        let changed =
-            ClusteringSpec::new(vec!["x".into(), "y".into()], ClusteringCurve::Hilbert).unwrap();
-        let err = dataset.set_clustering(&changed).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
+        // The config-only declaration can evolve to a new column set when its
+        // layout version increases.
+        let changed = ClusteringSpec::with_bits(
+            vec!["x".into(), "y".into()],
+            ClusteringCurve::Hilbert,
+            3,
+            16,
+        )
+        .unwrap();
+        dataset.set_clustering(&changed).await.unwrap();
+        assert_eq!(dataset.clustering_spec().unwrap(), Some(changed));
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
     }
 
     #[tokio::test]
-    async fn test_clear_clustering_drops_config_keeps_markers() {
+    async fn test_set_clustering_requires_increasing_layout_version() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let current =
+            ClusteringSpec::with_bits(vec!["x".into()], ClusteringCurve::Hilbert, 2, 16).unwrap();
+        dataset.set_clustering(&current).await.unwrap();
+        let declared_version = dataset.version_id();
+
+        let changed_curve =
+            ClusteringSpec::with_bits(vec!["x".into()], ClusteringCurve::ZOrder, 2, 16).unwrap();
+        let err = dataset.set_clustering(&changed_curve).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("requires a version greater than 2"),
+            "got {err}"
+        );
+
+        let changed_columns = ClusteringSpec::with_bits(
+            vec!["x".into(), "y".into()],
+            ClusteringCurve::Hilbert,
+            2,
+            16,
+        )
+        .unwrap();
+        let err = dataset.set_clustering(&changed_columns).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("requires a version greater than 2"),
+            "got {err}"
+        );
+
+        let changed_bits =
+            ClusteringSpec::with_bits(vec!["x".into()], ClusteringCurve::Hilbert, 2, 8).unwrap();
+        let err = dataset.set_clustering(&changed_bits).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("requires a version greater than 2"),
+            "got {err}"
+        );
+
+        let lower =
+            ClusteringSpec::with_bits(vec!["x".into()], ClusteringCurve::Hilbert, 1, 16).unwrap();
+        let err = dataset.set_clustering(&lower).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("cannot decrease from 2 to 1"),
+            "got {err}"
+        );
+
+        assert_eq!(dataset.version_id(), declared_version);
+        assert_eq!(dataset.clustering_spec().unwrap(), Some(current));
+    }
+
+    #[tokio::test]
+    async fn test_clear_clustering_removes_config_declaration() {
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
         let data = gen_batch()
@@ -1056,16 +1210,144 @@ mod tests {
         dataset.set_clustering(&spec).await.unwrap();
 
         dataset.clear_clustering().await.unwrap();
-        // Tuning config is gone, so the spec falls back to defaults over the
-        // still-marked column rather than disappearing entirely.
-        let after = dataset.clustering_spec().unwrap().unwrap();
-        assert_eq!(after.columns, vec!["x".to_string()]);
-        assert_eq!(after.curve, ClusteringCurve::Hilbert);
-        assert_eq!(after.version, 1);
+        assert!(dataset.clustering_spec().unwrap().is_none());
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
+        for key in ClusteringSpec::config_keys() {
+            assert!(!dataset.config().contains_key(key));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_clustering_removes_unknown_reserved_keys() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let spec = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        execute_metadata_update(
+            &mut dataset,
+            Operation::UpdateConfig {
+                config_updates: Some(UpdateMap {
+                    update_entries: vec![
+                        (
+                            "lance.clustering.future_option".to_string(),
+                            "value".to_string(),
+                        )
+                            .into(),
+                    ],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        dataset.clear_clustering().await.unwrap();
+        assert!(dataset.clustering_spec().unwrap().is_none());
         assert!(
-            !dataset
+            dataset
                 .config()
-                .contains_key(lance_index::clustering::CLUSTERING_CURVE_KEY)
+                .keys()
+                .all(|key| !key.starts_with("lance.clustering."))
         );
+    }
+
+    #[tokio::test]
+    async fn test_reenable_clustering_requires_version_above_existing_fragment_stamps() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let initial = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&initial).await.unwrap();
+
+        // An append inherits the active declaration and persists its layout
+        // version on the new fragment.
+        let append = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        dataset.append(append, None).await.unwrap();
+        assert!(
+            dataset
+                .iter_fragments()
+                .any(|fragment| fragment.clustering_version == Some(initial.version))
+        );
+        dataset.clear_clustering().await.unwrap();
+        assert!(dataset.clustering_spec().unwrap().is_none());
+
+        let aliased = ClusteringSpec::new(vec!["y".into()], ClusteringCurve::ZOrder).unwrap();
+        let version_before = dataset.version_id();
+        let err = dataset.set_clustering(&aliased).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("greater than the maximum existing fragment clustering version 1"),
+            "got {err}"
+        );
+        assert_eq!(dataset.version_id(), version_before);
+        assert!(dataset.clustering_spec().unwrap().is_none());
+
+        let reenabled =
+            ClusteringSpec::with_bits(vec!["y".into()], ClusteringCurve::ZOrder, 2, 16).unwrap();
+        dataset.set_clustering(&reenabled).await.unwrap();
+        assert_eq!(dataset.clustering_spec().unwrap(), Some(reenabled));
+    }
+
+    #[tokio::test]
+    async fn test_generic_config_update_rejects_reserved_clustering_keys() {
+        use lance_index::clustering::{
+            CLUSTERING_COLUMNS_KEY, CLUSTERING_VERSION_KEY, ClusteringCurve, ClusteringSpec,
+        };
+
+        let data = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let version_before = dataset.version_id();
+
+        let err = dataset
+            .update_config([(CLUSTERING_COLUMNS_KEY, r#"[\"x\"]"#)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains("is reserved"), "got {err}");
+        assert_eq!(dataset.version_id(), version_before);
+
+        let spec = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+        let declared_version = dataset.version_id();
+
+        let err = dataset
+            .update_config([(CLUSTERING_VERSION_KEY, None)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains("is reserved"), "got {err}");
+        assert_eq!(dataset.version_id(), declared_version);
+        assert_eq!(dataset.clustering_spec().unwrap(), Some(spec.clone()));
+
+        let err = dataset
+            .update_config([("application.key", "value")])
+            .replace()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("would remove reserved"),
+            "got {err}"
+        );
+        assert_eq!(dataset.version_id(), declared_version);
+        assert_eq!(dataset.clustering_spec().unwrap(), Some(spec));
     }
 }
