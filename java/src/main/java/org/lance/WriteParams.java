@@ -43,6 +43,7 @@ public class WriteParams {
   private final Optional<List<String>> targetBases;
   private final Optional<Boolean> allowExternalBlobOutsideBases;
   private final Optional<Long> blobPackFileSizeThreshold;
+  private final Optional<List<String>> clusterBy;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -57,7 +58,8 @@ public class WriteParams {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold) {
+      Optional<Long> blobPackFileSizeThreshold,
+      Optional<List<String>> clusterBy) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -71,6 +73,7 @@ public class WriteParams {
     this.targetBases = targetBases;
     this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
     this.blobPackFileSizeThreshold = blobPackFileSizeThreshold;
+    this.clusterBy = clusterBy;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -145,6 +148,21 @@ public class WriteParams {
     return blobPackFileSizeThreshold;
   }
 
+  /**
+   * Get the clustering-key columns the write stream is sorted by ("liquid clustering").
+   *
+   * <p>When set, the write stream is sorted by the multi-column space-filling curve before
+   * fragments are rolled, so each fragment is value-coherent across every key column. Uses the
+   * default curve and bit width. For non-default tuning that also persists on the dataset and is
+   * inherited by later appends, declare a spec with {@link org.lance.Dataset#setClustering}
+   * instead.
+   *
+   * @return Optional containing the clustering-key columns, or empty if not set
+   */
+  public Optional<List<String>> getClusterBy() {
+    return clusterBy;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -171,6 +189,7 @@ public class WriteParams {
     private Optional<List<String>> targetBases = Optional.empty();
     private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
     private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
+    private Optional<List<String>> clusterBy = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -277,6 +296,23 @@ public class WriteParams {
       return this;
     }
 
+    /**
+     * Cluster the written data by these columns using a space-filling curve ("liquid clustering").
+     *
+     * <p>The write stream is sorted by the multi-column curve before fragments are rolled, so each
+     * fragment is value-coherent across every key column and zone-map data skipping is effective on
+     * all of them. Uses the default curve and bit width. For non-default tuning that also persists
+     * on the dataset and is inherited by later appends, declare a spec with {@link
+     * org.lance.Dataset#setClustering} instead of setting this.
+     *
+     * @param clusterBy the clustering-key columns, in priority order
+     * @return this builder
+     */
+    public Builder withClusterBy(List<String> clusterBy) {
+      this.clusterBy = Optional.of(clusterBy);
+      return this;
+    }
+
     public WriteParams build() {
       return new WriteParams(
           maxRowsPerFile,
@@ -291,7 +327,8 @@ public class WriteParams {
           initialBases,
           targetBases,
           allowExternalBlobOutsideBases,
-          blobPackFileSizeThreshold);
+          blobPackFileSizeThreshold,
+          clusterBy);
     }
   }
 }

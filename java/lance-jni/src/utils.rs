@@ -104,6 +104,7 @@ pub fn extract_write_params(
     target_bases: &JObject,                      // Optional<String>
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: &JObject,     // Optional<Long>
+    cluster_by: Option<&JObject>,                // Optional<List<String>>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -156,6 +157,22 @@ pub fn extract_write_params(
     }
     if let Some(max_bytes) = env.get_long_opt(blob_pack_file_size_threshold)? {
         write_params.blob_pack_file_size_threshold = Some(max_bytes as usize);
+    }
+
+    // When cluster_by is a non-empty list of column names, sort the write stream
+    // by the clustering-key space-filling curve using the default tuning. Uses
+    // ClusteringSpec::new so the curve/bit-width defaults match the Rust core.
+    if let Some(cluster_by) = cluster_by
+        && let Some(columns) = env.get_strings_opt(cluster_by)?
+        && !columns.is_empty()
+    {
+        write_params.cluster_by = Some(
+            lance_index::clustering::ClusteringSpec::new(
+                columns,
+                lance_index::clustering::ClusteringCurve::default(),
+            )
+            .map_err(|e| Error::input_error(e.to_string()))?,
+        );
     }
 
     // Create storage options accessor from static storage_options

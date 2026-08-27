@@ -842,3 +842,108 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+
+
+def _fragment_order(dataset, column):
+    """Return the column values in physical (fragment/offset) order."""
+    values = []
+    for frag in dataset.get_fragments():
+        table = frag.to_table(columns=[column])
+        values.extend(table[column].to_pylist())
+    return values
+
+
+def test_write_cluster_by_sorts_fragments(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    # Spread keys across the int32 range so the default 16-bit quantization can
+    # still tell them apart, and shuffle so an unsorted write is not monotonic.
+    keys = [((i * 7 + 13) % 1000) * 2_000_000 for i in range(1000)]
+    data = pa.table(
+        {"id": pa.array(range(1000), pa.int32()), "k": pa.array(keys, pa.int32())}
+    )
+
+    dataset = lance.write_dataset(data, base_dir, cluster_by=["k"])
+
+    # A clustered write lays rows out sorted by the clustering key.
+    seen = _fragment_order(dataset, "k")
+    assert seen == sorted(keys)
+
+
+def test_set_and_read_and_clear_clustering(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, base_dir)
+    assert dataset.clustering_spec() is None
+
+    dataset.set_clustering(["a", "b"], curve="zorder", version=1, bits_per_dim=20)
+    spec = dataset.clustering_spec()
+    assert spec == {
+        "columns": ["a", "b"],
+        "curve": "zorder",
+        "version": 1,
+        "bits_per_dim": 20,
+    }
+
+    # Reopening the dataset reads the same spec back from persisted metadata.
+    reopened = lance.dataset(base_dir)
+    assert reopened.clustering_spec() == spec
+
+    # The column set is immutable once declared, but the version can be bumped.
+    dataset.set_clustering(["a", "b"], curve="zorder", version=2, bits_per_dim=20)
+    assert dataset.clustering_spec()["version"] == 2
+    with pytest.raises(ValueError, match="immutable"):
+        dataset.set_clustering(["a"], curve="zorder", version=3)
+
+    # Clearing drops the tuning config but the column markers are immutable, so
+    # the spec falls back to defaults over the still-marked columns.
+    dataset.clear_clustering()
+    assert dataset.clustering_spec() == {
+        "columns": ["a", "b"],
+        "curve": "hilbert",
+        "version": 1,
+        "bits_per_dim": 16,
+    }
+
+
+def test_set_clustering_rejects_unknown_column(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), base_dir)
+    with pytest.raises(ValueError, match="does not exist"):
+        dataset.set_clustering(["missing"])
+    assert dataset.clustering_spec() is None
+
+
+def test_recluster_compaction_sorts_under_clustered(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    keys = [(i * 37 + 11) % 1000 for i in range(1000)]
+    data = pa.table({"k": pa.array(keys, pa.int32())})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=250)
+    assert len(dataset.get_fragments()) == 4
+
+    # int32 + 32 bits keeps full resolution so distinct keys never collide.
+    dataset.set_clustering(["k"], curve="hilbert", version=1, bits_per_dim=32)
+
+    metrics = dataset.optimize.compact_files(
+        compaction_mode="cluster",
+        target_rows_per_fragment=100_000,
+        num_threads=1,
+    )
+    assert metrics.fragments_removed == 4
+    assert metrics.fragments_added == 1
+
+    # Every row survives and is laid out globally sorted by the clustering key.
+    dataset = lance.dataset(base_dir)
+    assert _fragment_order(dataset, "k") == sorted(keys)
+
+    # A second run at the same version is a no-op: nothing is under-clustered.
+    version_before = dataset.version
+    metrics = dataset.optimize.compact_files(compaction_mode="cluster", num_threads=1)
+    assert metrics.fragments_removed == 0
+    assert dataset.version == version_before
+
+
+def test_recluster_compaction_requires_spec(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    dataset = lance.write_dataset(pa.table({"k": [3, 1, 2]}), base_dir)
+    with pytest.raises(OSError, match="clustering spec"):
+        dataset.optimize.compact_files(compaction_mode="cluster", num_threads=1)

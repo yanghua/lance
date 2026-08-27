@@ -20,7 +20,13 @@ public enum CompactionMode {
   /** Try binary copy if fragments are compatible, fall back to reencode otherwise. */
   TRY_BINARY_COPY("try_binary_copy"),
   /** Use binary copy or fail if fragments are not compatible. */
-  FORCE_BINARY_COPY("force_binary_copy");
+  FORCE_BINARY_COPY("force_binary_copy"),
+  /**
+   * Decode and re-encode data, re-sorting each task's rows by the dataset's clustering-key
+   * space-filling curve ("liquid clustering"). The dataset must have a clustering spec declared
+   * (see {@link org.lance.Dataset#setClustering}). Incompatible with binary copy.
+   */
+  CLUSTER("cluster");
 
   private final String value;
 

@@ -3403,6 +3403,64 @@ impl Dataset {
         Ok(new_config)
     }
 
+    /// Declare or replace the clustering spec on this dataset.
+    ///
+    /// `columns` are the clustering-key columns (order matters). `curve` is
+    /// "hilbert" or "zorder"; `bits_per_dim` is the per-column quantization
+    /// width. This is a metadata-only commit: the column set is persisted as
+    /// schema markers and the tuning parameters in the dataset config. The
+    /// column set is immutable once declared; bumping `version` (or changing the
+    /// curve/bits) marks existing data under-clustered for a later recluster.
+    #[pyo3(signature = (columns, curve, version, bits_per_dim))]
+    fn set_clustering(
+        &mut self,
+        columns: Vec<String>,
+        curve: String,
+        version: u64,
+        bits_per_dim: u32,
+    ) -> PyResult<()> {
+        let curve = curve
+            .parse::<lance_index::clustering::ClusteringCurve>()
+            .infer_error()?;
+        let spec = lance_index::clustering::ClusteringSpec::with_bits(
+            columns,
+            curve,
+            version,
+            bits_per_dim,
+        )
+        .infer_error()?;
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, async { new_self.set_clustering(&spec).await })?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    /// Return the clustering spec declared on this dataset as a dict with
+    /// `columns`, `curve`, `version`, and `bits_per_dim` keys, or None when
+    /// unset.
+    fn clustering_spec(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some(spec) = self.ds.clustering_spec().infer_error()? else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("columns", spec.columns)?;
+        dict.set_item("curve", spec.curve.as_str())?;
+        dict.set_item("version", spec.version)?;
+        dict.set_item("bits_per_dim", spec.bits_per_dim)?;
+        Ok(Some(dict.unbind()))
+    }
+
+    /// Drop the clustering declaration. Existing data keeps its layout; future
+    /// writes and compactions no longer cluster.
+    fn clear_clustering(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, async { new_self.clear_clustering().await })?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[pyo3(signature = (values, *, replace = false))]
     fn update_schema_metadata(
         &mut self,
@@ -4878,6 +4936,21 @@ pub fn get_write_params(
         }
         if let Some(max_bytes) = get_dict_opt::<usize>(options, "blob_pack_file_size_threshold")? {
             p = p.with_blob_pack_file_size_threshold(max_bytes);
+        }
+
+        // When `cluster_by` is a list of column names, the write stream is
+        // sorted by the clustering-key space-filling curve before fragments are
+        // rolled. Tuning (curve, bit width) uses the defaults; declare a spec on
+        // the dataset with `set_clustering` for non-default tuning that also
+        // persists and is inherited by later appends.
+        if let Some(columns) = get_dict_opt::<Vec<String>>(options, "cluster_by")? {
+            p.cluster_by = Some(
+                lance_index::clustering::ClusteringSpec::new(
+                    columns,
+                    lance_index::clustering::ClusteringCurve::default(),
+                )
+                .infer_error()?,
+            );
         }
 
         // Handle properties

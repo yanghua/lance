@@ -1012,6 +1012,13 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    // In Cluster mode, select fragments by clustering version (under-clustered
+    // first) rather than by size/deletions, so a version bump reclusters even
+    // already-large fragments. Other modes use the size/adjacency planner.
+    if matches!(options.compaction_mode(), CompactionMode::Cluster) {
+        let planner = ClusteringCompactionPlanner::new(options)?;
+        return compact_files_with_planner(dataset, remap_options, &planner).await;
+    }
     let planner = DefaultCompactionPlanner::new(options)?;
     compact_files_with_planner(dataset, remap_options, &planner).await
 }
@@ -2199,6 +2206,10 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
+    if matches!(options.compaction_mode(), CompactionMode::Cluster) {
+        let planner = ClusteringCompactionPlanner::new(options.clone())?;
+        return planner.plan(dataset).await;
+    }
     let planner = DefaultCompactionPlanner::new(options.clone())?;
     planner.plan(dataset).await
 }
@@ -10085,5 +10096,62 @@ mod tests {
         let planner = ClusteringCompactionPlanner::new(CompactionOptions::default()).unwrap();
         let err = planner.plan(&dataset).await.unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_compact_files_cluster_mode_routes_to_clustering_planner() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        // The public `compact_files` / `plan_compaction` entrypoints must pick
+        // the clustering planner (select by version) rather than the default
+        // size planner when `compaction_mode` is Cluster. A large single
+        // fragment the size planner would leave alone must still be reclustered.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let shuffled: Vec<i32> = (0..1000).map(|i| (i * 37 + 11) % 1000).collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(shuffled))])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 1);
+
+        let spec =
+            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::Hilbert, 1, 32).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        let options = CompactionOptions {
+            compaction_mode: Some(CompactionMode::Cluster),
+            ..Default::default()
+        };
+        // plan_compaction routes to the clustering planner and finds the single
+        // under-clustered fragment.
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let batches = dataset
+            .scan()
+            .project(&["k"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        for b in &batches {
+            let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            seen.extend((0..a.len()).map(|i| a.value(i)));
+        }
+        assert_eq!(seen, (0..1000).collect::<Vec<_>>());
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|f| f.clustering_version == Some(1))
+        );
     }
 }

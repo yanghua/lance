@@ -184,7 +184,13 @@ public class CompactionTest {
   }
 
   @ParameterizedTest
-  @EnumSource(CompactionMode.class)
+  // CLUSTER is excluded: it requires a clustering spec on the dataset and
+  // reorders rows, so it cannot share this generic size-based round trip. It is
+  // covered by ClusteringTest and the Rust/Python recluster tests.
+  @EnumSource(
+      value = CompactionMode.class,
+      names = {"CLUSTER"},
+      mode = EnumSource.Mode.EXCLUDE)
   public void testCompactionModeRoundTrip(CompactionMode mode, @TempDir Path tempDir)
       throws Exception {
     String datasetPath = tempDir.resolve("test_dataset_for_compaction").toString();

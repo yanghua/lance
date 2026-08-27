@@ -68,7 +68,7 @@ class CompactionOptions(TypedDict):
     The default will use the same default from ``scanner``.
     """
     compaction_mode: Optional[
-        Literal["reencode", "try_binary_copy", "force_binary_copy"]
+        Literal["reencode", "try_binary_copy", "force_binary_copy", "cluster"]
     ]
     """
     The compaction mode to use. Valid values:
@@ -78,6 +78,10 @@ class CompactionOptions(TypedDict):
       fall back to reencode otherwise.
     - ``"force_binary_copy"``: Use binary copy or fail if fragments are
       not compatible.
+    - ``"cluster"``: Decode and re-encode data, re-sorting each task's rows
+      by the dataset's clustering key ("liquid clustering"). Requires a
+      clustering spec declared on the dataset. Rejected on datasets with
+      stable row ids or a remappable secondary index.
     """
     binary_copy_read_batch_bytes: Optional[int]
     """

@@ -338,6 +338,7 @@ fn create_fragment<'a>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        None,
     )?;
 
     write_params.session = session_from_handle(session_handle);
@@ -935,6 +936,9 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
+            // Clustering is not exposed to Java yet, and the reverse conversion
+            // does not export it, so this round-trip is clustering-unaware.
+            clustering_version: None,
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,

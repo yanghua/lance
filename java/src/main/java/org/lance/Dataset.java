@@ -16,6 +16,8 @@ package org.lance;
 import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
+import org.lance.clustering.ClusteringCurve;
+import org.lance.clustering.ClusteringSpec;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
@@ -65,6 +67,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -254,7 +257,8 @@ public class Dataset implements Closeable {
       Optional<Long> blobPackFileSizeThreshold,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      Optional<List<String>> clusterBy);
 
   /**
    * Creates a dataset with optional namespace client support for managed versioning.
@@ -306,7 +310,8 @@ public class Dataset implements Closeable {
             params.getBlobPackFileSizeThreshold(),
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientManagedVersioning,
+            params.getClusterBy());
     dataset.allocator = allocator;
     return dataset;
   }
@@ -1726,6 +1731,71 @@ public class Dataset implements Closeable {
     Dataset newDataset = newTransactionBuilder().operation(operation).build().commit();
     updateToNewDataset(newDataset);
   }
+
+  /**
+   * Declare or replace the clustering key for this dataset ("liquid clustering").
+   *
+   * <p>The clustering key lays data out along a multi-column space-filling curve so that zone-map
+   * data skipping is effective across every key column at once. This is a metadata-only commit that
+   * never rewrites data: the column set is persisted as schema markers and the tuning parameters in
+   * the dataset config. Data already written stays in place until it is re-clustered by a
+   * compaction run with {@link org.lance.compaction.CompactionMode#CLUSTER}.
+   *
+   * <p>The column set is immutable once declared: re-declaring a different set throws. Bump {@link
+   * ClusteringSpec#getVersion()} (or change the curve or bits-per-dimension) to force existing data
+   * to be treated as under-clustered and re-clustered on the next optimize.
+   *
+   * @param spec the clustering spec to declare; its columns must exist in the schema
+   */
+  public void setClustering(ClusteringSpec spec) {
+    Preconditions.checkNotNull(spec, "spec cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeSetClustering(
+          spec.getColumns(), spec.getCurve().getValue(), spec.getVersion(), spec.getBitsPerDim());
+    }
+  }
+
+  private native void nativeSetClustering(
+      List<String> columns, String curve, long version, int bitsPerDim);
+
+  /**
+   * Read the clustering spec declared on this dataset, if any.
+   *
+   * @return the declared clustering spec, or empty when no clustering is declared
+   */
+  public Optional<ClusteringSpec> getClusteringSpec() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      String[] result = nativeGetClusteringSpec();
+      if (result == null) {
+        return Optional.empty();
+      }
+      // result layout: [curve, version, bitsPerDim, column0, column1, ...]
+      ClusteringCurve curve = ClusteringCurve.fromValue(result[0]);
+      long version = Long.parseLong(result[1]);
+      int bitsPerDim = Integer.parseInt(result[2]);
+      List<String> columns = new ArrayList<>(Arrays.asList(result).subList(3, result.length));
+      return Optional.of(new ClusteringSpec(columns, curve, version, bitsPerDim));
+    }
+  }
+
+  private native String[] nativeGetClusteringSpec();
+
+  /**
+   * Drop the clustering declaration from this dataset.
+   *
+   * <p>Existing data keeps its physical layout; only the declaration is dropped, so future writes
+   * and compactions no longer cluster.
+   */
+  public void clearClustering() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeClearClustering();
+    }
+  }
+
+  private native void nativeClearClustering();
 
   /**
    * Updates the internal state of this dataset to match the provided new dataset. This is used by

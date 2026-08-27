@@ -404,6 +404,7 @@ impl IntoJava for &CompactionOptions {
                     CompactionMode::Reencode => "REENCODE",
                     CompactionMode::TryBinaryCopy => "TRY_BINARY_COPY",
                     CompactionMode::ForceBinaryCopy => "FORCE_BINARY_COPY",
+                    CompactionMode::Cluster => "CLUSTER",
                 };
                 env.get_static_field(
                     COMPACTION_MODE_CLASS,

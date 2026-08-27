@@ -549,6 +549,7 @@ fn inner_create_with_ffi_schema<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        JObject::null(),
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -610,6 +611,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
+    cluster_by: JObject,                           // Optional<List<String>>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -633,6 +635,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
+            cluster_by,
         )
     )
 }
@@ -658,6 +661,7 @@ fn inner_create_with_ffi_stream<'local>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
+    cluster_by: JObject,                        // Optional<List<String>>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -681,6 +685,7 @@ fn inner_create_with_ffi_stream<'local>(
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        cluster_by,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -709,6 +714,7 @@ fn create_dataset<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
     blob_pack_file_size_threshold: JObject,
+    cluster_by: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -730,6 +736,7 @@ fn create_dataset<'local>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        Some(&cluster_by),
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
@@ -2214,6 +2221,129 @@ fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     Ok(dataset_guard.inner.manifest().uses_stable_row_ids() as u8)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeSetClustering<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    columns: JObject, // List<String>
+    curve: JString,
+    version: jlong,
+    bits_per_dim: jint,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_set_clustering(
+            &mut env,
+            java_dataset,
+            columns,
+            curve,
+            version,
+            bits_per_dim
+        )
+    )
+}
+
+fn inner_set_clustering(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    columns: JObject,
+    curve: JString,
+    version: jlong,
+    bits_per_dim: jint,
+) -> Result<()> {
+    let columns = env
+        .get_strings(&columns)
+        .map_err(|e| Error::input_error(format!("failed to read clustering columns: {e}")))?;
+    let curve_str: String = env.get_string(&curve)?.into();
+    let curve = curve_str
+        .parse::<lance_index::clustering::ClusteringCurve>()
+        .map_err(|e| Error::input_error(e.to_string()))?;
+    let spec = lance_index::clustering::ClusteringSpec::with_bits(
+        columns,
+        curve,
+        version as u64,
+        bits_per_dim as u32,
+    )
+    .map_err(|e| Error::input_error(e.to_string()))?;
+
+    let ds_clone = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.clone()
+    };
+    let mut new_ds = ds_clone;
+    block_on(new_ds.set_clustering(&spec))?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.inner = new_ds;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetClusteringSpec<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_clustering_spec(&mut env, java_dataset))
+}
+
+/// Returns the clustering spec as a flat `String[]` laid out as
+/// `[curve, version, bits_per_dim, column0, column1, ...]`, or null when no
+/// clustering is declared. Java reassembles the typed `ClusteringSpec`.
+fn inner_get_clustering_spec<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let spec = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard
+            .inner
+            .clustering_spec()
+            .map_err(|e| Error::input_error(e.to_string()))?
+    };
+    let Some(spec) = spec else {
+        return Ok(JObject::null());
+    };
+
+    let mut values: Vec<String> = Vec::with_capacity(3 + spec.columns.len());
+    values.push(spec.curve.as_str().to_string());
+    values.push(spec.version.to_string());
+    values.push(spec.bits_per_dim.to_string());
+    values.extend(spec.columns);
+
+    let string_class = env.find_class("java/lang/String")?;
+    let empty = env.new_string("")?;
+    let array = env.new_object_array(values.len() as i32, &string_class, &empty)?;
+    for (i, value) in values.iter().enumerate() {
+        let jvalue = env.new_string(value)?;
+        env.set_object_array_element(&array, i as i32, &jvalue)?;
+    }
+    Ok(array.into())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeClearClustering(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_clear_clustering(&mut env, java_dataset))
+}
+
+fn inner_clear_clustering(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let ds_clone = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.clone()
+    };
+    let mut new_ds = ds_clone;
+    block_on(new_ds.clear_clustering())?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.inner = new_ds;
+    Ok(())
 }
 
 #[unsafe(no_mangle)]

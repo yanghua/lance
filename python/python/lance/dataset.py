@@ -2030,6 +2030,68 @@ class LanceDataset(pa.dataset.Dataset):
         # Use the new path-based Rust function directly
         self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
+    def set_clustering(
+        self,
+        columns: List[str],
+        *,
+        curve: Literal["hilbert", "zorder"] = "hilbert",
+        version: int = 1,
+        bits_per_dim: int = 16,
+    ) -> None:
+        """Declare or replace the clustering key for this dataset ("liquid
+        clustering").
+
+        The clustering key lays data out along a multi-column space-filling
+        curve so zone-map data skipping is effective across every key column at
+        once. This is a metadata-only commit that never rewrites data: the
+        column set is persisted as schema markers and the tuning parameters in
+        the dataset config. Data already written stays in place until it is
+        re-clustered by :py:meth:`DatasetOptimizer.compact_files` with
+        ``compaction_mode="cluster"`` (or a clustered ``write_dataset``).
+
+        Parameters
+        ----------
+        columns : List[str]
+            The clustering-key columns, in priority order. Must exist in the
+            schema. The column set is immutable once declared: re-declaring a
+            different set raises an error. Bump ``version`` (or change the curve
+            or ``bits_per_dim``) to force existing data to be treated as
+            under-clustered and re-clustered on the next optimize.
+        curve : {"hilbert", "zorder"}, default "hilbert"
+            The space-filling curve. Hilbert has better locality; Z-order is
+            cheaper to compute.
+        version : int, default 1
+            The clustering layout version. Bumping it marks all existing
+            fragments under-clustered so they are re-clustered opportunistically.
+        bits_per_dim : int, default 16
+            Per-column quantization bit width. ``len(columns) * bits_per_dim``
+            must not exceed 128.
+        """
+        self._ds.set_clustering(columns, curve, version, bits_per_dim)
+
+    def clustering_spec(self) -> Optional[Dict[str, Any]]:
+        """Return the clustering spec declared on this dataset, or None.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            A dict with keys ``columns`` (list of str), ``curve`` (str),
+            ``version`` (int), and ``bits_per_dim`` (int), or None when no
+            clustering is declared.
+        """
+        return self._ds.clustering_spec()
+
+    def clear_clustering(self) -> None:
+        """Drop the clustering tuning parameters from this dataset.
+
+        Existing data keeps its physical layout. Because the clustering-key
+        column markers are immutable, only the tuning config (curve, version,
+        bits-per-dimension) is removed; :py:meth:`clustering_spec` then falls
+        back to the default tuning over the still-marked columns rather than
+        returning None.
+        """
+        self._ds.clear_clustering()
+
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
 
@@ -7290,7 +7352,7 @@ class DatasetOptimizer:
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
-            Literal["reencode", "try_binary_copy", "force_binary_copy"]
+            Literal["reencode", "try_binary_copy", "force_binary_copy", "cluster"]
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
         max_source_fragments: Optional[int] = None,
@@ -7379,6 +7441,11 @@ class DatasetOptimizer:
               compatible, fall back to reencode otherwise.
             - ``"force_binary_copy"``: Use binary copy or fail if fragments
               are not compatible.
+            - ``"cluster"``: Decode and re-encode data, re-sorting each task's
+              rows by the dataset's clustering key (declared with
+              :py:meth:`LanceDataset.set_clustering`) so under-clustered
+              fragments converge to the clustered layout. Rejected on datasets
+              with stable row ids or a remappable secondary index.
         binary_copy_read_batch_bytes: int, optional
             The batch size in bytes for reading during binary copy operations.
             Controls how much data is read at once when performing binary copy.
@@ -7746,6 +7813,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    cluster_by: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -7882,6 +7950,15 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace_client`. Cannot be used with `uri`.
+    cluster_by : optional, List[str]
+        Cluster the written data by these columns using a space-filling curve
+        ("liquid clustering"). The write stream is sorted by the multi-column
+        curve before fragments are rolled, so each fragment is value-coherent
+        across every key column and zone-map data skipping is effective on all
+        of them. Uses the default curve and bit width. For non-default tuning
+        that also persists on the dataset and is inherited by later appends,
+        declare a spec with :py:meth:`LanceDataset.set_clustering` instead of
+        passing this argument.
 
     Notes
     -----
@@ -8006,6 +8083,9 @@ def write_dataset(
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
     }
+
+    if cluster_by is not None:
+        params["cluster_by"] = cluster_by
 
     # Add namespace_client and table_id for storage options provider and managed
     # versioning. The storage options provider will be created automatically in Rust.

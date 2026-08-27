@@ -272,13 +272,19 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
 
 - **Rust:** `WriteParams.cluster_by`; `Dataset::set_clustering` / `Dataset::clustering_spec` /
   `Dataset::clear_clustering` to declare/read/drop the spec (columns via schema markers, tuning via
-  config); `CompactionMode::Cluster` / a `recluster` option on `CompactionOptions`.
-- **Python:** `write_dataset(..., cluster_by=[...])`, `dataset.alter_clustering(columns=[...])`,
-  `dataset.optimize.compact_files(recluster=True)` (or auto when a spec is set).
-- **Java/JNI:** mirror the Python shape (per cross-language contract in `python/AGENTS.md` /
-  `java/AGENTS.md`).
+  config); `CompactionMode::Cluster` on `CompactionOptions`. *(Implemented.)*
+- **Python: (implemented)** `write_dataset(..., cluster_by=["a", "b"])`;
+  `dataset.set_clustering(columns, *, curve, version, bits_per_dim)` /
+  `dataset.clustering_spec()` (returns a dict or `None`) / `dataset.clear_clustering()`;
+  `dataset.optimize.compact_files(compaction_mode="cluster")`. The bindings only marshal arguments
+  — all validation lives in the Rust core.
+- **Java/JNI: (implemented)** `WriteParams.Builder.withClusterBy(List<String>)`;
+  `Dataset.setClustering(ClusteringSpec)` / `Dataset.getClusteringSpec()` /
+  `Dataset.clearClustering()`; `CompactionMode.CLUSTER`. `ClusteringSpec` / `ClusteringCurve` are
+  thin value types mirroring the Rust/Python shape.
 - **Spark connector:** map SQL `CLUSTER BY (a, b)` to the persisted spec; `OPTIMIZE` triggers the
-  incremental recluster; keep `LanceScanBuilder` pruning as-is.
+  incremental recluster; keep `LanceScanBuilder` pruning as-is. *(Not yet done — connector lives
+  outside this repo.)*
 
 ## 10. Open questions
 
@@ -317,8 +323,12 @@ Centralize logic in Rust; keep parameter names identical across languages (`clus
   Deferred: reclustering on datasets with stable row ids or a remappable index (currently rejected
   to avoid corrupting the positional row mapping), and pulling in overlapping already-clustered
   fragments for better merge quality.
-- **Phase 4 — bindings & connectors.** Python/Java wrappers; Spark `CLUSTER BY` + `OPTIMIZE`
-  integration; auto zonemap declaration.
+- **Phase 4 — bindings & connectors. (implemented, partial)** Python and Java wrappers over the
+  Rust core: `cluster_by` on the write path, `set_clustering` / `clustering_spec` /
+  `clear_clustering` for declaration, and the `"cluster"` / `CLUSTER` compaction mode (routed to
+  `ClusteringCompactionPlanner` from the public `compact_files` / `plan_compaction` entrypoints).
+  Deferred: the Spark `CLUSTER BY` + `OPTIMIZE` connector integration (out of this repo) and
+  automatic zonemap declaration.
 - **Phase 5 — docs & benchmarks.** Data-skipping recall vs unclustered baseline; write/optimize
   overhead; key-change convergence.
 
