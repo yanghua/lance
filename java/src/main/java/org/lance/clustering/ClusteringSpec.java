@@ -16,6 +16,7 @@ package org.lance.clustering;
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.math.BigInteger;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -33,13 +34,14 @@ import java.util.Set;
  */
 public class ClusteringSpec implements Serializable {
   private static final long serialVersionUID = 1L;
+  private static final BigInteger MAX_U64 = new BigInteger("18446744073709551615");
 
   /** Default per-column quantization bit width, matching the Rust core. */
   public static final int DEFAULT_BITS_PER_DIM = 16;
 
   private final List<String> columns;
   private final ClusteringCurve curve;
-  private final long version;
+  private final BigInteger version;
   private final int bitsPerDim;
 
   /**
@@ -55,9 +57,11 @@ public class ClusteringSpec implements Serializable {
    * @throws IllegalArgumentException if the columns are empty or duplicated, the version is not
    *     positive, or the bit-width constraints are violated
    */
-  public ClusteringSpec(List<String> columns, ClusteringCurve curve, long version, int bitsPerDim) {
+  public ClusteringSpec(
+      List<String> columns, ClusteringCurve curve, BigInteger version, int bitsPerDim) {
     Objects.requireNonNull(columns, "columns");
     Objects.requireNonNull(curve, "curve");
+    Objects.requireNonNull(version, "version");
     if (columns.isEmpty()) {
       throw new IllegalArgumentException("clustering spec must have at least one column");
     }
@@ -68,9 +72,7 @@ public class ClusteringSpec implements Serializable {
         throw new IllegalArgumentException("duplicate clustering column: " + column);
       }
     }
-    if (version <= 0) {
-      throw new IllegalArgumentException("clustering version must be positive, got " + version);
-    }
+    validateUnsignedVersion(version);
     if (bitsPerDim < 1 || bitsPerDim > 64) {
       throw new IllegalArgumentException(
           "clustering bitsPerDim must be in 1..=64, got " + bitsPerDim);
@@ -92,6 +94,11 @@ public class ClusteringSpec implements Serializable {
     this.bitsPerDim = bitsPerDim;
   }
 
+  /** Constructs a clustering spec with a positive version representable as a Java {@code long}. */
+  public ClusteringSpec(List<String> columns, ClusteringCurve curve, long version, int bitsPerDim) {
+    this(columns, curve, BigInteger.valueOf(version), bitsPerDim);
+  }
+
   /**
    * Constructs a clustering spec at version 1 with the default bit width.
    *
@@ -99,7 +106,7 @@ public class ClusteringSpec implements Serializable {
    * @param curve the space-filling curve used to order key values
    */
   public ClusteringSpec(List<String> columns, ClusteringCurve curve) {
-    this(columns, curve, 1, DEFAULT_BITS_PER_DIM);
+    this(columns, curve, BigInteger.ONE, DEFAULT_BITS_PER_DIM);
   }
 
   public List<String> getColumns() {
@@ -110,8 +117,31 @@ public class ClusteringSpec implements Serializable {
     return curve;
   }
 
+  /**
+   * Returns the clustering version as a signed Java {@code long}.
+   *
+   * @throws ArithmeticException if the unsigned 64-bit version exceeds {@link Long#MAX_VALUE}; use
+   *     {@link #getVersionUnsigned()} for the complete range
+   */
   public long getVersion() {
+    try {
+      return version.longValueExact();
+    } catch (ArithmeticException error) {
+      throw new ArithmeticException(
+          "clustering version " + version + " exceeds Long.MAX_VALUE; use getVersionUnsigned()");
+    }
+  }
+
+  /** Returns the clustering version over the complete unsigned 64-bit range. */
+  public BigInteger getVersionUnsigned() {
     return version;
+  }
+
+  private static void validateUnsignedVersion(BigInteger version) {
+    if (version.signum() <= 0 || version.compareTo(MAX_U64) > 0) {
+      throw new IllegalArgumentException(
+          "clustering version must be in 1..=2^64-1, got " + version);
+    }
   }
 
   public int getBitsPerDim() {
@@ -127,7 +157,7 @@ public class ClusteringSpec implements Serializable {
       return false;
     }
     ClusteringSpec that = (ClusteringSpec) o;
-    return version == that.version
+    return version.equals(that.version)
         && bitsPerDim == that.bitsPerDim
         && columns.equals(that.columns)
         && curve == that.curve;

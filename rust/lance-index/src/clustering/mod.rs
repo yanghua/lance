@@ -63,6 +63,16 @@ pub const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
 
 const CLUSTERING_CONFIG_PREFIX: &str = "lance.clustering.";
 
+fn is_known_clustering_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        CLUSTERING_COLUMNS_KEY
+            | CLUSTERING_CURVE_KEY
+            | CLUSTERING_VERSION_KEY
+            | CLUSTERING_BITS_PER_DIM_KEY
+    )
+}
+
 /// Default per-column bit width. 16 bits per dimension keeps four columns
 /// inside a 64-bit index while still distinguishing 65,536 buckets per column.
 pub const DEFAULT_BITS_PER_DIM: u32 = 16;
@@ -253,10 +263,23 @@ impl ClusteringSpec {
     /// declaration must contain all four keys written by [`Self::to_config`]; a
     /// partial declaration is rejected instead of being silently defaulted.
     pub fn from_config(config: &HashMap<String, String>) -> Result<Option<Self>> {
-        if !config
+        let mut has_clustering_config = false;
+        for key in config
             .keys()
-            .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
+            .filter(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
         {
+            has_clustering_config = true;
+            if !is_known_clustering_config_key(key) {
+                return Err(Error::invalid_input(format!(
+                    "unknown clustering config key {key:?}; expected one of {}, {}, {}, or {}",
+                    CLUSTERING_COLUMNS_KEY,
+                    CLUSTERING_CURVE_KEY,
+                    CLUSTERING_VERSION_KEY,
+                    CLUSTERING_BITS_PER_DIM_KEY
+                )));
+            }
+        }
+        if !has_clustering_config {
             return Ok(None);
         }
         let required_value = |key| {
@@ -611,6 +634,7 @@ fn axes_to_transpose(x: &mut [u64], bits: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn encode_rows(encoder: &SpaceFillingEncoder, columns: &[ArrayRef]) -> Vec<Vec<u8>> {
@@ -904,7 +928,7 @@ mod tests {
             20,
         )
         .unwrap();
-        let config: HashMap<String, String> = spec.to_config().into_iter().collect();
+        let mut config: HashMap<String, String> = spec.to_config().into_iter().collect();
         assert_eq!(config[CLUSTERING_COLUMNS_KEY], r#"["a","b"]"#);
         assert_eq!(
             ClusteringSpec::config_keys(),
@@ -915,6 +939,10 @@ mod tests {
                 CLUSTERING_BITS_PER_DIM_KEY,
             ]
         );
+        config.insert(
+            "lance.clustering_other.key".to_string(),
+            "value".to_string(),
+        );
         let parsed = ClusteringSpec::from_config(&config).unwrap().unwrap();
         assert_eq!(parsed, spec);
     }
@@ -924,26 +952,87 @@ mod tests {
         let config = HashMap::new();
         assert!(ClusteringSpec::from_config(&config).unwrap().is_none());
 
-        let unrelated = HashMap::from([("other.key".to_string(), "value".to_string())]);
+        let unrelated = HashMap::from([
+            ("other.key".to_string(), "value".to_string()),
+            (
+                "lance.clustering_other.key".to_string(),
+                "value".to_string(),
+            ),
+        ]);
         assert!(ClusteringSpec::from_config(&unrelated).unwrap().is_none());
     }
 
     #[test]
     fn from_config_rejects_partial_declaration() {
-        let cases = [
-            (CLUSTERING_COLUMNS_KEY, r#"["x"]"#),
-            (CLUSTERING_VERSION_KEY, "1"),
-            (CLUSTERING_CURVE_KEY, "zorder"),
-            (CLUSTERING_BITS_PER_DIM_KEY, "8"),
-            ("lance.clustering.future_option", "value"),
-        ];
-        for (key, value) in cases {
-            let config = HashMap::from([(key.to_string(), value.to_string())]);
+        let complete_config = HashMap::from([
+            (CLUSTERING_COLUMNS_KEY.to_string(), r#"["x"]"#.to_string()),
+            (CLUSTERING_CURVE_KEY.to_string(), "zorder".to_string()),
+            (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+            (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "8".to_string()),
+        ]);
+        for missing_key in ClusteringSpec::config_keys() {
+            let mut config = complete_config.clone();
+            config.remove(missing_key);
             let error = ClusteringSpec::from_config(&config)
                 .expect_err("a partial clustering declaration must be rejected");
             assert!(matches!(&error, Error::InvalidInput { .. }));
-            assert!(error.to_string().contains("incomplete clustering config"));
+            let message = error.to_string();
+            assert!(message.contains("incomplete clustering config"));
+            assert!(message.contains(missing_key));
         }
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_clustering_keys() {
+        let unknown_key = "lance.clustering.future_option";
+        let mut configs = vec![HashMap::new()];
+        configs.push(
+            ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert)
+                .unwrap()
+                .to_config()
+                .into_iter()
+                .collect(),
+        );
+
+        for mut config in configs {
+            config.insert(unknown_key.to_string(), "value".to_string());
+            let error = ClusteringSpec::from_config(&config)
+                .expect_err("unknown keys in the clustering namespace must be rejected");
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("unknown clustering config key"));
+            assert!(message.contains(unknown_key));
+        }
+    }
+
+    #[rstest]
+    #[case::empty_columns(r#"[]"#, "16", "at least one column")]
+    #[case::duplicate_columns(r#"["x","x"]"#, "16", "duplicate column \"x\"")]
+    #[case::zero_bits(r#"["x"]"#, "0", "bits_per_dim must be in 1..=64")]
+    #[case::too_many_bits(r#"["x"]"#, "65", "bits_per_dim must be in 1..=64")]
+    #[case::too_wide_key(r#"["a","b","c"]"#, "64", "exceeds the 128-bit limit")]
+    fn from_config_rejects_semantically_invalid_declaration(
+        #[case] columns: &str,
+        #[case] bits_per_dim: &str,
+        #[case] expected_message: &str,
+    ) {
+        let config = HashMap::from([
+            (CLUSTERING_COLUMNS_KEY.to_string(), columns.to_string()),
+            (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
+            (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+            (
+                CLUSTERING_BITS_PER_DIM_KEY.to_string(),
+                bits_per_dim.to_string(),
+            ),
+        ]);
+
+        let error = ClusteringSpec::from_config(&config)
+            .expect_err("a semantically invalid clustering declaration must be rejected");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected {expected_message:?} in {error}"
+        );
     }
 
     #[test]

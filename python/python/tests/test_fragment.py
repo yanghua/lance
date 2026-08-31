@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import pickle
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import lance
@@ -169,15 +170,21 @@ def test_write_fragments_cluster_by_stamps_declared_version(
     tmp_path: Path, return_transaction: bool
 ):
     dataset_uri = tmp_path / "dataset"
-    data = pa.table({"k": pa.array([6_000_000, 2_000_000, 4_000_000], pa.int32())})
+    columns = [f"k{i}" for i in range(9)]
+    data = pa.table(
+        {
+            column: pa.array([6_000_000, 2_000_000, 4_000_000], pa.int32())
+            for column in columns
+        }
+    )
     dataset = lance.write_dataset([], dataset_uri, schema=data.schema)
-    dataset.set_clustering(["k"])
+    dataset.set_clustering(columns, curve="zorder", version=7, bits_per_dim=8)
 
     result = write_fragments(
         data,
         dataset,
         return_transaction=return_transaction,
-        cluster_by=["k"],
+        cluster_by=columns,
     )
     if return_transaction:
         transaction = result
@@ -188,16 +195,86 @@ def test_write_fragments_cluster_by_stamps_declared_version(
         )
 
     assert all(
-        fragment.clustering_version == 1 for fragment in transaction.operation.fragments
+        fragment.clustering_version == 7 for fragment in transaction.operation.fragments
     )
 
     dataset = LanceDataset.commit(dataset, transaction)
-    assert dataset.to_table()["k"].to_pylist() == [2_000_000, 4_000_000, 6_000_000]
+    assert sorted(dataset.to_table()[columns[0]].to_pylist()) == [
+        2_000_000,
+        4_000_000,
+        6_000_000,
+    ]
 
     committed = dataset.read_transaction(dataset.version)
     assert all(
-        fragment.clustering_version == 1 for fragment in committed.operation.fragments
+        fragment.clustering_version == 7 for fragment in committed.operation.fragments
     )
+
+
+def test_fragment_clustering_version_direct_operation_round_trip(tmp_path: Path):
+    dataset_uri = tmp_path / "dataset"
+    columns = [f"k{i}" for i in range(9)]
+    data = pa.table({column: [3, 1, 2] for column in columns})
+    dataset = lance.write_dataset([], dataset_uri, schema=data.schema)
+    dataset.set_clustering(columns, version=7, bits_per_dim=8)
+
+    fragments = write_fragments(data, dataset, cluster_by=columns)
+    assert {fragment.clustering_version for fragment in fragments} == {7}
+
+    dataset = LanceDataset.commit(
+        dataset,
+        LanceOperation.Append(fragments),
+        read_version=dataset.version,
+    )
+    assert dataset.get_fragments()[-1].metadata.clustering_version == 7
+
+
+def test_fragment_clustering_version_transaction_properties_cannot_spoof_marker(
+    tmp_path: Path,
+):
+    dataset = lance.write_dataset(pa.table({"x": [0]}), tmp_path / "dataset")
+    fragments = write_fragments(pa.table({"x": [1]}), dataset)
+    transaction = lance.Transaction(
+        read_version=dataset.version,
+        operation=LanceOperation.Append(fragments),
+        transaction_properties={"__lance_new_fragment_clustering_version": "7"},
+    )
+
+    dataset = LanceDataset.commit(dataset, transaction)
+    assert dataset.get_fragments()[-1].metadata.clustering_version is None
+
+
+@pytest.mark.parametrize(
+    "versions, error",
+    [
+        ([7, None], "either all None or all the same"),
+        ([7, 8], "either all None or all the same"),
+        ([0, 0], "must be greater than zero"),
+        ([-1, -1], "positive integer that fits in u64"),
+        ([1 << 64, 1 << 64], "positive integer that fits in u64"),
+    ],
+)
+def test_fragment_clustering_version_rejects_invalid_new_fragment_set(
+    tmp_path: Path, versions: list[int | None], error: str
+):
+    dataset = lance.write_dataset(pa.table({"x": [0]}), tmp_path / "dataset")
+    fragments = write_fragments(
+        pa.table({"x": [1, 2]}),
+        dataset,
+        max_rows_per_file=1,
+        max_rows_per_group=1,
+    )
+    fragments = [
+        replace(fragment, clustering_version=version)
+        for fragment, version in zip(fragments, versions)
+    ]
+
+    with pytest.raises(ValueError, match=error):
+        LanceDataset.commit(
+            dataset,
+            LanceOperation.Append(fragments),
+            read_version=dataset.version,
+        )
 
 
 def test_write_fragments_cluster_by_rejects_unknown_column(tmp_path: Path):

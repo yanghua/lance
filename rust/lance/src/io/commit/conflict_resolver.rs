@@ -292,9 +292,26 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
-        // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
+        // A clustering rewrite carries a layout-version marker computed against
+        // its read schema. A concurrent projection can invalidate that marker,
+        // so neither operation can be safely rebased over the other. Ordinary
+        // rewrites preserve row values and retain their existing compatibility
+        // with projections.
+        let clustering_rewrite_with_project = match (ours, theirs) {
+            (Operation::Rewrite { .. }, Operation::Project { .. }) => self
+                .transaction
+                .new_fragment_clustering_version()?
+                .is_some(),
+            (Operation::Project { .. }, Operation::Rewrite { .. }) => other_transaction
+                .new_fragment_clustering_version()?
+                .is_some(),
+            _ => false,
+        };
+        if clustering_rewrite_with_project {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
         {
@@ -2321,7 +2338,9 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
+    use crate::dataset::transaction::{
+        DataReplacementGroup, RewriteGroup, TransactionBuilder, UpdateMap,
+    };
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -3958,6 +3977,103 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_project_conflicts_only_with_marked_rewrite_in_both_orders() {
+        let project = Operation::Project {
+            schema: lance_core::datatypes::Schema::default(),
+            preserves_nullability: true,
+        };
+        let rewrite = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![Fragment::new(1)],
+            }],
+            rewritten_indices: Vec::new(),
+            frag_reuse_index: None,
+        };
+        let transaction_with_marker = |operation: Operation, marker: Option<&str>| match marker {
+            Some("7") => TransactionBuilder::new(0, operation)
+                .new_fragment_clustering_version(7)
+                .build(),
+            Some(marker) => {
+                let mut transaction = Transaction::new(0, operation, None);
+                transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+                    "__lance_new_fragment_clustering_version".to_string(),
+                    marker.to_string(),
+                )])));
+                transaction
+            }
+            None => Transaction::new(0, operation, None),
+        };
+
+        for marked in [false, true] {
+            for (order, ours, theirs) in [
+                ("project-rebasing", project.clone(), rewrite.clone()),
+                ("rewrite-rebasing", rewrite.clone(), project.clone()),
+            ] {
+                let marker = marked.then_some("7");
+                let transaction = transaction_with_marker(
+                    ours.clone(),
+                    matches!(&ours, Operation::Rewrite { .. })
+                        .then_some(marker)
+                        .flatten(),
+                );
+                let other_transaction = transaction_with_marker(
+                    theirs.clone(),
+                    matches!(&theirs, Operation::Rewrite { .. })
+                        .then_some(marker)
+                        .flatten(),
+                );
+                let mut rebase = TransactionRebase {
+                    transaction,
+                    initial_fragments: HashMap::new(),
+                    modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
+                    affected_rows: None,
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
+                };
+                let result = rebase.check_txn(&other_transaction, 1);
+
+                assert_eq!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    marked,
+                    "{order}/marked={marked}: got {result:?}"
+                );
+            }
+        }
+
+        for (order, ours, theirs) in [
+            ("project-rebasing", project.clone(), rewrite.clone()),
+            ("rewrite-rebasing", rewrite, project),
+        ] {
+            let transaction = transaction_with_marker(
+                ours.clone(),
+                matches!(&ours, Operation::Rewrite { .. }).then_some("malformed"),
+            );
+            let other_transaction = transaction_with_marker(
+                theirs.clone(),
+                matches!(&theirs, Operation::Rewrite { .. }).then_some("malformed"),
+            );
+            let mut rebase = TransactionRebase {
+                transaction,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let error = rebase.check_txn(&other_transaction, 1).unwrap_err();
+
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid reserved transaction property"),
+                "{order}: got {error}"
+            );
         }
     }
 

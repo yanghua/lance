@@ -394,7 +394,6 @@ impl DataFileFieldInterner {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
-            clustering_version: (p.clustering_version > 0).then_some(p.clustering_version),
             last_updated_at_version_meta,
             created_at_version_meta,
         })
@@ -487,14 +486,6 @@ pub struct Fragment {
     /// have this set.
     pub physical_rows: Option<usize>,
 
-    /// The clustering layout version this fragment's data was written under, if
-    /// it was produced by a clustering-aware write or recluster (see the
-    /// `lance.clustering.*` dataset config). `None` (or a value below the
-    /// dataset's current clustering version) marks the fragment as
-    /// under-clustered and thus a candidate for re-clustering during optimize.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clustering_version: Option<u64>,
-
     /// Last updated at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
@@ -513,7 +504,6 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }
@@ -551,7 +541,6 @@ impl Fragment {
             deletion_file: _,
             row_id_meta: _,
             physical_rows: _,
-            clustering_version: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
         } = self;
@@ -573,7 +562,6 @@ impl Fragment {
             deletion_file: _,
             row_id_meta: _,
             physical_rows: _,
-            clustering_version: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
         } = self;
@@ -600,7 +588,6 @@ impl Fragment {
             overlays: vec![],
             deletion_file: None,
             physical_rows,
-            clustering_version: None,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -715,7 +702,6 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
-            clustering_version: (p.clustering_version > 0).then_some(p.clustering_version),
             last_updated_at_version_meta: p
                 .last_updated_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
@@ -766,7 +752,9 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
-            clustering_version: f.clustering_version.unwrap_or_default(),
+            // Clustering stamps are owned by Manifest's private positional
+            // sidecar and injected only by Manifest serialization.
+            clustering_version: 0,
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
@@ -929,31 +917,6 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
-    }
-
-    #[test]
-    fn test_clustering_version_round_trips_and_defaults_to_none() {
-        let mut fragment = Fragment::new(7);
-        fragment.add_file_legacy(
-            "f.lance",
-            &Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-                "x",
-                DataType::Int32,
-                true,
-            )]))
-            .unwrap(),
-        );
-
-        // Unset stamp encodes as 0 and decodes back to None.
-        assert_eq!(fragment.clustering_version, None);
-        let decoded = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
-        assert_eq!(decoded.clustering_version, None);
-
-        // A set stamp round-trips.
-        fragment.clustering_version = Some(3);
-        let decoded = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
-        assert_eq!(decoded.clustering_version, Some(3));
-        assert_eq!(decoded, fragment);
     }
 
     #[test]

@@ -25,6 +25,8 @@ import java.util.List;
  * committed later.
  */
 public class RewriteResult implements Serializable {
+  private static final long serialVersionUID = 4501818269828675274L;
+
   private final CompactionMetrics metrics;
   private final List<FragmentMetadata> newFragments;
   private final List<FragmentMetadata> originalFragments;

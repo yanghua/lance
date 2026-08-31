@@ -198,6 +198,11 @@ pub async fn write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
+    // `Manifest::fragments` remains public for API compatibility. Reject a
+    // caller that replaced it without updating its positional sidecars before
+    // writing any bytes to the destination.
+    manifest.validate_fragment_invariants()?;
+
     match manifest.data_storage_format.version {
         ConcreteFileVersion::V1 => {
             write_schema_dictionaries(writer, &mut manifest.schema).await?;
@@ -328,6 +333,117 @@ mod test {
         assert!(manifest.index_section.is_none());
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
         assert!(roundtripped_manifest.index_section.is_none());
+    }
+
+    async fn assert_write_rejects_misaligned_sidecar(
+        path: &str,
+        mut manifest: Manifest,
+        expected_message: &str,
+    ) {
+        let store = ObjectStore::memory();
+        let mut writer = store.create(&Path::from(path)).await.unwrap();
+
+        let error = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message));
+        assert_eq!(writer.tell().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_rejects_more_fragments_than_sidecar_before_writing() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![crate::format::Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.fragments = Arc::new(vec![
+            crate::format::Fragment::new(0),
+            crate::format::Fragment::new(1),
+        ]);
+
+        assert_write_rejects_misaligned_sidecar(
+            "/reject_more_fragments_than_sidecar",
+            manifest,
+            "manifest has 2 fragments but 1 fragment clustering versions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_rejects_more_sidecar_entries_than_fragments_before_writing() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![
+                crate::format::Fragment::new(0),
+                crate::format::Fragment::new(1),
+            ]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.fragments = Arc::new(vec![crate::format::Fragment::new(0)]);
+
+        assert_write_rejects_misaligned_sidecar(
+            "/reject_more_sidecar_entries_than_fragments",
+            manifest,
+            "manifest has 1 fragments but 2 fragment clustering versions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_rejects_stale_fragment_offsets_before_writing() {
+        let schema = Schema::default();
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![crate::format::Fragment::with_file_legacy(
+                0,
+                "old.lance",
+                &schema,
+                Some(10),
+            )]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.fragments = Arc::new(vec![crate::format::Fragment::with_file_legacy(
+            0,
+            "old.lance",
+            &schema,
+            Some(20),
+        )]);
+
+        assert_write_rejects_misaligned_sidecar(
+            "/reject_stale_fragment_offsets",
+            manifest,
+            "manifest fragment offsets are stale for its 1 fragments",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_rejects_same_shape_fragment_reorder_before_writing() {
+        let schema = Schema::default();
+        let fragments = vec![
+            crate::format::Fragment::with_file_legacy(0, "zero.lance", &schema, Some(10)),
+            crate::format::Fragment::with_file_legacy(1, "one.lance", &schema, Some(10)),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments.clone()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.fragments = Arc::new(vec![fragments[1].clone(), fragments[0].clone()]);
+
+        assert_write_rejects_misaligned_sidecar(
+            "/reject_same_shape_fragment_reorder",
+            manifest,
+            "manifest fragment at position 0 with id 1 does not match the fragment layout",
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -53,11 +53,8 @@ use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, ReadParams,
     UncommittedMergeInsert, UpdateBuilder, Version, VersionRef, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, WriteMode, WriteParams,
-    fragment::FileFragment as LanceFileFragment,
-    progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner,
-    transaction::{Operation, Transaction},
+    WhenNotMatchedBySource, WriteMode, WriteParams, fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress, scanner::Scanner as LanceScanner, transaction::Transaction,
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
@@ -106,6 +103,7 @@ use crate::scanner::ScanStatistics;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
+use crate::transaction::{PyOperation, PyTransactionWithManifest};
 use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -2971,7 +2969,7 @@ impl Dataset {
     #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit(
         dest: PyWriteDest,
-        operation: PyLance<Operation>,
+        operation: PyOperation,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -2985,14 +2983,14 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
-        let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
-
-        if let Some(commit_message) = commit_message {
-            transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+        let transaction_properties = commit_message.map(|commit_message| {
+            Arc::new(HashMap::from([(
                 LANCE_COMMIT_MESSAGE_KEY.to_string(),
                 commit_message,
-            )])));
-        }
+            )]))
+        });
+        let transaction =
+            operation.into_transaction(read_version.unwrap_or_default(), transaction_properties);
 
         Self::commit_transaction(
             dest,
@@ -3590,12 +3588,21 @@ impl Dataset {
     ///
     /// Returns None if the transaction file does not exist.
     #[pyo3(signature = (version))]
-    fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyLance<Transaction>>> {
+    fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyTransactionWithManifest>> {
         let new_self = self.ds.as_ref().clone();
-        let transaction = rt()
-            .block_on(None, new_self.read_transaction_by_version(version))?
+        let (transaction, manifest) = rt()
+            .block_on(None, async move {
+                let transaction = new_self.read_transaction_by_version(version).await?;
+                let manifest = if new_self.version().version == version {
+                    new_self.manifest().clone()
+                } else {
+                    new_self.checkout_version(version).await?.manifest().clone()
+                };
+                Ok::<_, lance::Error>((transaction, manifest))
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(transaction.map(PyLance))
+        Ok(transaction
+            .map(|transaction| PyTransactionWithManifest(transaction, Arc::new(manifest))))
     }
 
     #[pyo3(signature = (recent_transactions=10))]
@@ -4709,11 +4716,7 @@ pub fn write_dataset(
     dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let mut params = get_write_params(options, &dest.table_root_uri()?)?;
-    let cluster_by_columns = params
-        .as_mut()
-        .and_then(|params| params.cluster_by.take())
-        .map(|spec| spec.columns);
+    let (params, cluster_by_columns) = get_write_params(options, &dest.table_root_uri()?)?;
     let mut builder = lance::dataset::InsertBuilder::new(dest.as_dest());
     if let Some(params) = params.as_ref() {
         builder = builder.with_params(params);
@@ -4734,10 +4737,7 @@ pub fn write_dataset(
         )?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        rt().block_on(
-            Some(py),
-            builder.execute_stream(batches),
-        )?
+        rt().block_on(Some(py), builder.execute_stream(batches))?
     };
     let ds = result.map_err(write_error_to_pyerr)?;
     Ok(Dataset {
@@ -4806,11 +4806,12 @@ fn get_dict_opt<'py, D: FromPyObjectOwned<'py>>(
 pub fn get_write_params(
     options: &Bound<'_, PyDict>,
     table_uri: &str,
-) -> PyResult<Option<WriteParams>> {
-    let params = if options.is_none() {
-        None
+) -> PyResult<(Option<WriteParams>, Option<Vec<String>>)> {
+    let (params, cluster_by_columns) = if options.is_none() {
+        (None, None)
     } else {
         let mut p = WriteParams::default();
+        let cluster_by_columns = get_dict_opt::<Vec<String>>(options, "cluster_by")?;
         if let Some(mode) = get_dict_opt::<String>(options, "mode")? {
             p.mode = parse_write_mode(mode.as_str())?;
         };
@@ -4960,19 +4961,6 @@ pub fn get_write_params(
             p = p.with_blob_pack_file_size_threshold(max_bytes);
         }
 
-        // A column-list request uses default tuning for a one-shot write. If the
-        // destination already declares these columns, the Rust write path
-        // resolves the declaration's full curve, version, and bit width.
-        if let Some(columns) = get_dict_opt::<Vec<String>>(options, "cluster_by")? {
-            p.cluster_by = Some(
-                lance_index::clustering::ClusteringSpec::new(
-                    columns,
-                    lance_index::clustering::ClusteringCurve::default(),
-                )
-                .infer_error()?,
-            );
-        }
-
         // Handle properties
         if let Some(props) =
             get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?
@@ -5012,9 +5000,9 @@ pub fn get_write_params(
             p.commit_handler = Some(commit_handler);
         }
 
-        Some(p)
+        (Some(p), cluster_by_columns)
     };
-    Ok(params)
+    Ok((params, cluster_by_columns))
 }
 
 fn prepare_vector_index_params(

@@ -122,10 +122,16 @@ public class WriteFragmentBuilder {
   /**
    * Set the write parameters.
    *
+   * <p>This cannot be combined with individual write-parameter setters such as {@link
+   * #maxRowsPerFile(int)} or {@link #clusterBy(List)}, in either call order.
+   *
    * @param params the write parameters
    * @return this builder
    */
   public WriteFragmentBuilder writeParams(WriteParams params) {
+    Preconditions.checkState(
+        this.writeParamsBuilder == null,
+        "Cannot use both writeParams() and individual parameter methods");
     this.writeParams = params;
     return this;
   }
@@ -350,6 +356,8 @@ public class WriteFragmentBuilder {
   }
 
   private void ensureWriteParamsBuilder() {
+    Preconditions.checkState(
+        this.writeParams == null, "Cannot use both writeParams() and individual parameter methods");
     if (this.writeParamsBuilder == null) {
       this.writeParamsBuilder = new WriteParams.Builder();
     }

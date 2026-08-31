@@ -95,7 +95,8 @@ use super::transaction::{
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::write::{write_fragments_internal, write_fragments_internal_with_clustering};
+use super::{WriteMode, WriteParams, cleanup_data_fragments};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -123,9 +124,15 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_index::clustering::ClusteringSpec;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance_table::format::{
+    DataFile, DeletionFile, DeletionFileType, ExternalFile, Fragment, InlineRowIds,
+    RowDatasetVersionMeta, RowIdMeta,
+};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -146,12 +153,6 @@ pub enum CompactionMode {
     TryBinaryCopy,
     /// Use binary copy or fail if fragments are not compatible.
     ForceBinaryCopy,
-    /// Decode and re-encode data, re-sorting the combined rows of each task by
-    /// the dataset's clustering-key space-filling curve ("liquid clustering").
-    /// The dataset must have a clustering spec declared (see
-    /// [`Dataset::set_clustering`](crate::Dataset::set_clustering)). Incompatible
-    /// with binary copy.
-    Cluster,
 }
 
 impl TryFrom<&str> for CompactionMode {
@@ -162,9 +163,8 @@ impl TryFrom<&str> for CompactionMode {
             "reencode" => Ok(Self::Reencode),
             "try_binary_copy" => Ok(Self::TryBinaryCopy),
             "force_binary_copy" => Ok(Self::ForceBinaryCopy),
-            "cluster" => Ok(Self::Cluster),
             _ => Err(Error::invalid_input(format!(
-                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\", \"cluster\"",
+                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
                 value
             ))),
         }
@@ -564,6 +564,103 @@ impl CompactionOptions {
     }
 }
 
+/// The compaction operation selected by dataset configuration.
+///
+/// Clustering is deliberately represented outside [`CompactionMode`] so the
+/// existing compaction option and distributed-work payloads retain their
+/// original API and serialization contracts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactionRequest {
+    /// Compact files without reordering rows.
+    Compaction(CompactionOptions),
+    /// Recluster files according to the dataset's declared clustering spec.
+    Clustering(CompactionOptions),
+}
+
+impl CompactionRequest {
+    /// Return the normalized options for the selected operation.
+    pub fn options(&self) -> &CompactionOptions {
+        match self {
+            Self::Compaction(options) | Self::Clustering(options) => options,
+        }
+    }
+
+    /// Consume this request and return its normalized options.
+    pub fn into_options(self) -> CompactionOptions {
+        match self {
+            Self::Compaction(options) | Self::Clustering(options) => options,
+        }
+    }
+}
+
+/// Resolve manifest compaction configuration into an explicit operation.
+///
+/// The special value `lance.compaction.compaction_mode=cluster` selects
+/// [`CompactionRequest::Clustering`] and is removed before ordinary option
+/// parsing. Its returned options are normalized to
+/// [`CompactionMode::Reencode`], because clustering always decodes, sorts, and
+/// re-encodes rows. All other mode values retain the ordinary
+/// [`CompactionOptions::from_dataset_config`] behavior.
+///
+/// This function resolves dataset defaults only. A caller that also accepts an
+/// explicit per-operation mode must give that explicit request precedence when
+/// choosing the [`CompactionRequest`] variant, then apply its other option
+/// overrides to the returned options.
+#[allow(deprecated)]
+pub fn resolve_compaction_options_from_dataset_config(
+    config: &HashMap<String, String>,
+) -> Result<CompactionRequest> {
+    let mode_key = format!("{COMPACTION_CONFIG_PREFIX}compaction_mode");
+    let is_clustering = config
+        .get(&mode_key)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("cluster"));
+    if !is_clustering {
+        return CompactionOptions::from_dataset_config(config).map(CompactionRequest::Compaction);
+    }
+
+    let mut ordinary_config = config.clone();
+    ordinary_config.remove(&mode_key);
+    let mut options = CompactionOptions::from_dataset_config(&ordinary_config)?;
+    options.compaction_mode = Some(CompactionMode::Reencode);
+    options.enable_binary_copy = false;
+    options.enable_binary_copy_force = false;
+    Ok(CompactionRequest::Clustering(options))
+}
+
+fn validate_clustering_options(options: &CompactionOptions) -> Result<()> {
+    if options.defer_index_remap {
+        return Err(Error::invalid_input(
+            "CompactionOptions::defer_index_remap=true is not supported for clustering \
+             compaction: reclustering reorders rows and invalidates the positional \
+             row-address mapping recorded by the fragment reuse index (FRI)",
+        ));
+    }
+    if !matches!(options.compaction_mode(), CompactionMode::Reencode) {
+        return Err(Error::invalid_input(format!(
+            "clustering compaction requires CompactionMode::Reencode, got {:?}",
+            options.compaction_mode()
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_clustering_dataset(dataset: &Dataset) -> Result<()> {
+    if dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::not_supported(
+            "reclustering is not yet supported on datasets with stable row ids: \
+             reordering rows would invalidate the positional row-id sequence rechunk",
+        ));
+    }
+    if load_indices_for_remapping(dataset).await?.is_some() {
+        return Err(Error::not_supported(
+            "reclustering is not yet supported on datasets with a remappable secondary index: \
+             reordering rows would invalidate the positional row-address remap. Drop the index, \
+             recluster, then rebuild it",
+        ));
+    }
+    Ok(())
+}
+
 /// Determine if page-level binary copy can safely merge the provided fragments.
 ///
 /// Preconditions checked in order:
@@ -597,14 +694,8 @@ pub(super) async fn can_use_binary_copy_current(
     use lance_file::reader::FileReader as LFReader;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-    if matches!(
-        options.compaction_mode(),
-        CompactionMode::Reencode | CompactionMode::Cluster
-    ) {
-        log::debug!(
-            "Binary copy disabled: compaction mode {:?} always re-encodes",
-            options.compaction_mode()
-        );
+    if matches!(options.compaction_mode(), CompactionMode::Reencode) {
+        log::debug!("Binary copy disabled: compaction mode is Reencode");
         return Ok(false);
     }
 
@@ -904,22 +995,20 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 /// A compaction planner that selects under-clustered fragments for
 /// re-clustering.
 ///
-/// A fragment is *under-clustered* when its recorded
-/// [`clustering_version`](lance_table::format::Fragment::clustering_version) is
-/// different from the dataset's current
+/// A fragment is *under-clustered* when its manifest-recorded clustering
+/// version is different from the dataset's current
 /// [`ClusteringSpec::version`](lance_index::clustering::ClusteringSpec::version)
 /// — i.e. it was written before clustering was declared, under an older layout,
 /// or carries an unexpected future version. Selected fragments are grouped,
-/// oldest position first, and emitted as [`CompactionMode::Cluster`] tasks so
-/// [`rewrite_files`] re-sorts them by the clustering key.
+/// oldest position first, and emitted as dedicated clustering tasks that
+/// re-sort them by the clustering key.
 ///
 /// The existing per-run budgets on [`CompactionOptions`]
 /// (`max_source_fragments` / `max_source_rows` / `max_source_bytes`) bound how
 /// much is reclustered per run, so a large table converges incrementally over
 /// successive `optimize` calls rather than in one full-table rewrite.
 ///
-/// This planner always plans in `Cluster` mode regardless of the incoming
-/// `compaction_mode`, and requires the dataset to have a clustering spec.
+/// This planner requires the dataset to have a clustering spec.
 #[derive(Debug, Clone)]
 pub struct ClusteringCompactionPlanner {
     options: CompactionOptions,
@@ -928,19 +1017,18 @@ pub struct ClusteringCompactionPlanner {
 
 impl ClusteringCompactionPlanner {
     pub fn new(mut options: CompactionOptions) -> Result<Self> {
-        options.compaction_mode = Some(CompactionMode::Cluster);
         options.validate()?;
+        validate_clustering_options(&options)?;
         let excluded_fragment_ids = options.excluded_fragment_ids.iter().copied().collect();
         Ok(Self {
             options,
             excluded_fragment_ids,
         })
     }
-}
 
-#[async_trait::async_trait]
-impl CompactionPlanner for ClusteringCompactionPlanner {
-    async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+    /// Build a dedicated clustering compaction plan.
+    pub async fn plan(&self, dataset: &Dataset) -> Result<ClusteringCompactionPlan> {
+        validate_clustering_dataset(dataset).await?;
         let Some(spec) = dataset.clustering_spec()? else {
             return Err(Error::invalid_input(
                 "ClusteringCompactionPlanner requires a clustering spec on the dataset; \
@@ -948,6 +1036,7 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
             ));
         };
         let current_version = spec.version;
+        let clustering_versions = dataset.manifest.fragment_clustering_versions();
 
         // A fragment needs reclustering unless its stamp exactly matches the
         // current clustering version. This also repairs unexpected future
@@ -961,31 +1050,33 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
         // Resolve live row counts through FileFragment instead of relying on
         // optional manifest metadata. Legacy fragments may not record physical
         // rows or deletion counts, and treating either as zero could make a task
-        // silently exceed max_source_rows. The ordered buffering preserves
-        // adjacency while allowing legacy metadata reads to run concurrently.
+        // silently exceed max_source_rows. Without a source budget, ordered
+        // buffering preserves adjacency while allowing legacy metadata reads to
+        // run concurrently. With a budget, defer row metrics until the candidate
+        // passes checks that only need manifest metadata.
         let has_source_budget = self.options.max_source_fragments.is_some()
             || self.options.max_source_rows.is_some()
             || self.options.max_source_bytes.is_some();
         let metric_concurrency = if has_source_budget {
-            // Incremental planning must not eagerly touch fragments beyond the
-            // selected prefix: an unrelated legacy-metadata failure there must
-            // not prevent this run from making progress.
             1
         } else {
             dataset.object_store.as_ref().io_parallelism()
         };
-        let candidate_fragments = futures::stream::iter(fragments)
-            .map(|fragment| async {
+        let candidate_fragments = futures::stream::iter(fragments.into_iter().enumerate())
+            .map(|(position, fragment)| async move {
                 let is_excluded = u32::try_from(fragment.id())
                     .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id));
-                let stamped = fragment.metadata.clustering_version;
+                let stamped = clustering_versions.get(position).copied().flatten();
                 let under_clustered = stamped != Some(current_version);
                 if is_excluded || !under_clustered {
-                    Ok(None)
+                    Ok::<_, Error>(None)
                 } else {
-                    collect_metrics(&fragment)
-                        .await
-                        .map(|metrics| Some((fragment.metadata, metrics.num_rows())))
+                    let prefetched_rows = if has_source_budget {
+                        None
+                    } else {
+                        Some(collect_metrics(&fragment).await?.num_rows())
+                    };
+                    Ok(Some((fragment, prefetched_rows)))
                 }
             })
             .buffered(metric_concurrency);
@@ -1003,7 +1094,6 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
         let mut selected_fragments = 0usize;
         let mut selected_rows = 0usize;
         let mut selected_bytes = 0u64;
-        let source_fragment_limit = self.options.max_source_fragments;
         let schema_field_ids: HashSet<i32> = if self.options.max_source_bytes.is_some() {
             dataset.schema().field_ids().into_iter().collect()
         } else {
@@ -1023,13 +1113,28 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
         };
 
         loop {
-            if source_fragment_limit.is_some_and(|max| selected_fragments >= max) {
+            // Check every configured budget before requesting another candidate.
+            // Besides avoiding unnecessary work, this prevents failures in a
+            // later fragment from discarding an already-complete prefix.
+            let reached_run_budget = self
+                .options
+                .max_source_fragments
+                .is_some_and(|max| selected_fragments >= max)
+                || self
+                    .options
+                    .max_source_rows
+                    .is_some_and(|max| selected_rows >= max)
+                || self
+                    .options
+                    .max_source_bytes
+                    .is_some_and(|max| selected_bytes >= max);
+            if reached_run_budget {
                 break;
             }
             let Some(candidate) = candidate_fragments.next().await else {
                 break;
             };
-            let Some((fragment, rows)) = candidate? else {
+            let Some((fragment, prefetched_rows)) = candidate? else {
                 // Already-clustered and explicitly excluded fragments both
                 // break adjacency. In particular, never combine candidates on
                 // opposite sides of an excluded fragment.
@@ -1042,22 +1147,35 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
                 continue;
             };
             let bytes = if self.options.max_source_bytes.is_some() {
-                fragment_source_bytes(&fragment, &schema_field_ids)?
+                fragment_source_bytes(&fragment.metadata, &schema_field_ids)?
             } else {
                 0
             };
-            let exceeds_run_budget = self
+            let exceeds_metadata_budget = self
                 .options
                 .max_source_fragments
-                .is_some_and(|max| selected_fragments + 1 > max)
-                || self
-                    .options
-                    .max_source_rows
-                    .is_some_and(|max| selected_rows.saturating_add(rows) > max)
+                .is_some_and(|max| selected_fragments.saturating_add(1) > max)
                 || self
                     .options
                     .max_source_bytes
                     .is_some_and(|max| selected_bytes.saturating_add(bytes) > max);
+
+            // A byte budget can reject this fragment entirely from manifest
+            // metadata. Do that before resolving live rows, which may require
+            // opening a legacy data or deletion file. A row-only budget cannot
+            // avoid that lookahead when it still has remaining capacity.
+            let rows = if exceeds_metadata_budget {
+                0
+            } else if let Some(rows) = prefetched_rows {
+                rows
+            } else {
+                collect_metrics(&fragment).await?.num_rows()
+            };
+            let exceeds_run_budget = exceeds_metadata_budget
+                || self
+                    .options
+                    .max_source_rows
+                    .is_some_and(|max| selected_rows.saturating_add(rows) > max);
             if exceeds_run_budget {
                 flush(
                     &mut current,
@@ -1078,6 +1196,7 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
                 }
                 break;
             }
+            let fragment = fragment.metadata;
 
             let would_exceed_source_budget = !current.is_empty()
                 && (self
@@ -1128,28 +1247,6 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
                     &mut all_tasks,
                 );
             }
-
-            let reached_run_budget = self
-                .options
-                .max_source_fragments
-                .is_some_and(|max| selected_fragments >= max)
-                || self
-                    .options
-                    .max_source_rows
-                    .is_some_and(|max| selected_rows >= max)
-                || self
-                    .options
-                    .max_source_bytes
-                    .is_some_and(|max| selected_bytes >= max);
-            if reached_run_budget {
-                flush(
-                    &mut current,
-                    &mut current_rows,
-                    &mut current_bytes,
-                    &mut all_tasks,
-                );
-                break;
-            }
         }
         flush(
             &mut current,
@@ -1163,7 +1260,7 @@ impl CompactionPlanner for ClusteringCompactionPlanner {
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         compaction_plan.extend_tasks(tasks);
-        Ok(compaction_plan)
+        Ok(ClusteringCompactionPlan::new(compaction_plan))
     }
 }
 
@@ -1183,15 +1280,41 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    // In Cluster mode, select fragments by clustering version (under-clustered
-    // first) rather than by size/deletions, so a version bump reclusters even
-    // already-large fragments. Other modes use the size/adjacency planner.
-    if matches!(options.compaction_mode(), CompactionMode::Cluster) {
-        let planner = ClusteringCompactionPlanner::new(options)?;
-        return compact_files_with_planner(dataset, remap_options, &planner).await;
-    }
     let planner = DefaultCompactionPlanner::new(options)?;
     compact_files_with_planner(dataset, remap_options, &planner).await
+}
+
+/// Recluster under-clustered fragments using the dataset's declared
+/// clustering spec.
+///
+/// Unlike [`compact_files`], this operation may reorder rows. It therefore
+/// rejects deferred index remapping, stable row IDs, and remappable secondary
+/// indices until those paths can carry row identity through the sort.
+pub async fn compact_files_with_clustering(
+    dataset: &mut Dataset,
+    options: CompactionOptions,
+) -> Result<CompactionMetrics> {
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    let plan = plan_clustering_compaction(dataset, &options).await?;
+    if plan.num_tasks() == 0 {
+        return Ok(CompactionMetrics::default());
+    }
+
+    let dataset_snapshot = dataset.clone();
+    let options = plan.options().clone();
+    let num_threads = options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
+    let completed_tasks = futures::stream::iter(plan.compaction_tasks())
+        .map(|task| {
+            let dataset = &dataset_snapshot;
+            async move { task.execute(dataset).await }
+        })
+        .buffer_unordered(num_threads)
+        .try_collect()
+        .await?;
+
+    commit_clustering_compaction(dataset, completed_tasks, &options).await
 }
 
 pub async fn compact_files_with_planner(
@@ -1413,6 +1536,489 @@ impl CompactionPlan {
     /// The options used to produce this plan.
     pub fn options(&self) -> &CompactionOptions {
         &self.options
+    }
+}
+
+/// A serializable plan for reclustering under-clustered fragments.
+///
+/// This is a distinct, tagged envelope so it cannot be confused with an
+/// ordinary [`CompactionPlan`] by a distributed worker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusteringCompactionPlan {
+    inner: CompactionPlan,
+}
+
+#[allow(deprecated)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringCompactionOptionsWire {
+    target_rows_per_fragment: usize,
+    max_rows_per_group: usize,
+    max_bytes_per_file: Option<usize>,
+    materialize_deletions: bool,
+    materialize_deletions_threshold: f32,
+    num_threads: Option<usize>,
+    batch_size: Option<usize>,
+    io_buffer_size: Option<u64>,
+    defer_index_remap: bool,
+    index_remap_mode: IndexRemapMode,
+    compaction_mode: Option<CompactionMode>,
+    enable_binary_copy: bool,
+    enable_binary_copy_force: bool,
+    binary_copy_read_batch_bytes: Option<usize>,
+    max_source_fragments: Option<usize>,
+    max_source_rows: Option<usize>,
+    max_source_bytes: Option<u64>,
+    excluded_fragment_ids: Vec<u32>,
+    max_overlays_per_fragment: Option<usize>,
+}
+
+#[allow(deprecated)]
+impl From<&CompactionOptions> for ClusteringCompactionOptionsWire {
+    fn from(options: &CompactionOptions) -> Self {
+        Self {
+            target_rows_per_fragment: options.target_rows_per_fragment,
+            max_rows_per_group: options.max_rows_per_group,
+            max_bytes_per_file: options.max_bytes_per_file,
+            materialize_deletions: options.materialize_deletions,
+            materialize_deletions_threshold: options.materialize_deletions_threshold,
+            num_threads: options.num_threads,
+            batch_size: options.batch_size,
+            io_buffer_size: options.io_buffer_size,
+            defer_index_remap: options.defer_index_remap,
+            index_remap_mode: options.index_remap_mode,
+            compaction_mode: options.compaction_mode,
+            enable_binary_copy: options.enable_binary_copy,
+            enable_binary_copy_force: options.enable_binary_copy_force,
+            binary_copy_read_batch_bytes: options.binary_copy_read_batch_bytes,
+            max_source_fragments: options.max_source_fragments,
+            max_source_rows: options.max_source_rows,
+            max_source_bytes: options.max_source_bytes,
+            excluded_fragment_ids: options.excluded_fragment_ids.clone(),
+            max_overlays_per_fragment: options.max_overlays_per_fragment,
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl From<ClusteringCompactionOptionsWire> for CompactionOptions {
+    fn from(options: ClusteringCompactionOptionsWire) -> Self {
+        Self {
+            target_rows_per_fragment: options.target_rows_per_fragment,
+            max_rows_per_group: options.max_rows_per_group,
+            max_bytes_per_file: options.max_bytes_per_file,
+            materialize_deletions: options.materialize_deletions,
+            materialize_deletions_threshold: options.materialize_deletions_threshold,
+            num_threads: options.num_threads,
+            batch_size: options.batch_size,
+            io_buffer_size: options.io_buffer_size,
+            defer_index_remap: options.defer_index_remap,
+            index_remap_mode: options.index_remap_mode,
+            compaction_mode: options.compaction_mode,
+            enable_binary_copy: options.enable_binary_copy,
+            enable_binary_copy_force: options.enable_binary_copy_force,
+            binary_copy_read_batch_bytes: options.binary_copy_read_batch_bytes,
+            max_source_fragments: options.max_source_fragments,
+            max_source_rows: options.max_source_rows,
+            max_source_bytes: options.max_source_bytes,
+            excluded_fragment_ids: options.excluded_fragment_ids,
+            max_overlays_per_fragment: options.max_overlays_per_fragment,
+            transaction_properties: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringDataFileWire {
+    path: String,
+    fields: Vec<i32>,
+    column_indices: Vec<i32>,
+    file_major_version: u32,
+    file_minor_version: u32,
+    file_size_bytes: CachedFileSize,
+    base_id: Option<u32>,
+}
+
+impl From<&DataFile> for ClusteringDataFileWire {
+    fn from(file: &DataFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            fields: file.fields.to_vec(),
+            column_indices: file.column_indices.to_vec(),
+            file_major_version: file.file_major_version,
+            file_minor_version: file.file_minor_version,
+            file_size_bytes: file.file_size_bytes.clone(),
+            base_id: file.base_id,
+        }
+    }
+}
+
+impl From<ClusteringDataFileWire> for DataFile {
+    fn from(file: ClusteringDataFileWire) -> Self {
+        Self {
+            path: file.path,
+            fields: file.fields.into(),
+            column_indices: file.column_indices.into(),
+            file_major_version: file.file_major_version,
+            file_minor_version: file.file_minor_version,
+            file_size_bytes: file.file_size_bytes,
+            base_id: file.base_id,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringExternalFileWire {
+    path: String,
+    offset: u64,
+    size: u64,
+}
+
+impl From<&ExternalFile> for ClusteringExternalFileWire {
+    fn from(file: &ExternalFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            offset: file.offset,
+            size: file.size,
+        }
+    }
+}
+
+impl From<ClusteringExternalFileWire> for ExternalFile {
+    fn from(file: ClusteringExternalFileWire) -> Self {
+        Self {
+            path: file.path,
+            offset: file.offset,
+            size: file.size,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum ClusteringRowIdMetaWire {
+    Inline(Vec<u8>),
+    External(ClusteringExternalFileWire),
+}
+
+impl From<&RowIdMeta> for ClusteringRowIdMetaWire {
+    fn from(meta: &RowIdMeta) -> Self {
+        match meta {
+            RowIdMeta::Inline(data) => Self::Inline(data.to_vec()),
+            RowIdMeta::External(file) => Self::External(file.into()),
+        }
+    }
+}
+
+impl From<ClusteringRowIdMetaWire> for RowIdMeta {
+    fn from(meta: ClusteringRowIdMetaWire) -> Self {
+        match meta {
+            ClusteringRowIdMetaWire::Inline(data) => Self::Inline(InlineRowIds::from(data)),
+            ClusteringRowIdMetaWire::External(file) => Self::External(file.into()),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringInlineVersionWire {
+    inline: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringExternalVersionWire {
+    external: ClusteringExternalFileWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ClusteringRowDatasetVersionMetaWire {
+    Inline(ClusteringInlineVersionWire),
+    External(ClusteringExternalVersionWire),
+}
+
+impl From<&RowDatasetVersionMeta> for ClusteringRowDatasetVersionMetaWire {
+    fn from(meta: &RowDatasetVersionMeta) -> Self {
+        match meta {
+            RowDatasetVersionMeta::Inline(data) => Self::Inline(ClusteringInlineVersionWire {
+                inline: data.to_vec(),
+            }),
+            RowDatasetVersionMeta::External(file) => {
+                Self::External(ClusteringExternalVersionWire {
+                    external: file.into(),
+                })
+            }
+        }
+    }
+}
+
+impl From<ClusteringRowDatasetVersionMetaWire> for RowDatasetVersionMeta {
+    fn from(meta: ClusteringRowDatasetVersionMetaWire) -> Self {
+        match meta {
+            ClusteringRowDatasetVersionMetaWire::Inline(data) => Self::Inline(data.inline.into()),
+            ClusteringRowDatasetVersionMetaWire::External(file) => {
+                Self::External(file.external.into())
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringDeletionFileWire {
+    read_version: u64,
+    id: u64,
+    file_type: DeletionFileType,
+    num_deleted_rows: Option<usize>,
+    base_id: Option<u32>,
+}
+
+impl From<&DeletionFile> for ClusteringDeletionFileWire {
+    fn from(file: &DeletionFile) -> Self {
+        Self {
+            read_version: file.read_version,
+            id: file.id,
+            file_type: file.file_type.clone(),
+            num_deleted_rows: file.num_deleted_rows,
+            base_id: file.base_id,
+        }
+    }
+}
+
+impl From<ClusteringDeletionFileWire> for DeletionFile {
+    fn from(file: ClusteringDeletionFileWire) -> Self {
+        Self {
+            read_version: file.read_version,
+            id: file.id,
+            file_type: file.file_type,
+            num_deleted_rows: file.num_deleted_rows,
+            base_id: file.base_id,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringDataOverlayFileWire {
+    data_file: ClusteringDataFileWire,
+    coverage: OverlayCoverage,
+    committed_version: u64,
+}
+
+impl From<&DataOverlayFile> for ClusteringDataOverlayFileWire {
+    fn from(file: &DataOverlayFile) -> Self {
+        Self {
+            data_file: ClusteringDataFileWire::from(&file.data_file),
+            coverage: file.coverage.clone(),
+            committed_version: file.committed_version,
+        }
+    }
+}
+
+impl From<ClusteringDataOverlayFileWire> for DataOverlayFile {
+    fn from(file: ClusteringDataOverlayFileWire) -> Self {
+        Self {
+            data_file: file.data_file.into(),
+            coverage: file.coverage,
+            committed_version: file.committed_version,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringFragmentWire {
+    id: u64,
+    files: Vec<ClusteringDataFileWire>,
+    overlays: Vec<ClusteringDataOverlayFileWire>,
+    deletion_file: Option<ClusteringDeletionFileWire>,
+    row_id_meta: Option<ClusteringRowIdMetaWire>,
+    physical_rows: Option<usize>,
+    last_updated_at_version_meta: Option<ClusteringRowDatasetVersionMetaWire>,
+    created_at_version_meta: Option<ClusteringRowDatasetVersionMetaWire>,
+}
+
+impl From<&Fragment> for ClusteringFragmentWire {
+    fn from(fragment: &Fragment) -> Self {
+        Self {
+            id: fragment.id,
+            files: fragment
+                .files
+                .iter()
+                .map(ClusteringDataFileWire::from)
+                .collect(),
+            overlays: fragment
+                .overlays
+                .iter()
+                .map(ClusteringDataOverlayFileWire::from)
+                .collect(),
+            deletion_file: fragment
+                .deletion_file
+                .as_ref()
+                .map(ClusteringDeletionFileWire::from),
+            row_id_meta: fragment
+                .row_id_meta
+                .as_ref()
+                .map(ClusteringRowIdMetaWire::from),
+            physical_rows: fragment.physical_rows,
+            last_updated_at_version_meta: fragment
+                .last_updated_at_version_meta
+                .as_ref()
+                .map(ClusteringRowDatasetVersionMetaWire::from),
+            created_at_version_meta: fragment
+                .created_at_version_meta
+                .as_ref()
+                .map(ClusteringRowDatasetVersionMetaWire::from),
+        }
+    }
+}
+
+impl From<ClusteringFragmentWire> for Fragment {
+    fn from(fragment: ClusteringFragmentWire) -> Self {
+        Self {
+            id: fragment.id,
+            files: fragment.files.into_iter().map(DataFile::from).collect(),
+            overlays: fragment
+                .overlays
+                .into_iter()
+                .map(DataOverlayFile::from)
+                .collect(),
+            deletion_file: fragment.deletion_file.map(DeletionFile::from),
+            row_id_meta: fragment.row_id_meta.map(RowIdMeta::from),
+            physical_rows: fragment.physical_rows,
+            last_updated_at_version_meta: fragment
+                .last_updated_at_version_meta
+                .map(RowDatasetVersionMeta::from),
+            created_at_version_meta: fragment
+                .created_at_version_meta
+                .map(RowDatasetVersionMeta::from),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringTaskDataWire {
+    fragments: Vec<ClusteringFragmentWire>,
+}
+
+impl From<&TaskData> for ClusteringTaskDataWire {
+    fn from(task: &TaskData) -> Self {
+        Self {
+            fragments: task
+                .fragments
+                .iter()
+                .map(ClusteringFragmentWire::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<ClusteringTaskDataWire> for TaskData {
+    fn from(task: ClusteringTaskDataWire) -> Self {
+        Self {
+            fragments: task.fragments.into_iter().map(Fragment::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringCompactionPlanPayload {
+    tasks: Vec<ClusteringTaskDataWire>,
+    read_version: u64,
+    options: ClusteringCompactionOptionsWire,
+}
+
+impl From<&CompactionPlan> for ClusteringCompactionPlanPayload {
+    fn from(plan: &CompactionPlan) -> Self {
+        Self {
+            tasks: plan
+                .tasks
+                .iter()
+                .map(ClusteringTaskDataWire::from)
+                .collect(),
+            read_version: plan.read_version,
+            options: ClusteringCompactionOptionsWire::from(&plan.options),
+        }
+    }
+}
+
+impl From<ClusteringCompactionPlanPayload> for CompactionPlan {
+    fn from(plan: ClusteringCompactionPlanPayload) -> Self {
+        Self {
+            tasks: plan.tasks.into_iter().map(TaskData::from).collect(),
+            read_version: plan.read_version,
+            options: plan.options.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+enum ClusteringCompactionPlanWireRef<'a> {
+    #[serde(rename = "lance_clustering_compaction_plan_v1")]
+    V1(&'a ClusteringCompactionPlanPayload),
+}
+
+#[derive(Deserialize)]
+enum ClusteringCompactionPlanWire {
+    #[serde(rename = "lance_clustering_compaction_plan_v1")]
+    V1(ClusteringCompactionPlanPayload),
+}
+
+impl Serialize for ClusteringCompactionPlan {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let plan = ClusteringCompactionPlanPayload::from(&self.inner);
+        ClusteringCompactionPlanWireRef::V1(&plan).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClusteringCompactionPlan {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ClusteringCompactionPlanWire::V1(plan) =
+            ClusteringCompactionPlanWire::deserialize(deserializer)?;
+        Ok(Self { inner: plan.into() })
+    }
+}
+
+impl ClusteringCompactionPlan {
+    fn new(inner: CompactionPlan) -> Self {
+        Self { inner }
+    }
+
+    /// Retrieve standalone clustering tasks for distributed execution.
+    pub fn compaction_tasks(&self) -> impl Iterator<Item = ClusteringCompactionTask> + '_ {
+        self.inner
+            .compaction_tasks()
+            .map(ClusteringCompactionTask::from_compaction_task)
+    }
+
+    /// The number of tasks in the plan.
+    pub fn num_tasks(&self) -> usize {
+        self.inner.num_tasks()
+    }
+
+    /// The dataset version from which the plan was produced.
+    pub fn read_version(&self) -> u64 {
+        self.inner.read_version()
+    }
+
+    /// The normalized options used to produce the plan.
+    pub fn options(&self) -> &CompactionOptions {
+        self.inner.options()
+    }
+
+    /// The fragment groups selected by this plan.
+    pub fn tasks(&self) -> &[TaskData] {
+        self.inner.tasks()
     }
 }
 
@@ -2231,6 +2837,145 @@ pub struct CompactionTask {
     pub options: CompactionOptions,
 }
 
+/// A standalone, serializable reclustering task.
+///
+/// The tagged envelope prevents an ordinary [`CompactionTask`] from being
+/// accepted as a row-reordering task, or vice versa.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusteringCompactionTask {
+    inner: CompactionTask,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringCompactionTaskPayload {
+    task: ClusteringTaskDataWire,
+    read_version: u64,
+    options: ClusteringCompactionOptionsWire,
+}
+
+impl From<&CompactionTask> for ClusteringCompactionTaskPayload {
+    fn from(task: &CompactionTask) -> Self {
+        Self {
+            task: ClusteringTaskDataWire::from(&task.task),
+            read_version: task.read_version,
+            options: ClusteringCompactionOptionsWire::from(&task.options),
+        }
+    }
+}
+
+impl From<ClusteringCompactionTaskPayload> for CompactionTask {
+    fn from(task: ClusteringCompactionTaskPayload) -> Self {
+        Self {
+            task: task.task.into(),
+            read_version: task.read_version,
+            options: task.options.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+enum ClusteringCompactionTaskWireRef<'a> {
+    #[serde(rename = "lance_clustering_compaction_task_v1")]
+    V1(&'a ClusteringCompactionTaskPayload),
+}
+
+#[derive(Deserialize)]
+enum ClusteringCompactionTaskWire {
+    #[serde(rename = "lance_clustering_compaction_task_v1")]
+    V1(ClusteringCompactionTaskPayload),
+}
+
+impl Serialize for ClusteringCompactionTask {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let task = ClusteringCompactionTaskPayload::from(&self.inner);
+        ClusteringCompactionTaskWireRef::V1(&task).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClusteringCompactionTask {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ClusteringCompactionTaskWire::V1(task) =
+            ClusteringCompactionTaskWire::deserialize(deserializer)?;
+        Ok(Self { inner: task.into() })
+    }
+}
+
+impl ClusteringCompactionTask {
+    /// Create a clustering task from planner data.
+    ///
+    /// This is primarily for language bindings that reconstruct a distributed
+    /// task from their own transport objects. The task validates all clustering
+    /// constraints again when executed.
+    pub fn new(task: TaskData, read_version: u64, mut options: CompactionOptions) -> Result<Self> {
+        options.validate()?;
+        validate_clustering_options(&options)?;
+        Ok(Self {
+            inner: CompactionTask {
+                task,
+                read_version,
+                options,
+            },
+        })
+    }
+
+    fn from_compaction_task(inner: CompactionTask) -> Self {
+        Self { inner }
+    }
+
+    /// The fragment group to rewrite.
+    pub fn task_data(&self) -> &TaskData {
+        &self.inner.task
+    }
+
+    /// The fragments to rewrite.
+    pub fn fragments(&self) -> &[Fragment] {
+        &self.inner.task.fragments
+    }
+
+    /// The immutable dataset version against which this task executes.
+    pub fn read_version(&self) -> u64 {
+        self.inner.read_version
+    }
+
+    /// The normalized options carried by this task.
+    pub fn options(&self) -> &CompactionOptions {
+        &self.inner.options
+    }
+
+    /// Execute the clustering task against its declared read version.
+    pub async fn execute(&self, dataset: &Dataset) -> Result<ClusteringRewriteResult> {
+        validate_clustering_options(&self.inner.options)?;
+        let dataset = if dataset.manifest.version == self.inner.read_version {
+            Cow::Borrowed(dataset)
+        } else {
+            Cow::Owned(dataset.checkout_version(self.inner.read_version).await?)
+        };
+        validate_clustering_dataset(dataset.as_ref()).await?;
+        let clustering_spec = dataset.clustering_spec()?.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "clustering compaction requires a clustering declaration at task read_version {}",
+                self.inner.read_version
+            ))
+        })?;
+        let clustering_version = clustering_spec.version;
+        let inner = rewrite_files_with_strategy(
+            dataset,
+            self.inner.task.clone(),
+            &self.inner.options,
+            RewriteStrategy::Cluster(clustering_spec),
+        )
+        .await?;
+        Ok(ClusteringRewriteResult::new(inner, clustering_version))
+    }
+}
+
 impl CompactionTask {
     /// Run the compaction task and return the result.
     ///
@@ -2384,12 +3129,19 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    if matches!(options.compaction_mode(), CompactionMode::Cluster) {
-        let planner = ClusteringCompactionPlanner::new(options.clone())?;
-        return planner.plan(dataset).await;
-    }
     let planner = DefaultCompactionPlanner::new(options.clone())?;
     planner.plan(dataset).await
+}
+
+/// Plan reclustering work for fragments whose clustering version differs from
+/// the dataset's current declaration.
+pub async fn plan_clustering_compaction(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+) -> Result<ClusteringCompactionPlan> {
+    ClusteringCompactionPlanner::new(options.clone())?
+        .plan(dataset)
+        .await
 }
 
 /// The result of a single compaction task.
@@ -2412,6 +3164,194 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClusteringRewritePayload {
+    result: RewriteResult,
+    clustering_version: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringCompactionMetricsWire {
+    fragments_removed: usize,
+    fragments_added: usize,
+    files_removed: usize,
+    files_added: usize,
+}
+
+impl From<&CompactionMetrics> for ClusteringCompactionMetricsWire {
+    fn from(metrics: &CompactionMetrics) -> Self {
+        Self {
+            fragments_removed: metrics.fragments_removed,
+            fragments_added: metrics.fragments_added,
+            files_removed: metrics.files_removed,
+            files_added: metrics.files_added,
+        }
+    }
+}
+
+impl From<ClusteringCompactionMetricsWire> for CompactionMetrics {
+    fn from(metrics: ClusteringCompactionMetricsWire) -> Self {
+        Self {
+            fragments_removed: metrics.fragments_removed,
+            fragments_added: metrics.fragments_added,
+            files_removed: metrics.files_removed,
+            files_added: metrics.files_added,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusteringRewritePayloadWire {
+    metrics: ClusteringCompactionMetricsWire,
+    new_fragments: Vec<ClusteringFragmentWire>,
+    read_version: u64,
+    original_fragments: Vec<ClusteringFragmentWire>,
+    row_addrs: Option<Vec<u8>>,
+    clustering_version: u64,
+}
+
+impl From<&ClusteringRewritePayload> for ClusteringRewritePayloadWire {
+    fn from(payload: &ClusteringRewritePayload) -> Self {
+        Self {
+            metrics: ClusteringCompactionMetricsWire::from(&payload.result.metrics),
+            new_fragments: payload
+                .result
+                .new_fragments
+                .iter()
+                .map(ClusteringFragmentWire::from)
+                .collect(),
+            read_version: payload.result.read_version,
+            original_fragments: payload
+                .result
+                .original_fragments
+                .iter()
+                .map(ClusteringFragmentWire::from)
+                .collect(),
+            row_addrs: payload.result.row_addrs.clone(),
+            clustering_version: payload.clustering_version,
+        }
+    }
+}
+
+impl From<ClusteringRewritePayloadWire> for ClusteringRewritePayload {
+    fn from(payload: ClusteringRewritePayloadWire) -> Self {
+        Self {
+            result: RewriteResult {
+                metrics: payload.metrics.into(),
+                new_fragments: payload
+                    .new_fragments
+                    .into_iter()
+                    .map(Fragment::from)
+                    .collect(),
+                read_version: payload.read_version,
+                original_fragments: payload
+                    .original_fragments
+                    .into_iter()
+                    .map(Fragment::from)
+                    .collect(),
+                row_addrs: payload.row_addrs,
+            },
+            clustering_version: payload.clustering_version,
+        }
+    }
+}
+
+/// The serializable result of a [`ClusteringCompactionTask`].
+///
+/// Its tagged envelope is intentionally incompatible with [`RewriteResult`]
+/// so ordinary and row-reordering results cannot be mixed accidentally. The
+/// serialized payload is intended for trusted workers; it is not an attestation
+/// of the referenced files' contents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusteringRewriteResult {
+    inner: ClusteringRewritePayload,
+}
+
+#[derive(Serialize)]
+enum ClusteringRewriteResultWireRef<'a> {
+    #[serde(rename = "lance_clustering_rewrite_result_v1")]
+    V1(&'a ClusteringRewritePayloadWire),
+}
+
+#[derive(Deserialize)]
+enum ClusteringRewriteResultWire {
+    #[serde(rename = "lance_clustering_rewrite_result_v1")]
+    V1(ClusteringRewritePayloadWire),
+}
+
+impl Serialize for ClusteringRewriteResult {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let result = ClusteringRewritePayloadWire::from(&self.inner);
+        ClusteringRewriteResultWireRef::V1(&result).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClusteringRewriteResult {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ClusteringRewriteResultWire::V1(result) =
+            ClusteringRewriteResultWire::deserialize(deserializer)?;
+        Ok(Self {
+            inner: result.into(),
+        })
+    }
+}
+
+impl ClusteringRewriteResult {
+    /// Create a clustering result from a rewrite payload and the declaration
+    /// version used to sort it.
+    fn new(result: RewriteResult, clustering_version: u64) -> Self {
+        Self {
+            inner: ClusteringRewritePayload {
+                result,
+                clustering_version,
+            },
+        }
+    }
+
+    /// The underlying rewrite payload.
+    pub fn rewrite_result(&self) -> &RewriteResult {
+        &self.inner.result
+    }
+
+    /// The metrics produced by this task.
+    pub fn metrics(&self) -> &CompactionMetrics {
+        &self.inner.result.metrics
+    }
+
+    /// The newly written fragments.
+    pub fn new_fragments(&self) -> &[Fragment] {
+        &self.inner.result.new_fragments
+    }
+
+    /// The task's immutable read version.
+    pub fn read_version(&self) -> u64 {
+        self.inner.result.read_version
+    }
+
+    /// The original fragments replaced by this task.
+    pub fn original_fragments(&self) -> &[Fragment] {
+        &self.inner.result.original_fragments
+    }
+
+    /// The serialized old row addresses, if any.
+    pub fn row_addrs(&self) -> Option<&[u8]> {
+        self.inner.result.row_addrs.as_deref()
+    }
+
+    /// The clustering declaration version used to sort the output.
+    pub fn clustering_version(&self) -> u64 {
+        self.inner.clustering_version
+    }
 }
 
 async fn reserve_fragment_ids(
@@ -2458,7 +3398,26 @@ async fn rewrite_files(
     task: TaskData,
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
+    rewrite_files_with_strategy(dataset, task, options, RewriteStrategy::PreserveOrder).await
+}
+
+enum RewriteStrategy {
+    PreserveOrder,
+    Cluster(ClusteringSpec),
+}
+
+async fn rewrite_files_with_strategy(
+    dataset: Cow<'_, Dataset>,
+    task: TaskData,
+    options: &CompactionOptions,
+    strategy: RewriteStrategy,
+) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
+    let is_clustering = matches!(&strategy, RewriteStrategy::Cluster(_));
+    let clustering_spec = match &strategy {
+        RewriteStrategy::PreserveOrder => None,
+        RewriteStrategy::Cluster(spec) => Some(spec.clone()),
+    };
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -2500,9 +3459,12 @@ async fn rewrite_files(
         num_rows,
         fragments.len()
     );
-    let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
-    if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
+    let can_binary_copy =
+        !is_clustering && can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    if !can_binary_copy
+        && !is_clustering
+        && matches!(options.compaction_mode(), CompactionMode::ForceBinaryCopy)
+    {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -2582,46 +3544,6 @@ async fn rewrite_files(
     if dataset.manifest.uses_stable_row_ids() {
         params.enable_stable_row_ids = true;
     }
-
-    // In Cluster mode, re-sort the task's combined rows by the dataset's
-    // clustering-key space-filling curve and stamp the output fragments with the
-    // current clustering version. Setting `cluster_by` drives both in
-    // `write_fragments_internal`.
-    //
-    // Reordering rows breaks the *positional* old->new row mapping that both the
-    // index-remap path and the stable-row-id rechunk path assume (they pair a
-    // sorted/insertion-ordered old sequence with positionally-assigned new
-    // addresses). Correctly reclustering those cases means carrying row identity
-    // through the sort and rebuilding the mapping from the sorted order, which is
-    // a follow-up. For now reject the combinations that would otherwise silently
-    // corrupt row ids or a secondary index.
-    if matches!(mode, CompactionMode::Cluster) {
-        let Some(spec) = dataset.clustering_spec()? else {
-            return Err(Error::invalid_input(
-                "compaction mode \"cluster\" requires a clustering spec on the dataset; \
-                 declare one with Dataset::set_clustering before reclustering",
-            ));
-        };
-        if dataset.manifest.uses_stable_row_ids() {
-            return Err(Error::not_supported(
-                "reclustering (compaction mode \"cluster\") is not yet supported on datasets \
-                 with stable row ids: reordering rows would invalidate the positional row-id \
-                 sequence rechunk",
-            ));
-        }
-        if load_indices_for_remapping(dataset.as_ref())
-            .await?
-            .is_some()
-        {
-            return Err(Error::not_supported(
-                "reclustering (compaction mode \"cluster\") is not yet supported on datasets \
-                 with a remappable secondary index: reordering rows would invalidate the \
-                 positional row-address remap. Drop the index, recluster, then rebuild it",
-            ));
-        }
-        params.cluster_by = Some(spec);
-    }
-
     if can_binary_copy {
         let version = dataset.manifest.data_storage_format.lance_file_format();
         new_fragments = versions::rewrite_files_binary_copy(
@@ -2633,7 +3555,9 @@ async fn rewrite_files(
         )
         .await?;
 
-        if new_fragments.is_empty() && matches!(mode, CompactionMode::ForceBinaryCopy) {
+        if new_fragments.is_empty()
+            && matches!(options.compaction_mode(), CompactionMode::ForceBinaryCopy)
+        {
             return Err(Error::not_supported_source(
                 format!("compaction task {}: binary copy is not supported", task_id).into(),
             ));
@@ -2658,17 +3582,36 @@ async fn rewrite_files(
             row_ids_rx = Some(rx);
         }
     } else {
-        let (frags, _) = write_fragments_internal(
-            dataset.manifest.data_storage_format.lance_file_format(),
-            Some(dataset.as_ref()),
-            dataset.object_store.clone(),
-            &dataset.base,
-            dataset.schema().clone(),
-            reader.expect("reader must be prepared for non-binary-copy path"),
-            params,
-            None,
-        )
-        .await?;
+        let reader = reader.expect("reader must be prepared for non-binary-copy path");
+        let (frags, _) = match clustering_spec {
+            Some(spec) => {
+                write_fragments_internal_with_clustering(
+                    dataset.manifest.data_storage_format.lance_file_format(),
+                    Some(dataset.as_ref()),
+                    dataset.object_store.clone(),
+                    &dataset.base,
+                    dataset.schema().clone(),
+                    reader,
+                    params,
+                    None,
+                    Some(spec),
+                )
+                .await?
+            }
+            None => {
+                write_fragments_internal(
+                    dataset.manifest.data_storage_format.lance_file_format(),
+                    Some(dataset.as_ref()),
+                    dataset.object_store.clone(),
+                    &dataset.base,
+                    dataset.schema().clone(),
+                    reader,
+                    params,
+                    None,
+                )
+                .await?
+            }
+        };
         new_fragments = frags;
     }
 
@@ -2906,21 +3849,93 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
+    commit_compaction_with_strategy(
+        dataset,
+        completed_tasks,
+        remap_options,
+        options,
+        CommitStrategy::Ordinary,
+    )
+    .await
+}
+
+/// Commit results produced by [`ClusteringCompactionTask::execute`].
+///
+/// Result read/declaration versions are checked against the immutable task
+/// snapshot before any fragment IDs are reserved. This consistency check is not
+/// authentication of a serialized payload. The task version is stamped even if
+/// the coordinator now observes a newer or cleared declaration.
+pub async fn commit_clustering_compaction(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<ClusteringRewriteResult>,
+    options: &CompactionOptions,
+) -> Result<CompactionMetrics> {
+    validate_clustering_options(options)?;
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
 
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
-    // Address-style results require immediate index remapping unless it is deferred.
-    let needs_remapping =
-        !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
+    let read_version = completed_tasks[0].read_version();
+    let clustering_version = completed_tasks[0].clustering_version();
+    if completed_tasks.iter().any(|result| {
+        result.read_version() != read_version || result.clustering_version() != clustering_version
+    }) {
+        return Err(Error::invalid_input(format!(
+            "clustering compaction results must all have read_version {read_version} and \
+             clustering_version {clustering_version}"
+        )));
+    }
 
-    // Confirm there is a remapper before materializing the potentially very large row address map.
-    let index_remapper = if needs_remapping {
-        remap_options.create_remapper(dataset).await?
+    let task_dataset = if dataset.manifest.version == read_version {
+        Cow::Borrowed(dataset as &Dataset)
     } else {
-        None
+        Cow::Owned(dataset.checkout_version(read_version).await?)
     };
+    let declared_version = task_dataset
+        .clustering_spec()?
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "clustering compaction results require a clustering declaration at task \
+                 read_version {read_version}"
+            ))
+        })?
+        .version;
+    if declared_version != clustering_version {
+        return Err(Error::invalid_input(format!(
+            "clustering compaction result version {clustering_version} does not match \
+             declaration version {declared_version} at task read_version {read_version}"
+        )));
+    }
+
+    let completed_tasks = completed_tasks
+        .into_iter()
+        .map(|result| result.inner.result)
+        .collect();
+    commit_compaction_with_strategy(
+        dataset,
+        completed_tasks,
+        Arc::new(IgnoreRemap::default()),
+        options,
+        CommitStrategy::Cluster { clustering_version },
+    )
+    .await
+}
+
+enum CommitStrategy {
+    Ordinary,
+    Cluster { clustering_version: u64 },
+}
+
+async fn commit_compaction_with_strategy(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    strategy: CommitStrategy,
+) -> Result<CompactionMetrics> {
+    if completed_tasks.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -2940,6 +3955,18 @@ pub async fn commit_compaction(
         .map(|t| t.read_version)
         .min()
         .unwrap_or(dataset.manifest.version);
+
+    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // Address-style results require immediate index remapping unless it is deferred.
+    let needs_remapping =
+        !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
+
+    // Confirm there is a remapper before materializing the potentially very large row address map.
+    let index_remapper = if needs_remapping {
+        remap_options.create_remapper(dataset).await?
+    } else {
+        None
+    };
 
     let mut completed_tasks = completed_tasks;
 
@@ -3122,7 +4149,7 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = TransactionBuilder::new(
+    let mut transaction_builder = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
         // mode the caller may open a fresh dataset at a later version (V+N), but
@@ -3137,8 +4164,12 @@ pub async fn commit_compaction(
             frag_reuse_index,
         },
     )
-    .transaction_properties(options.transaction_properties.clone())
-    .build();
+    .transaction_properties(options.transaction_properties.clone());
+    if let CommitStrategy::Cluster { clustering_version } = strategy {
+        transaction_builder =
+            transaction_builder.new_fragment_clustering_version(clustering_version);
+    }
+    let transaction = transaction_builder.build();
 
     if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
@@ -3236,7 +4267,6 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };
@@ -3284,7 +4314,6 @@ mod tests {
                     deletion_file: None,
                     row_id_meta: None,
                     physical_rows: Some(0),
-                    clustering_version: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                 },
@@ -3522,6 +4551,20 @@ mod tests {
         let snapshot = dataset.clone();
         futures::stream::iter(plan.tasks)
             .map(|task| rewrite_files(Cow::Borrowed(&snapshot), task, options))
+            .buffer_unordered(1)
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    async fn execute_clustering_compaction_plan(
+        dataset: &Dataset,
+        options: &CompactionOptions,
+    ) -> Vec<ClusteringRewriteResult> {
+        let plan = plan_clustering_compaction(dataset, options).await.unwrap();
+        assert!(plan.num_tasks() > 0);
+        futures::stream::iter(plan.compaction_tasks())
+            .map(|task| async move { task.execute(dataset).await })
             .buffer_unordered(1)
             .try_collect()
             .await
@@ -7745,6 +8788,138 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_clustering_request_from_dataset_config() {
+        let config = HashMap::from([
+            (
+                "lance.compaction.compaction_mode".to_string(),
+                "ClUsTeR".to_string(),
+            ),
+            (
+                "lance.compaction.target_rows_per_fragment".to_string(),
+                "42".to_string(),
+            ),
+        ]);
+
+        let request = resolve_compaction_options_from_dataset_config(&config).unwrap();
+        let CompactionRequest::Clustering(options) = request else {
+            panic!("expected clustering request");
+        };
+        assert_eq!(options.target_rows_per_fragment, 42);
+        assert_eq!(options.compaction_mode(), CompactionMode::Reencode);
+        let error = CompactionMode::try_from("cluster").unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid compaction mode \"cluster\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\""
+        ));
+    }
+
+    #[test]
+    fn test_clustering_serialization_is_tagged_and_fail_closed() {
+        let options = CompactionOptions::default();
+        let task_data = TaskData {
+            fragments: vec![Fragment::new(11)],
+        };
+        let ordinary_plan = CompactionPlan {
+            tasks: vec![task_data.clone()],
+            read_version: 7,
+            options: options.clone(),
+        };
+        let ordinary_task = CompactionTask {
+            task: task_data,
+            read_version: 7,
+            options,
+        };
+        let ordinary_result = RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: vec![Fragment::new(12)],
+            read_version: 7,
+            original_fragments: vec![Fragment::new(11)],
+            row_addrs: None,
+        };
+
+        let clustering_plan = ClusteringCompactionPlan::new(ordinary_plan.clone());
+        let clustering_task = ClusteringCompactionTask::from_compaction_task(ordinary_task.clone());
+        let clustering_result = ClusteringRewriteResult::new(ordinary_result.clone(), 3);
+
+        let plan_json = serde_json::to_value(&clustering_plan).unwrap();
+        let task_json = serde_json::to_value(&clustering_task).unwrap();
+        let result_json = serde_json::to_value(&clustering_result).unwrap();
+        assert!(
+            plan_json
+                .get("lance_clustering_compaction_plan_v1")
+                .is_some()
+        );
+        assert!(
+            task_json
+                .get("lance_clustering_compaction_task_v1")
+                .is_some()
+        );
+        assert!(
+            result_json
+                .get("lance_clustering_rewrite_result_v1")
+                .is_some()
+        );
+
+        assert_eq!(
+            serde_json::from_value::<ClusteringCompactionPlan>(plan_json.clone()).unwrap(),
+            clustering_plan
+        );
+        assert_eq!(
+            serde_json::from_value::<ClusteringCompactionTask>(task_json.clone()).unwrap(),
+            clustering_task
+        );
+        assert_eq!(
+            serde_json::from_value::<ClusteringRewriteResult>(result_json.clone()).unwrap(),
+            clustering_result
+        );
+
+        let ordinary_plan_json = serde_json::to_value(&ordinary_plan).unwrap();
+        let ordinary_task_json = serde_json::to_value(&ordinary_task).unwrap();
+        let ordinary_result_json = serde_json::to_value(&ordinary_result).unwrap();
+        assert!(serde_json::from_value::<ClusteringCompactionPlan>(ordinary_plan_json).is_err());
+        assert!(serde_json::from_value::<ClusteringCompactionTask>(ordinary_task_json).is_err());
+        assert!(serde_json::from_value::<ClusteringRewriteResult>(ordinary_result_json).is_err());
+        assert!(serde_json::from_value::<CompactionPlan>(plan_json).is_err());
+        assert!(serde_json::from_value::<CompactionTask>(task_json).is_err());
+        assert!(serde_json::from_value::<RewriteResult>(result_json).is_err());
+
+        let plan_json = serde_json::to_value(&clustering_plan).unwrap();
+        let task_json = serde_json::to_value(&clustering_task).unwrap();
+        let result_json = serde_json::to_value(&clustering_result).unwrap();
+        assert!(serde_json::from_value::<ClusteringCompactionTask>(plan_json).is_err());
+        assert!(serde_json::from_value::<ClusteringRewriteResult>(task_json).is_err());
+        assert!(serde_json::from_value::<ClusteringCompactionPlan>(result_json).is_err());
+
+        let mut plan_json = serde_json::to_value(&clustering_plan).unwrap();
+        plan_json["lance_clustering_compaction_plan_v1"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringCompactionPlan>(plan_json).is_err());
+        let mut plan_options_json = serde_json::to_value(&clustering_plan).unwrap();
+        plan_options_json["lance_clustering_compaction_plan_v1"]["options"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringCompactionPlan>(plan_options_json).is_err());
+
+        let mut task_json = serde_json::to_value(&clustering_task).unwrap();
+        task_json["lance_clustering_compaction_task_v1"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringCompactionTask>(task_json).is_err());
+        let mut task_data_json = serde_json::to_value(&clustering_task).unwrap();
+        task_data_json["lance_clustering_compaction_task_v1"]["task"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringCompactionTask>(task_data_json).is_err());
+        let mut task_fragment_json = serde_json::to_value(&clustering_task).unwrap();
+        task_fragment_json["lance_clustering_compaction_task_v1"]["task"]["fragments"][0]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringCompactionTask>(task_fragment_json).is_err());
+
+        let mut result_json = serde_json::to_value(&clustering_result).unwrap();
+        result_json["lance_clustering_rewrite_result_v1"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringRewriteResult>(result_json).is_err());
+        let mut result_metrics_json = serde_json::to_value(&clustering_result).unwrap();
+        result_metrics_json["lance_clustering_rewrite_result_v1"]["metrics"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<ClusteringRewriteResult>(result_metrics_json).is_err());
+    }
+
+    #[test]
     fn test_from_dataset_config_partial() {
         let config = HashMap::from([(
             "lance.compaction.target_rows_per_fragment".to_string(),
@@ -10149,9 +11324,10 @@ mod tests {
         assert!(dataset.fragments().len() >= 2);
         assert!(
             dataset
-                .fragments()
+                .manifest
+                .fragment_clustering_versions()
                 .iter()
-                .all(|f| f.clustering_version.is_none()),
+                .all(Option::is_none),
             "fragments written before clustering was declared carry no stamp"
         );
 
@@ -10167,15 +11343,17 @@ mod tests {
         })
         .unwrap();
         let plan = planner.plan(&dataset).await.unwrap();
-        assert_eq!(
-            plan.tasks().len(),
-            1,
-            "all under-clustered frags in one task"
-        );
+        assert_eq!(plan.num_tasks(), 1, "all under-clustered frags in one task");
 
-        compact_files_with_planner(&mut dataset, None, &planner)
-            .await
-            .unwrap();
+        compact_files_with_clustering(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // Every row survives, globally sorted by the clustering key, and every
         // resulting fragment is stamped at the current clustering version.
@@ -10198,20 +11376,123 @@ mod tests {
         assert_eq!(seen, (0..1000).collect::<Vec<_>>());
         assert!(
             dataset
-                .fragments()
+                .manifest
+                .fragment_clustering_versions()
                 .iter()
-                .all(|f| f.clustering_version == Some(1)),
+                .all(|version| *version == Some(1)),
             "reclustered fragments must be stamped at the current version"
         );
 
         // A second recluster at the same version is a no-op: nothing is
         // under-clustered anymore.
         let plan2 = planner.plan(&dataset).await.unwrap();
+        assert_eq!(plan2.num_tasks(), 0, "no under-clustered fragments remain");
+    }
+
+    #[rstest]
+    #[case::bumped(false)]
+    #[case::cleared(true)]
+    #[tokio::test]
+    async fn test_cluster_commit_uses_worker_clustering_version(#[case] clear_declaration: bool) {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let test_dir = TempStrDir::default();
+        let worker_dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let results = execute_clustering_compaction_plan(&worker_dataset, &options).await;
+
+        let mut coordinator = Dataset::open(&test_dir).await.unwrap();
+        if clear_declaration {
+            coordinator.clear_clustering().await.unwrap();
+        } else {
+            let bumped =
+                ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 2, 32)
+                    .unwrap();
+            coordinator.set_clustering(&bumped).await.unwrap();
+        }
+        commit_clustering_compaction(&mut coordinator, results, &options)
+            .await
+            .unwrap();
+
         assert_eq!(
-            plan2.tasks().len(),
-            0,
-            "no under-clustered fragments remain"
+            coordinator
+                .clustering_spec()
+                .unwrap()
+                .map(|spec| spec.version),
+            (!clear_declaration).then_some(2)
         );
+        assert!(
+            coordinator
+                .manifest
+                .fragment_clustering_versions()
+                .iter()
+                .all(|version| *version == Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_cluster_task_requires_read_version_declaration() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1, 1).await;
+        let options = CompactionOptions::default();
+        let empty_task = TaskData { fragments: vec![] };
+
+        let task = ClusteringCompactionTask::new(
+            empty_task.clone(),
+            dataset.manifest.version,
+            options.clone(),
+        )
+        .unwrap();
+        let result = task.execute(&dataset).await.unwrap();
+        assert_eq!(result.read_version(), dataset.manifest.version);
+
+        dataset.clear_clustering().await.unwrap();
+        let task =
+            ClusteringCompactionTask::new(empty_task, dataset.manifest.version, options).unwrap();
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires a clustering declaration at task read_version"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_commit_rejects_mixed_read_versions_before_side_effects() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
+        let cluster_options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let valid = execute_clustering_compaction_plan(&dataset, &cluster_options)
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        let version_before = dataset.manifest.version;
+        let mut different_inner = valid.rewrite_result().clone();
+        different_inner.read_version += 1;
+        let different = ClusteringRewriteResult::new(different_inner, valid.clustering_version());
+        let mut coordinator = dataset.clone();
+        let error = commit_clustering_compaction(
+            &mut coordinator,
+            vec![valid, different],
+            &cluster_options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("must all have read_version"),
+            "got {error}"
+        );
+        assert_eq!(coordinator.manifest.version, version_before);
     }
 
     async fn dataset_for_recluster_planning(
@@ -10244,7 +11525,7 @@ mod tests {
         dataset
     }
 
-    fn planned_fragment_ids(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+    fn planned_fragment_ids(plan: &ClusteringCompactionPlan) -> Vec<Vec<u64>> {
         plan.tasks()
             .iter()
             .map(|task| task.fragments.iter().map(|fragment| fragment.id).collect())
@@ -10272,10 +11553,11 @@ mod tests {
     async fn test_recluster_planner_reclusters_unexpected_future_stamp() {
         let test_dir = TempStrDir::default();
         let mut dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
-        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[0].clustering_version =
-            Some(2);
-        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[1].clustering_version =
-            Some(1);
+        let mut manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
+        manifest_proto.fragments[0].clustering_version = 2;
+        manifest_proto.fragments[1].clustering_version = 1;
+        dataset.manifest =
+            Arc::new(lance_table::format::Manifest::try_from(manifest_proto).unwrap());
 
         let planner = ClusteringCompactionPlanner::new(CompactionOptions {
             target_rows_per_fragment: 1_000,
@@ -10305,7 +11587,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recluster_planner_stops_before_unselected_invalid_byte_metadata() {
+    async fn test_recluster_planner_fragment_budget_stops_before_unselected_row_error() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        assert_eq!(dataset.fragments().len(), 4);
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[2].physical_rows = None;
+        fragments[2].files[0].path = "data/missing-row-metrics.lance".to_string();
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_fragments: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_row_budget_stops_before_unselected_row_error() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        assert_eq!(dataset.fragments().len(), 4);
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[2].physical_rows = None;
+        fragments[2].files[0].path = "data/missing-row-metrics.lance".to_string();
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_rows: Some(500),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_byte_budget_stops_before_invalid_byte_metadata() {
         let test_dir = TempStrDir::default();
         let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
         assert_eq!(dataset.fragments().len(), 4);
@@ -10319,13 +11641,45 @@ mod tests {
             .sum();
         let planner = ClusteringCompactionPlanner::new(CompactionOptions {
             target_rows_per_fragment: 1_000,
-            max_source_fragments: Some(2),
             max_source_bytes: Some(first_two_bytes),
             ..Default::default()
         })
         .unwrap();
 
         let plan = planner.plan(&dataset).await.unwrap();
+        assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_planner_byte_budget_rejects_before_row_metrics() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 1_000, 250).await;
+        assert_eq!(dataset.fragments().len(), 4);
+
+        let schema_field_ids = dataset.schema().field_ids().into_iter().collect();
+        let first_two_bytes: u64 = dataset.fragments()[..2]
+            .iter()
+            .map(|fragment| fragment_source_bytes(fragment, &schema_field_ids).unwrap())
+            .sum();
+        let third_fragment_bytes =
+            fragment_source_bytes(&dataset.fragments()[2], &schema_field_ids).unwrap();
+        assert!(third_fragment_bytes > 1);
+
+        // Make resolving the third fragment's live row count fail. Its byte
+        // metadata is still valid, so the byte budget can reject it without
+        // touching the missing data file.
+        let fragments = Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments);
+        fragments[2].physical_rows = None;
+        fragments[2].files[0].path = "data/missing-row-metrics.lance".to_string();
+
+        let planner = ClusteringCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            max_source_bytes: Some(first_two_bytes + third_fragment_bytes - 1),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = planner.plan(&dataset).await.unwrap();
+
         assert_eq!(planned_fragment_ids(&plan), vec![vec![0, 1]]);
     }
 
@@ -10387,13 +11741,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compact_files_cluster_mode_routes_to_clustering_planner() {
+    async fn test_recluster_rejected_with_deferred_index_remap_without_indices() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
+        assert!(!dataset.manifest.uses_stable_row_ids());
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+
+        let valid_options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_clustering_compaction(&dataset, &valid_options)
+            .await
+            .unwrap();
+        let planned_task = plan.compaction_tasks().next().unwrap();
+        let mut task_options = planned_task.options().clone();
+        task_options.defer_index_remap = true;
+
+        // Serialized tasks can have their public options changed after planning.
+        // Execution must still reject this combination before rewriting files.
+        let task_err = ClusteringCompactionTask {
+            inner: CompactionTask {
+                task: planned_task.task_data().clone(),
+                read_version: planned_task.read_version(),
+                options: task_options,
+            },
+        }
+        .execute(&dataset)
+        .await
+        .unwrap_err();
+
+        let invalid_options = CompactionOptions {
+            defer_index_remap: true,
+            ..valid_options
+        };
+        let plan_err = plan_clustering_compaction(&dataset, &invalid_options)
+            .await
+            .unwrap_err();
+        let version_before = dataset.manifest.version;
+        let compact_err = compact_files_with_clustering(&mut dataset, invalid_options)
+            .await
+            .unwrap_err();
+
+        for err in [task_err, plan_err, compact_err] {
+            assert!(matches!(&err, Error::InvalidInput { .. }));
+            let message = err.to_string();
+            assert!(message.contains("defer_index_remap"));
+            assert!(message.contains("reclustering reorders rows"));
+            assert!(message.contains("fragment reuse index (FRI)"));
+        }
+        assert_eq!(dataset.manifest.version, version_before);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_task_rejects_stable_row_ids() {
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
-        // The public `compact_files` / `plan_compaction` entrypoints must pick
-        // the clustering planner (select by version) rather than the default
-        // size planner when `compaction_mode` is Cluster. A large single
-        // fragment the size planner would leave alone must still be reclustered.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![3, 1, 2]))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let spec =
+            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        let task = ClusteringCompactionTask::new(
+            TaskData {
+                fragments: dataset.fragments().to_vec(),
+            },
+            dataset.manifest.version,
+            CompactionOptions::default(),
+        )
+        .unwrap();
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("stable row ids"));
+    }
+
+    #[tokio::test]
+    async fn test_recluster_task_rejects_remappable_secondary_index() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_for_recluster_planning(&test_dir, 500, 250).await;
+        create_scalar_index(&mut dataset, "k", false).await;
+        let task = ClusteringCompactionTask::new(
+            TaskData {
+                fragments: dataset.fragments().to_vec(),
+            },
+            dataset.manifest.version,
+            CompactionOptions::default(),
+        )
+        .unwrap();
+
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("remappable secondary index"));
+    }
+
+    #[tokio::test]
+    async fn test_clustering_entrypoints_route_to_clustering_planner() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        // The dedicated clustering entrypoints select by clustering version
+        // rather than size. A large single fragment the ordinary planner would
+        // leave alone must still be reclustered.
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let shuffled: Vec<i32> = (0..1000).map(|i| (i * 37 + 11) % 1000).collect();
         let batch =
@@ -10408,16 +11871,15 @@ mod tests {
             ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::Hilbert, 1, 32).unwrap();
         dataset.set_clustering(&spec).await.unwrap();
 
-        let options = CompactionOptions {
-            compaction_mode: Some(CompactionMode::Cluster),
-            ..Default::default()
-        };
-        // plan_compaction routes to the clustering planner and finds the single
-        // under-clustered fragment.
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        assert_eq!(plan.tasks().len(), 1);
+        let options = CompactionOptions::default();
+        let plan = plan_clustering_compaction(&dataset, &options)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 1);
 
-        compact_files(&mut dataset, options, None).await.unwrap();
+        compact_files_with_clustering(&mut dataset, options)
+            .await
+            .unwrap();
         let batches = dataset
             .scan()
             .project(&["k"])
@@ -10437,9 +11899,10 @@ mod tests {
         assert_eq!(seen, (0..1000).collect::<Vec<_>>());
         assert!(
             dataset
-                .fragments()
+                .manifest
+                .fragment_clustering_versions()
                 .iter()
-                .all(|f| f.clustering_version == Some(1))
+                .all(|version| *version == Some(1))
         );
     }
 }

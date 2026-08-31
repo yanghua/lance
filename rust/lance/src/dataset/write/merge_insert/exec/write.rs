@@ -45,7 +45,7 @@ use crate::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
             },
-            write_fragments_internal,
+            write_fragments_internal_with_clustering,
         },
     },
 };
@@ -954,7 +954,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
-            let (mut new_fragments, _) = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal_with_clustering(
                 dataset.manifest.data_storage_format.lance_file_format(),
                 Some(&dataset),
                 dataset.object_store.clone(),
@@ -963,6 +963,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 write_data_stream,
                 WriteParams::default(),
                 target_bases_info,
+                None,
             )
             .await?;
 

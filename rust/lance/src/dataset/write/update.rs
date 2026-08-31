@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
-use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use super::{CommitBuilder, WriteParams, write_fragments_internal_with_clustering};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -437,7 +437,7 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let (mut new_fragments, _) = write_fragments_internal(
+        let (mut new_fragments, _) = write_fragments_internal_with_clustering(
             self.dataset
                 .manifest
                 .data_storage_format
@@ -449,6 +449,7 @@ impl UpdateJob {
             Box::pin(stream),
             write_params,
             None, // TODO: support multiple bases for update
+            None,
         )
         .await?;
 

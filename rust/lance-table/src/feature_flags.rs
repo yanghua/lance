@@ -51,9 +51,13 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
 /// The dataset has an active liquid-clustering configuration or fragments with
-/// clustering layout version stamps. Readers can safely ignore the stamps, but
-/// writers must preserve existing stamps and honor the active configuration
-/// when adding or rewriting fragments.
+/// clustering layout version stamps. Both readers and writers must understand
+/// this metadata.
+///
+/// The reader fence is deliberately conservative. Although clustering metadata
+/// does not change logical row values, already-released pre-clustering binaries
+/// were not designed to preserve all of its invariants. Fencing both access
+/// modes prevents those binaries from opening or mutating the dataset.
 pub const FLAG_CLUSTERING_VERSION: u64 = 256;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 512;
@@ -144,16 +148,15 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
-    // An older writer drops the unknown protobuf field when it rewrites a
-    // manifest and does not honor an active clustering declaration when it
-    // creates new fragments. Reading remains safe because clustering metadata
-    // affects data layout and optimization eligibility, not logical values.
+    // Fence both readers and writers conservatively. Clustering metadata does
+    // not change logical row values, but already-released pre-clustering builds
+    // were not designed to preserve all of its invariants when opening or
+    // rewriting a dataset. Bit 256 is unknown to those builds, so setting both
+    // words keeps them from opening or mutating clustered datasets.
     let has_clustering_metadata = manifest.config.contains_key(CLUSTERING_VERSION_CONFIG_KEY)
-        || manifest
-            .fragments
-            .iter()
-            .any(|fragment| fragment.clustering_version.is_some());
+        || manifest.has_fragment_clustering_versions();
     if has_clustering_metadata {
+        manifest.reader_feature_flags |= FLAG_CLUSTERING_VERSION;
         manifest.writer_feature_flags |= FLAG_CLUSTERING_VERSION;
     }
 
@@ -314,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clustering_version_fences_older_writers_only() {
+    fn test_clustering_version_fences_older_readers_and_writers() {
         assert_eq!(
             FLAG_CLUSTERING_VERSION, 256,
             "the fence must sit on the boundary pre-clustering builds shipped with"
@@ -324,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_feature_flags_sets_clustering_version_writer_flag() {
+    fn test_apply_feature_flags_sets_clustering_version_flags() {
         use crate::format::{DataStorageFormat, Fragment};
         use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
@@ -348,7 +351,7 @@ mod tests {
             .config
             .insert(CLUSTERING_VERSION_CONFIG_KEY.to_string(), "1".to_string());
         apply_feature_flags(&mut configured_manifest, false, false).unwrap();
-        assert_eq!(
+        assert_ne!(
             configured_manifest.reader_feature_flags & FLAG_CLUSTERING_VERSION,
             0
         );
@@ -357,16 +360,17 @@ mod tests {
             0
         );
 
-        let mut stamped_fragment = Fragment::new(0);
-        stamped_fragment.clustering_version = Some(1);
         let mut stamped_manifest = Manifest::new(
             schema,
-            Arc::new(vec![stamped_fragment]),
+            Arc::new(vec![Fragment::new(0)]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
+        stamped_manifest
+            .set_fragment_clustering_versions(vec![Some(1)])
+            .unwrap();
         apply_feature_flags(&mut stamped_manifest, false, false).unwrap();
-        assert_eq!(
+        assert_ne!(
             stamped_manifest.reader_feature_flags & FLAG_CLUSTERING_VERSION,
             0
         );

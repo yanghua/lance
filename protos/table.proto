@@ -126,9 +126,9 @@ message Manifest {
   //   refuse it too: one that treats every entry of fields as keyed would maintain
   //   the index against the wrong dependency set.
   // * 1 << 8: the dataset has an active liquid-clustering configuration or fragments
-  //   with clustering layout version stamps. Readers may ignore this metadata, but
-  //   writers must preserve existing stamps and honor the active configuration.
-  //   This bit is therefore set only in writer_feature_flags.
+  //   with clustering layout version stamps. Readers and writers that predate this
+  //   contract must refuse the dataset: old rewrite paths could otherwise silently
+  //   discard the declaration or stamps. This bit is set in both flag words.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -403,7 +403,7 @@ message DataFragment {
   // dataset config). A fragment whose stamp is absent (0) or does not equal the
   // dataset's current clustering version is "under-clustered" and is a
   // candidate for re-clustering during optimize. Zero means unset.
-  // Writers require feature flag 256 when this field is nonzero.
+  // Readers and writers require feature flag 256 when this field is nonzero.
   uint64 clustering_version = 12;
 }
 

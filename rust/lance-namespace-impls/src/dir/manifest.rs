@@ -1308,7 +1308,8 @@ impl ManifestNamespace {
         previous: &Manifest,
         schema: lance_core::datatypes::Schema,
         fragments: &[Fragment],
-    ) -> Manifest {
+        clustering_version: Option<u64>,
+    ) -> Result<Manifest> {
         let mut next_fragment_id = 0;
         let mut fragments = fragments
             .iter()
@@ -1322,7 +1323,13 @@ impl ManifestNamespace {
             })
             .collect::<Vec<_>>();
         fragments.sort_by_key(|fragment| fragment.id);
-        Manifest::new_from_previous(previous, schema, Arc::new(fragments))
+        let fragment_count = fragments.len();
+        let mut manifest = Manifest::new_from_previous(previous, schema, Arc::new(fragments));
+        manifest.replace_fragments_with_clustering_versions(
+            manifest.fragments.clone(),
+            vec![clustering_version; fragment_count],
+        )?;
+        Ok(manifest)
     }
 
     async fn build_manifest_indices(
@@ -1994,6 +2001,7 @@ impl ManifestNamespace {
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
 
+            let clustering_version = transaction.new_fragment_clustering_version()?;
             let Operation::Overwrite {
                 fragments, schema, ..
             } = &transaction.operation
@@ -2022,7 +2030,8 @@ impl ManifestNamespace {
                 dataset.manifest(),
                 schema.clone(),
                 fragments,
-            );
+                clustering_version,
+            )?;
             let target_version = manifest.version;
 
             let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -4373,7 +4382,9 @@ mod tests {
             dataset_guard.manifest(),
             dataset_guard.manifest().schema.clone(),
             &fragments,
-        );
+            Some(7),
+        )
+        .unwrap();
 
         let fragment_ids = manifest
             .fragments
@@ -4381,6 +4392,10 @@ mod tests {
             .map(|fragment| fragment.id)
             .collect::<Vec<_>>();
         assert_eq!(fragment_ids, vec![0, 1, 7]);
+        assert_eq!(
+            manifest.fragment_clustering_versions(),
+            &[Some(7), Some(7), Some(7)]
+        );
         assert_eq!(
             ManifestNamespace::manifest_fragment_bitmap(&manifest)
                 .unwrap()

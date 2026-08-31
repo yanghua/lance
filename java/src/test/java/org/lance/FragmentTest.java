@@ -38,12 +38,16 @@ import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -62,6 +66,18 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
+  /**
+   * Produced on JDK 11 from apache/main FragmentMetadata, before clusteringVersion was added, with
+   * id=17, physicalRows=123, and an empty file list.
+   */
+  private static final String PRE_CLUSTERING_VERSION_FRAGMENT_METADATA_BASE64 =
+      "rO0ABXNyABpvcmcubGFuY2UuRnJhZ21lbnRNZXRhZGF0Ya5N2FskGPhkAgAHSQACaWRKAAxwaHlzaWNhbFJvd3NM"
+          + "ABRjcmVhdGVkQXRWZXJzaW9uTWV0YXQAIExvcmcvbGFuY2UvZnJhZ21lbnQvVmVyc2lvbk1ldGE7TAAMZGVsZXRp"
+          + "b25GaWxldAAhTG9yZy9sYW5jZS9mcmFnbWVudC9EZWxldGlvbkZpbGU7TAAFZmlsZXN0ABBMamF2YS91dGlsL0xp"
+          + "c3Q7TAAYbGFzdFVwZGF0ZWRBdFZlcnNpb25NZXRhcQB+AAFMAAlyb3dJZE1ldGF0AB5Mb3JnL2xhbmNlL2ZyYWdt"
+          + "ZW50L1Jvd0lkTWV0YTt4cAAAABEAAAAAAAAAe3Bwc3IAH2phdmEudXRpbC5Db2xsZWN0aW9ucyRFbXB0eUxpc3R6"
+          + "uBe0PKee3gIAAHhwcHA=";
+
   @Test
   void testFragmentCreateFfiArrayForwardsClusterBy(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("clustered_fragment_array").toString();
@@ -137,6 +153,36 @@ public class FragmentTest {
       assertEquals(1, fragments.size());
       assertEquals(Long.valueOf(3), fragments.get(0).getClusteringVersion());
     }
+  }
+
+  @Test
+  void testFragmentMetadataClusteringVersionAboveLongMax() {
+    BigInteger version = BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE);
+    FragmentMetadata metadata =
+        FragmentMetadata.withClusteringVersionUnsigned(
+            1, Collections.emptyList(), 0L, null, null, null, null, version);
+
+    assertEquals(version, metadata.getClusteringVersionUnsigned());
+    assertThrows(ArithmeticException.class, metadata::getClusteringVersion);
+  }
+
+  @Test
+  void testDeserializeFragmentMetadataFromBeforeClusteringVersion() throws Exception {
+    byte[] serialized = Base64.getDecoder().decode(PRE_CLUSTERING_VERSION_FRAGMENT_METADATA_BASE64);
+    FragmentMetadata metadata;
+    try (ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(serialized))) {
+      metadata = (FragmentMetadata) input.readObject();
+    }
+
+    assertEquals(17, metadata.getId());
+    assertEquals(123, metadata.getPhysicalRows());
+    assertTrue(metadata.getFiles().isEmpty());
+    assertNull(metadata.getDeletionFile());
+    assertNull(metadata.getRowIdMeta());
+    assertNull(metadata.getCreatedAtVersionMeta());
+    assertNull(metadata.getLastUpdatedAtVersionMeta());
+    assertNull(metadata.getClusteringVersion());
+    assertNull(metadata.getClusteringVersionUnsigned());
   }
 
   @Test

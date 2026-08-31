@@ -682,7 +682,6 @@ mod tests {
             overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         };

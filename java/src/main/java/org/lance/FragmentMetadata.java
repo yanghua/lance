@@ -21,12 +21,14 @@ import org.lance.fragment.VersionMeta;
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Objects;
 
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
+  private static final BigInteger MAX_U64 = new BigInteger("18446744073709551615");
   private final int id;
   private final List<DataFile> files;
   private final long physicalRows;
@@ -34,7 +36,7 @@ public class FragmentMetadata implements Serializable {
   private final RowIdMeta rowIdMeta;
   private final VersionMeta createdAtVersionMeta;
   private final VersionMeta lastUpdatedAtVersionMeta;
-  private final Long clusteringVersion;
+  private final BigInteger clusteringVersion;
 
   public FragmentMetadata(
       int id,
@@ -61,9 +63,10 @@ public class FragmentMetadata implements Serializable {
         rowIdMeta,
         createdAtVersionMeta,
         lastUpdatedAtVersionMeta,
-        null);
+        (Long) null);
   }
 
+  /** Preserves the existing nullable-Long constructor for source compatibility. */
   public FragmentMetadata(
       int id,
       List<DataFile> files,
@@ -77,6 +80,54 @@ public class FragmentMetadata implements Serializable {
       throw new IllegalArgumentException(
           "clusteringVersion must be positive, got " + clusteringVersion);
     }
+    this.id = id;
+    this.files = files;
+    this.physicalRows = physicalRows;
+    this.deletionFile = deletionFile;
+    this.rowIdMeta = rowIdMeta;
+    this.createdAtVersionMeta = createdAtVersionMeta;
+    this.lastUpdatedAtVersionMeta = lastUpdatedAtVersionMeta;
+    this.clusteringVersion =
+        clusteringVersion == null ? null : BigInteger.valueOf(clusteringVersion);
+  }
+
+  /** Creates metadata with a clustering version over the complete unsigned 64-bit range. */
+  public static FragmentMetadata withClusteringVersionUnsigned(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta,
+      BigInteger clusteringVersion) {
+    if (clusteringVersion != null
+        && (clusteringVersion.signum() <= 0 || clusteringVersion.compareTo(MAX_U64) > 0)) {
+      throw new IllegalArgumentException(
+          "clusteringVersion must be in 1..=2^64-1, got " + clusteringVersion);
+    }
+    return new FragmentMetadata(
+        id,
+        files,
+        physicalRows,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta,
+        clusteringVersion,
+        true);
+  }
+
+  private FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta,
+      BigInteger clusteringVersion,
+      @SuppressWarnings("unused") boolean unsignedVersion) {
     this.id = id;
     this.files = files;
     this.physicalRows = physicalRows;
@@ -133,9 +184,26 @@ public class FragmentMetadata implements Serializable {
   /**
    * Returns the clustering layout version under which this fragment was written.
    *
-   * @return the clustering version, or null when the fragment is not stamped as clustered
+   * @throws ArithmeticException if the unsigned 64-bit version exceeds {@link Long#MAX_VALUE}; use
+   *     {@link #getClusteringVersionUnsigned()} for the complete range
+   * @return the clustering version, or null when the fragment is unstamped
    */
   public Long getClusteringVersion() {
+    if (clusteringVersion == null) {
+      return null;
+    }
+    try {
+      return clusteringVersion.longValueExact();
+    } catch (ArithmeticException error) {
+      throw new ArithmeticException(
+          "clusteringVersion "
+              + clusteringVersion
+              + " exceeds Long.MAX_VALUE; use getClusteringVersionUnsigned()");
+    }
+  }
+
+  /** Returns the clustering version over the complete unsigned 64-bit range, or null if unset. */
+  public BigInteger getClusteringVersionUnsigned() {
     return clusteringVersion;
   }
 

@@ -352,6 +352,9 @@ public class WriteDatasetBuilder {
    * space-filling curve settings. For a dataset with a matching active declaration, its curve,
    * version, and bit width are authoritative.
    *
+   * <p>This option requires rows supplied by reader() or stream(); execute() rejects schema-only
+   * dataset creation because there are no rows to cluster.
+   *
    * @param clusterBy clustering-key columns, in priority order
    * @return this builder instance
    * @throws NullPointerException if the list is null or contains a null column name
@@ -386,6 +389,7 @@ public class WriteDatasetBuilder {
    *
    * @return Dataset
    * @throws IllegalArgumentException if required parameters are missing or invalid
+   * @throws IllegalStateException if clusterBy() is set for schema-only dataset creation
    */
   public Dataset execute() {
     // Auto-create allocator if not provided
@@ -428,6 +432,11 @@ public class WriteDatasetBuilder {
       throw new IllegalArgumentException(
           "Cannot specify multiple data sources. "
               + "Use only one of: reader(), stream(), or schema().");
+    }
+    if (schema != null && reader == null && stream == null && clusterBy.isPresent()) {
+      throw new IllegalStateException(
+          "clusterBy() cannot be used with schema-only dataset creation because there are no rows "
+              + "to cluster. Provide data via reader() or stream().");
     }
 
     // Handle namespace client-based writing

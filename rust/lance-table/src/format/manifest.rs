@@ -18,8 +18,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_COVERED_INDEX_METADATA;
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_CLUSTERING_VERSION, FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS,
+    has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -53,6 +55,19 @@ pub struct Manifest {
     /// This list is stored in order, sorted by fragment id.  However, the fragment id
     /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
+
+    /// Clustering layout versions aligned positionally with [`Self::fragments`].
+    ///
+    /// `None` means the fragment has no valid clustering stamp. This is private
+    /// so callers cannot mutate the sidecar independently; because `fragments`
+    /// remains public for compatibility, write boundaries still validate alignment.
+    fragment_clustering_versions: Vec<Option<u64>>,
+
+    /// Fragment layouts captured when [`Self::fragment_clustering_versions`] was installed.
+    ///
+    /// This lets validation detect a public fragment-list replacement or reorder
+    /// even when its length and row-count-derived offsets happen to be unchanged.
+    fragment_clustering_version_fragments: Arc<Vec<Fragment>>,
 
     /// The file position of the version aux data.
     pub version_aux_data: usize,
@@ -126,6 +141,35 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
+fn data_file_identity_eq(left: &crate::format::DataFile, right: &crate::format::DataFile) -> bool {
+    left.path == right.path
+        && left.fields == right.fields
+        && left.column_indices == right.column_indices
+        && left.file_major_version == right.file_major_version
+        && left.file_minor_version == right.file_minor_version
+        && left.base_id == right.base_id
+}
+
+fn fragment_clustering_layout_eq(left: &Fragment, right: &Fragment) -> bool {
+    left.id == right.id
+        && left.files.len() == right.files.len()
+        && left
+            .files
+            .iter()
+            .zip(&right.files)
+            .all(|(left, right)| data_file_identity_eq(left, right))
+        && left.overlays.len() == right.overlays.len()
+        && left
+            .overlays
+            .iter()
+            .zip(&right.overlays)
+            .all(|(left, right)| {
+                left.committed_version == right.committed_version
+                    && left.coverage == right.coverage
+                    && data_file_identity_eq(&left.data_file, &right.data_file)
+            })
+}
+
 #[derive(Default)]
 pub struct ManifestSummary {
     pub total_fragments: u64,
@@ -177,6 +221,8 @@ impl Manifest {
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let fragment_clustering_versions = vec![None; fragments.len()];
+        let fragment_clustering_version_fragments = fragments.clone();
 
         Self {
             schema,
@@ -184,6 +230,8 @@ impl Manifest {
             branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
+            fragment_clustering_versions,
+            fragment_clustering_version_fragments,
             version_aux_data: 0,
             index_section: None,
             timestamp_nanos: 0,
@@ -202,12 +250,21 @@ impl Manifest {
         }
     }
 
+    /// Create the next manifest with a replacement fragment list.
+    ///
+    /// Fragment clustering versions are initialized to `None`; callers outside
+    /// normal [`crate::transaction::Transaction`] manifest construction must
+    /// install the intended versions with
+    /// [`Self::replace_fragments_with_clustering_versions`] or
+    /// [`Self::set_fragment_clustering_versions`].
     pub fn new_from_previous(
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let fragment_clustering_versions = vec![None; fragments.len()];
+        let fragment_clustering_version_fragments = fragments.clone();
 
         Self {
             schema,
@@ -215,6 +272,8 @@ impl Manifest {
             branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
+            fragment_clustering_versions,
+            fragment_clustering_version_fragments,
             version_aux_data: 0,
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
@@ -271,20 +330,22 @@ impl Manifest {
             version: self.version,
             branch: branch_name,
             writer_version: self.writer_version.clone(),
-            fragments: Arc::new(cloned_fragments),
+            fragments: Arc::new(cloned_fragments.clone()),
+            fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+            // The clone intentionally rewrites file base IDs, so its copied
+            // stamps are rebound to the cloned fragment layouts.
+            fragment_clustering_version_fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            // Not derivable from the manifest, so it would be lost like any other
-            // zeroed word: a clone of a table with covering indexes would come
-            // back unfenced, and since the clone copies the index metadata
-            // wholesale -- `covering_fields` included -- a build that predates
-            // covering could then open it and read carried columns as keyed ones.
-            // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
-            reader_feature_flags: self.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
-            writer_feature_flags: self.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            // Covering-index metadata is not derivable from the manifest, while
+            // clustering metadata is copied above. Preserve both fences on the
+            // in-memory clone instead of relying on a later write to rederive them.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | FLAG_CLUSTERING_VERSION),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | FLAG_CLUSTERING_VERSION),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -326,6 +387,161 @@ impl Manifest {
     /// Get a mutable reference to the table metadata
     pub fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.table_metadata
+    }
+
+    /// The clustering layout versions aligned with [`Self::fragments`].
+    pub fn fragment_clustering_versions(&self) -> &[Option<u64>] {
+        &self.fragment_clustering_versions
+    }
+
+    /// Return the clustering layout version recorded for `fragment_id`.
+    pub fn fragment_clustering_version(&self, fragment_id: u64) -> Option<u64> {
+        let position = self
+            .fragments
+            .partition_point(|fragment| fragment.id < fragment_id);
+        let position = match self.fragments.get(position) {
+            Some(fragment) if fragment.id == fragment_id => Some(position),
+            // Very old manifests were not required to sort fragment IDs.
+            _ => self
+                .fragments
+                .iter()
+                .position(|fragment| fragment.id == fragment_id),
+        };
+        position
+            .and_then(|position| self.fragment_clustering_versions.get(position))
+            .copied()
+            .flatten()
+    }
+
+    /// Whether any current fragment has a clustering layout version.
+    pub fn has_fragment_clustering_versions(&self) -> bool {
+        self.fragment_clustering_versions
+            .iter()
+            .any(Option::is_some)
+    }
+
+    /// Validate the positional metadata maintained alongside [`Self::fragments`].
+    ///
+    /// This is public for internal workspace crates that must guard direct
+    /// manifest rewrites. External callers should mutate manifests through
+    /// transaction APIs.
+    #[doc(hidden)]
+    pub fn validate_fragment_invariants(&self) -> Result<()> {
+        if self.fragment_clustering_versions.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "manifest has {} fragments but {} fragment clustering versions",
+                self.fragments.len(),
+                self.fragment_clustering_versions.len()
+            )));
+        }
+        if self.fragment_clustering_version_fragments.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "manifest has {} fragments but {} fragment clustering identity entries",
+                self.fragments.len(),
+                self.fragment_clustering_version_fragments.len()
+            )));
+        }
+        if let Some((position, (fragment, _))) = self
+            .fragments
+            .iter()
+            .zip(self.fragment_clustering_version_fragments.iter())
+            .enumerate()
+            .find(|(_, (fragment, bound_fragment))| {
+                !fragment_clustering_layout_eq(fragment, bound_fragment)
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "manifest fragment at position {position} with id {} does not match the \
+                 fragment layout bound to its clustering sidecar",
+                fragment.id
+            )));
+        }
+
+        if self.fragment_offsets != compute_fragment_offsets(&self.fragments) {
+            return Err(Error::invalid_input(format!(
+                "manifest fragment offsets are stale for its {} fragments",
+                self.fragments.len()
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Replace fragments while preserving their positionally aligned clustering versions.
+    ///
+    /// The replacement must have the same cardinality as the current fragments.
+    /// This is public for internal workspace crates that construct manifests
+    /// directly. External callers should mutate manifests through transaction APIs.
+    #[doc(hidden)]
+    pub fn replace_fragments(&mut self, fragments: Arc<Vec<Fragment>>) -> Result<()> {
+        self.validate_fragment_invariants()?;
+        if fragments.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "replacement has {} fragments but the manifest currently has {}; \
+                 supply matching clustering versions when changing cardinality",
+                fragments.len(),
+                self.fragments.len()
+            )));
+        }
+
+        let mut remaining = self
+            .fragment_clustering_version_fragments
+            .iter()
+            .zip(self.fragment_clustering_versions.iter().copied())
+            .collect::<Vec<_>>();
+        let mut versions = Vec::with_capacity(fragments.len());
+        for (position, fragment) in fragments.iter().enumerate() {
+            let Some(bound_position) = remaining.iter().position(|(bound_fragment, _)| {
+                fragment_clustering_layout_eq(fragment, bound_fragment)
+            }) else {
+                return Err(Error::invalid_input(format!(
+                    "replacement fragment id {} at position {} has no matching fragment layout \
+                     in the manifest; supply explicit clustering versions when layout changes",
+                    fragment.id, position
+                )));
+            };
+            let (_, version) = remaining.remove(bound_position);
+            versions.push(version);
+        }
+
+        self.replace_fragments_with_clustering_versions(fragments, versions)
+    }
+
+    /// Replace fragments and their positionally aligned clustering versions atomically.
+    ///
+    /// This also recomputes logical fragment offsets. The caller must supply
+    /// exactly one clustering version entry per fragment. This is public for
+    /// internal workspace crates that construct manifests directly. External
+    /// callers should mutate manifests through transaction APIs.
+    #[doc(hidden)]
+    pub fn replace_fragments_with_clustering_versions(
+        &mut self,
+        fragments: Arc<Vec<Fragment>>,
+        versions: Vec<Option<u64>>,
+    ) -> Result<()> {
+        if versions.len() != fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "replacement has {} fragments but {} fragment clustering versions",
+                fragments.len(),
+                versions.len()
+            )));
+        }
+
+        let fragment_offsets = compute_fragment_offsets(&fragments);
+        let fragment_clustering_version_fragments = fragments.clone();
+        self.fragments = fragments;
+        self.fragment_clustering_versions = versions;
+        self.fragment_clustering_version_fragments = fragment_clustering_version_fragments;
+        self.fragment_offsets = fragment_offsets;
+        Ok(())
+    }
+
+    /// Replace the clustering layout versions aligned with [`Self::fragments`].
+    ///
+    /// The caller must supply exactly one entry per fragment.
+    #[doc(hidden)]
+    pub fn set_fragment_clustering_versions(&mut self, versions: Vec<Option<u64>>) -> Result<()> {
+        self.replace_fragments_with_clustering_versions(self.fragments.clone(), versions)
     }
 
     /// Get a mutable reference to the schema metadata
@@ -922,6 +1138,13 @@ impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(p: pb::Manifest) -> Result<Self> {
+        let fragment_clustering_versions = p
+            .fragments
+            .iter()
+            .map(|fragment| {
+                (fragment.clustering_version != 0).then_some(fragment.clustering_version)
+            })
+            .collect();
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -949,6 +1172,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .map(|f| interner.intern_fragment(f))
                 .collect::<Result<Vec<_>>>()?,
         );
+        let fragment_clustering_version_fragments = fragments.clone();
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
@@ -993,6 +1217,8 @@ impl TryFrom<pb::Manifest> for Manifest {
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
             fragments,
+            fragment_clustering_versions,
+            fragment_clustering_version_fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
@@ -1045,7 +1271,21 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragments: m
+                .fragments
+                .iter()
+                .enumerate()
+                .map(|(position, fragment)| {
+                    let mut proto = pb::DataFragment::from(fragment);
+                    proto.clustering_version = m
+                        .fragment_clustering_versions
+                        .get(position)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_default();
+                    proto
+                })
+                .collect(),
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1140,7 +1380,7 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
+    use crate::feature_flags::{FLAG_CLUSTERING_VERSION, FLAG_USE_V2_FORMAT_DEPRECATED};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
@@ -1150,6 +1390,197 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_versions_are_manifest_owned_and_round_trip() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(2), Fragment::new(7)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3), None])
+            .unwrap();
+
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragments[0].clustering_version, 3);
+        assert_eq!(encoded.fragments[1].clustering_version, 0);
+        // Generic fragment conversion cannot accidentally transport a stamp.
+        assert_eq!(
+            pb::DataFragment::from(&manifest.fragments[0]).clustering_version,
+            0
+        );
+
+        let decoded = Manifest::try_from(encoded).unwrap();
+        assert_eq!(decoded.fragment_clustering_versions(), &[Some(3), None]);
+        assert_eq!(decoded.fragment_clustering_version(2), Some(3));
+        assert_eq!(decoded.fragment_clustering_version(7), None);
+        assert!(decoded.has_fragment_clustering_versions());
+    }
+
+    #[test]
+    fn new_manifest_defaults_every_clustering_version_to_none() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        assert_eq!(manifest.fragment_clustering_versions(), &[None, None]);
+        assert!(!manifest.has_fragment_clustering_versions());
+    }
+
+    #[test]
+    fn protobuf_conversion_never_truncates_fragments() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(2), Fragment::new(7)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3), Some(5)])
+            .unwrap();
+        // `fragments` remains public for API compatibility, so callers can
+        // temporarily violate the sidecar invariant before the write boundary.
+        manifest.fragments = Arc::new(vec![Fragment::new(2), Fragment::new(7), Fragment::new(9)]);
+
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragments.len(), 3);
+        assert_eq!(
+            encoded
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![2, 7, 9]
+        );
+        assert_eq!(
+            encoded
+                .fragments
+                .iter()
+                .map(|fragment| fragment.clustering_version)
+                .collect::<Vec<_>>(),
+            vec![3, 5, 0]
+        );
+    }
+
+    #[test]
+    fn replacing_fragments_reconciles_by_layout_and_recomputes_offsets() {
+        let schema = Schema::default();
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![
+                Fragment::with_file_legacy(0, "path0", &schema, Some(10)),
+                Fragment::with_file_legacy(1, "path1", &schema, Some(20)),
+            ]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3), Some(5)])
+            .unwrap();
+
+        let replacement = Arc::new(vec![
+            manifest.fragments[1].clone(),
+            manifest.fragments[0].clone(),
+        ]);
+        manifest.replace_fragments(replacement).unwrap();
+
+        assert_eq!(manifest.fragment_clustering_versions(), &[Some(5), Some(3)]);
+        manifest.validate_fragment_invariants().unwrap();
+        let fragments = manifest.fragments_by_offset_range(20..30);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].0, 20);
+        assert_eq!(fragments[0].1.id, 0);
+
+        let previous_fragments = manifest.fragments.clone();
+        let error = manifest
+            .replace_fragments_with_clustering_versions(Arc::new(vec![Fragment::new(10)]), vec![])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("replacement has 1 fragments but 0 fragment clustering versions")
+        );
+        assert_eq!(manifest.fragments, previous_fragments);
+        assert_eq!(manifest.fragment_clustering_versions(), &[Some(5), Some(3)]);
+
+        let mut changed_layout = manifest.fragments.as_ref().clone();
+        changed_layout[0].files[0].path = "changed.lance".to_string();
+        let error = manifest
+            .replace_fragments(Arc::new(changed_layout))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(
+                "replacement fragment id 1 at position 0 has no matching fragment layout"
+            )
+        );
+    }
+
+    #[test]
+    fn invariant_detects_public_same_shape_reorder_and_layout_mutation() {
+        let schema = Schema::default();
+        let fragments = vec![
+            Fragment::with_file_legacy(0, "path0", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path1", &schema, Some(10)),
+        ];
+        let mut reordered = Manifest::new(
+            schema.clone(),
+            Arc::new(fragments.clone()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        reordered
+            .set_fragment_clustering_versions(vec![Some(3), Some(5)])
+            .unwrap();
+        reordered.fragments = Arc::new(vec![fragments[1].clone(), fragments[0].clone()]);
+
+        let error = reordered.validate_fragment_invariants().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "manifest fragment at position 0 with id 1 does not match the fragment layout"
+        ));
+
+        let mut mutated = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        Arc::make_mut(&mut mutated.fragments)[0].files[0].path = "changed.lance".to_string();
+
+        let error = mutated.validate_fragment_invariants().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "manifest fragment at position 0 with id 0 does not match the fragment layout"
+        ));
+    }
+
+    #[test]
+    fn shallow_clone_preserves_clustering_reader_and_writer_fence() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3)])
+            .unwrap();
+        manifest.reader_feature_flags = FLAG_CLUSTERING_VERSION;
+        manifest.writer_feature_flags = FLAG_CLUSTERING_VERSION;
+
+        let cloned =
+            manifest.shallow_clone(None, "memory://parent".to_string(), 7, None, String::new());
+
+        assert_eq!(cloned.fragment_clustering_versions(), &[Some(3)]);
+        assert_ne!(cloned.reader_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
@@ -1541,7 +1972,6 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
             Fragment {
@@ -1555,7 +1985,6 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
         ];
@@ -1588,7 +2017,6 @@ mod tests {
             row_id_meta: None,
             physical_rows: None,
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
         fragment.overlays = vec![DataOverlayFile {

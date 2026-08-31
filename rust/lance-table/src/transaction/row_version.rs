@@ -337,7 +337,6 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }];
@@ -371,7 +370,6 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }];
@@ -405,7 +403,6 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }];
@@ -442,7 +439,6 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }];
@@ -472,7 +468,6 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                clustering_version: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
             },
@@ -483,7 +478,6 @@ mod tests {
                 files: vec![],
                 overlays: vec![],
                 deletion_file: None,
-                clustering_version: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
             },
@@ -529,7 +523,6 @@ mod tests {
             files: vec![],
             overlays: vec![],
             deletion_file: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
         }];
@@ -564,7 +557,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -577,7 +569,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -618,7 +609,6 @@ mod tests {
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
                 ),
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
             Fragment {
@@ -631,7 +621,6 @@ mod tests {
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
                 ),
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
         ]);
@@ -646,7 +635,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -686,7 +674,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -700,7 +687,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -743,7 +729,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -756,7 +741,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(4),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -786,7 +770,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -799,7 +782,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -824,7 +806,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -836,7 +817,6 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(3),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -865,7 +845,6 @@ mod tests {
             created_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                 vec![0xFFu8; 8].as_slice(),
             ))),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -878,7 +857,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(1),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -916,7 +894,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -938,7 +915,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -952,7 +928,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -987,7 +962,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq).into())),
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -1001,7 +975,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -1046,7 +1019,6 @@ mod tests {
             created_at_version_meta: Some(
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
             ),
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -1060,7 +1032,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(100),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 
@@ -1106,7 +1077,6 @@ mod tests {
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
                 ),
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
             Fragment {
@@ -1119,7 +1089,6 @@ mod tests {
                 created_at_version_meta: Some(
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
                 ),
-                clustering_version: None,
                 last_updated_at_version_meta: None,
             },
         ]);
@@ -1134,7 +1103,6 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq).into())),
             physical_rows: Some(2),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         };
 

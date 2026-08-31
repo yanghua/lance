@@ -174,7 +174,15 @@ public class CompactionOptions implements Serializable {
     output.writeObject(numThreads.orElse(null));
     output.writeObject(batchSize.orElse(null));
     output.writeObject(deferIndexRemap.orElse(null));
-    output.writeObject(compactionMode.map(CompactionMode::getValue).orElse(null));
+    if (compactionMode.isPresent()) {
+      CompactionMode mode = compactionMode.get();
+      // Older workers deserialize the existing modes from their string values. Keep that wire
+      // format for them, but serialize CLUSTER as an enum so a worker whose enum predates CLUSTER
+      // rejects the stream instead of silently treating the unknown string as an unset mode.
+      output.writeObject(mode == CompactionMode.CLUSTER ? mode : mode.getValue());
+    } else {
+      output.writeObject(null);
+    }
     output.writeObject(binaryCopyReadBatchBytes.orElse(null));
     output.writeObject(maxSourceFragments.orElse(null));
     output.writeObject(maxSourceRows.orElse(null));
@@ -191,18 +199,24 @@ public class CompactionOptions implements Serializable {
     this.numThreads = Optional.ofNullable((Long) input.readObject());
     this.batchSize = Optional.ofNullable((Long) input.readObject());
     this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
-    String modeStr = (String) input.readObject();
+    Object serializedMode = input.readObject();
     this.compactionMode = Optional.empty();
-    if (modeStr != null) {
+    if (serializedMode instanceof CompactionMode) {
+      this.compactionMode = Optional.of((CompactionMode) serializedMode);
+    } else if (serializedMode instanceof String) {
+      String modeValue = (String) serializedMode;
       for (CompactionMode m : CompactionMode.values()) {
-        if (m.getValue().equals(modeStr)) {
+        if (m.getValue().equals(modeValue)) {
           this.compactionMode = Optional.of(m);
           break;
         }
       }
       if (!this.compactionMode.isPresent()) {
-        throw new InvalidObjectException("unknown compaction mode: " + modeStr);
+        throw new InvalidObjectException("unknown compaction mode: " + modeValue);
       }
+    } else if (serializedMode != null) {
+      throw new InvalidObjectException(
+          "invalid compaction mode type: " + serializedMode.getClass().getName());
     }
     this.binaryCopyReadBatchBytes = Optional.ofNullable((Long) input.readObject());
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());

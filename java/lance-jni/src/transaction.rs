@@ -6,6 +6,7 @@ use crate::JNIEnvExt;
 use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
+use crate::fragment::{ImportedFragment, export_fragments_with_clustering_versions};
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
 };
@@ -28,6 +29,7 @@ use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
+use lance_table::format::Manifest;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
@@ -37,20 +39,95 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-impl IntoJava for &RewriteGroup {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let old_fragments = export_vec(env, &self.old_fragments)?;
-        let new_fragments = export_vec(env, &self.new_fragments)?;
+const NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY: &str = "__lance_new_fragment_clustering_version";
 
-        Ok(env.new_object(
-            "org/lance/operation/RewriteGroup",
-            "(Ljava/util/List;Ljava/util/List;)V",
-            &[
-                JValue::Object(&old_fragments),
-                JValue::Object(&new_fragments),
-            ],
-        )?)
+#[derive(Debug)]
+pub(crate) struct ImportedOperation {
+    pub operation: Operation,
+    pub new_fragment_clustering_version: Option<u64>,
+}
+
+pub(crate) fn uniform_new_fragment_clustering_version<'a>(
+    versions: impl IntoIterator<Item = &'a Option<u64>>,
+) -> Result<Option<u64>> {
+    let mut versions = versions.into_iter().copied();
+    let Some(first) = versions.next() else {
+        return Ok(None);
+    };
+    if first == Some(0) {
+        return Err(Error::input_error(
+            "new fragment clustering version must be greater than zero".to_string(),
+        ));
     }
+    if versions.any(|version| version != first) {
+        return Err(Error::input_error(
+            "new fragments must all have the same clustering version or all be unstamped"
+                .to_string(),
+        ));
+    }
+    Ok(first)
+}
+
+pub(crate) fn split_imported_fragments(
+    fragments: Vec<ImportedFragment>,
+) -> Result<(Vec<Fragment>, Option<u64>)> {
+    let clustering_version =
+        uniform_new_fragment_clustering_version(fragments.iter().map(|f| &f.clustering_version))?;
+    let fragments = fragments
+        .into_iter()
+        .map(|fragment| fragment.fragment)
+        .collect();
+    Ok((fragments, clustering_version))
+}
+
+fn split_imported_rewrite_groups(
+    groups: Vec<(Vec<Fragment>, Vec<ImportedFragment>)>,
+) -> Result<(Vec<RewriteGroup>, Option<u64>)> {
+    let versions = groups
+        .iter()
+        .flat_map(|(_, new_fragments)| {
+            new_fragments
+                .iter()
+                .map(|fragment| &fragment.clustering_version)
+        })
+        .collect::<Vec<_>>();
+    let clustering_version = uniform_new_fragment_clustering_version(versions)?;
+    let groups = groups
+        .into_iter()
+        .map(|(old_fragments, new_fragments)| RewriteGroup {
+            old_fragments,
+            new_fragments: new_fragments
+                .into_iter()
+                .map(|fragment| fragment.fragment)
+                .collect(),
+        })
+        .collect();
+    Ok((groups, clustering_version))
+}
+
+fn rewrite_group_into_java<'local>(
+    env: &mut JNIEnv<'local>,
+    group: &RewriteGroup,
+    manifest: Option<&Manifest>,
+    new_fragment_clustering_version: Option<u64>,
+) -> Result<JObject<'local>> {
+    let old_fragments =
+        export_fragments_with_clustering_versions(env, &group.old_fragments, |fragment| {
+            manifest.and_then(|manifest| manifest.fragment_clustering_version(fragment.id))
+        })?;
+    let new_fragments =
+        export_fragments_with_clustering_versions(env, &group.new_fragments, |_| {
+            new_fragment_clustering_version
+        })?;
+
+    Ok(env.new_object(
+        "org/lance/operation/RewriteGroup",
+        "(Ljava/util/List;Ljava/util/List;)V",
+        &[
+            JValue::Object(&old_fragments),
+            JValue::Object(&new_fragments),
+        ],
+    )?)
 }
 
 impl IntoJava for &RewrittenIndex {
@@ -296,14 +373,19 @@ fn inner_read_transaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
-    let transaction = {
+    let (transaction, manifest) = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.read_transaction()?
+        (
+            dataset_guard.read_transaction()?,
+            dataset_guard.inner.manifest().clone(),
+        )
     };
 
     let transaction = match transaction {
-        Some(transaction) => convert_to_java_transaction(env, transaction)?,
+        Some(transaction) => {
+            convert_to_java_transaction_with_manifest(env, transaction, Some(&manifest))?
+        }
         None => JObject::null(),
     };
     Ok(transaction)
@@ -313,6 +395,15 @@ pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
+    convert_to_java_transaction_with_manifest(env, transaction, None)
+}
+
+pub(crate) fn convert_to_java_transaction_with_manifest<'local>(
+    env: &mut JNIEnv<'local>,
+    transaction: Transaction,
+    manifest: Option<&Manifest>,
+) -> Result<JObject<'local>> {
+    let marker = transaction.new_fragment_clustering_version()?;
     let uuid = env.new_string(transaction.uuid)?;
     let tag = match transaction.tag {
         Some(tag) => JObject::from(env.new_string(tag)?),
@@ -322,7 +413,7 @@ pub(crate) fn convert_to_java_transaction<'local>(
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
     };
-    let operation = convert_to_java_operation(env, Some(transaction.operation))?;
+    let operation = convert_to_java_operation_inner(env, transaction.operation, manifest, marker)?;
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
@@ -338,26 +429,20 @@ pub(crate) fn convert_to_java_transaction<'local>(
     Ok(java_transaction)
 }
 
-pub(crate) fn convert_to_java_operation<'local>(
-    env: &mut JNIEnv<'local>,
-    operation: Option<Operation>,
-) -> Result<JObject<'local>> {
-    let operation = match operation {
-        Some(operation) => convert_to_java_operation_inner(env, operation)?,
-        None => JObject::null(),
-    };
-    Ok(operation)
-}
-
 fn convert_to_java_operation_inner<'local>(
     env: &mut JNIEnv<'local>,
     operation: Operation,
+    manifest: Option<&Manifest>,
+    new_fragment_clustering_version: Option<u64>,
 ) -> Result<JObject<'local>> {
     match operation {
         Operation::Append {
             fragments: rust_fragments,
         } => {
-            let java_fragments = export_vec(env, &rust_fragments)?;
+            let java_fragments =
+                export_fragments_with_clustering_versions(env, &rust_fragments, |_| {
+                    new_fragment_clustering_version
+                })?;
 
             Ok(env.new_object(
                 "org/lance/operation/Append",
@@ -370,7 +455,10 @@ fn convert_to_java_operation_inner<'local>(
             deleted_fragment_ids,
             predicate,
         } => {
-            let updated_fragments_obj = export_vec(env, &updated_fragments)?;
+            let updated_fragments_obj =
+                export_fragments_with_clustering_versions(env, &updated_fragments, |fragment| {
+                    manifest.and_then(|manifest| manifest.fragment_clustering_version(fragment.id))
+                })?;
 
             let deleted_ids: Vec<JLance<i64>> = deleted_fragment_ids
                 .iter()
@@ -396,7 +484,10 @@ fn convert_to_java_operation_inner<'local>(
             config_upsert_values,
             initial_bases: _,
         } => {
-            let java_fragments = export_vec(env, &rust_fragments)?;
+            let java_fragments =
+                export_fragments_with_clustering_versions(env, &rust_fragments, |_| {
+                    new_fragment_clustering_version
+                })?;
             let java_schema = convert_to_java_schema(env, schema)?;
             let java_config = match config_upsert_values {
                 Some(config_upsert_values) => to_java_map(env, &config_upsert_values)?,
@@ -446,8 +537,14 @@ fn convert_to_java_operation_inner<'local>(
                 .map(|x| JLance(*x as i64))
                 .collect();
             let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
-            let updated_fragments_obj = export_vec(env, &updated_fragments)?;
-            let new_fragments_obj = export_vec(env, &new_fragments)?;
+            let updated_fragments_obj =
+                export_fragments_with_clustering_versions(env, &updated_fragments, |fragment| {
+                    manifest.and_then(|manifest| manifest.fragment_clustering_version(fragment.id))
+                })?;
+            let new_fragments_obj =
+                export_fragments_with_clustering_versions(env, &new_fragments, |_| {
+                    new_fragment_clustering_version
+                })?;
             let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
             let fields_for_preserving_frag_bitmap =
                 JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
@@ -536,7 +633,17 @@ fn convert_to_java_operation_inner<'local>(
             rewritten_indices,
             frag_reuse_index,
         } => {
-            let java_groups = export_vec(env, &groups)?;
+            let java_groups = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for group in &groups {
+                let java_group =
+                    rewrite_group_into_java(env, group, manifest, new_fragment_clustering_version)?;
+                env.call_method(
+                    &java_groups,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&java_group)],
+                )?;
+            }
             let java_indices = export_vec(env, &rewritten_indices)?;
             let java_frag_reuse_index = match frag_reuse_index {
                 Some(index) => index.into_java(env)?,
@@ -606,7 +713,10 @@ fn convert_to_java_operation_inner<'local>(
             schema,
             preserves_nullability,
         } => {
-            let java_fragments = export_vec(env, &rust_fragments)?;
+            let java_fragments =
+                export_fragments_with_clustering_versions(env, &rust_fragments, |fragment| {
+                    manifest.and_then(|manifest| manifest.fragment_clustering_version(fragment.id))
+                })?;
             let java_schema = convert_to_java_schema(env, schema)?;
 
             Ok(env.new_object(
@@ -898,7 +1008,7 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
+    let imported = convert_to_rust_operation(env, &op, allocator, dataset, read_ver)?;
 
     let tag = env.get_optional_from_method(&java_transaction, "tag", |env, tag_obj| {
         let tag_str = JString::from(tag_obj);
@@ -913,11 +1023,23 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    Ok(TransactionBuilder::new(read_ver, op)
+    // Reconstruct the reserved transport marker from fragment sidecars for
+    // uncommitted-transaction round trips. Ignore a duplicate generic property
+    // so it cannot override that value.
+    let transaction_properties = transaction_properties
+        .map(|mut properties| {
+            properties.remove(NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY);
+            properties
+        })
+        .filter(|properties| !properties.is_empty());
+    let mut builder = TransactionBuilder::new(read_ver, imported.operation)
         .uuid(uuid)
         .tag(tag)
-        .transaction_properties(transaction_properties.map(Arc::new))
-        .build())
+        .transaction_properties(transaction_properties.map(Arc::new));
+    if let Some(version) = imported.new_fragment_clustering_version {
+        builder = builder.new_fragment_clustering_version(version);
+    }
+    Ok(builder.build())
 }
 
 fn convert_schema_from_operation(
@@ -1094,9 +1216,10 @@ fn convert_to_rust_operation(
     allocator: Option<&JObject<'_>>,
     dataset: Option<&mut BlockingDataset>,
     read_version: u64,
-) -> Result<Operation> {
+) -> Result<ImportedOperation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
-    let op = match op_name.as_str() {
+    let mut new_fragment_clustering_version = None;
+    let operation = match op_name.as_str() {
         "Project" => Operation::Project {
             preserves_nullability: env
                 .get_boolean_from_method(java_operation, "preservesNullability")?,
@@ -1186,10 +1309,12 @@ fn convert_to_rust_operation(
             }
         }
         "Append" => {
-            let fragments =
+            let fragments: Vec<ImportedFragment> =
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
+            let (fragments, version) = split_imported_fragments(fragments)?;
+            new_fragment_clustering_version = version;
             Operation::Append { fragments }
         }
         "Delete" => {
@@ -1218,10 +1343,12 @@ fn convert_to_rust_operation(
             }
         }
         "Overwrite" => {
-            let fragments: Vec<Fragment> =
+            let fragments: Vec<ImportedFragment> =
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
+            let (fragments, version) = split_imported_fragments(fragments)?;
+            new_fragment_clustering_version = version;
 
             let config_upsert_values = env.get_optional_from_method(
                 java_operation,
@@ -1253,10 +1380,24 @@ fn convert_to_rust_operation(
             }
         }
         "Rewrite" => {
-            let groups: Vec<RewriteGroup> =
-                import_vec_from_method(env, java_operation, "groups", |env, group| {
-                    group.extract_object(env)
-                })?;
+            let java_groups = env
+                .call_method(java_operation, "groups", "()Ljava/util/List;", &[])?
+                .l()?;
+            let java_groups = crate::traits::import_vec(env, &java_groups)?;
+            let mut imported_groups = Vec::with_capacity(java_groups.len());
+            for group in java_groups {
+                let old_fragments: Vec<Fragment> =
+                    import_vec_from_method(env, &group, "oldFragments", |env, fragment| {
+                        fragment.extract_object(env)
+                    })?;
+                let new_fragments: Vec<ImportedFragment> =
+                    import_vec_from_method(env, &group, "newFragments", |env, fragment| {
+                        fragment.extract_object(env)
+                    })?;
+                imported_groups.push((old_fragments, new_fragments));
+            }
+            let (groups, version) = split_imported_rewrite_groups(imported_groups)?;
+            new_fragment_clustering_version = version;
 
             let rewritten_indices: Vec<RewrittenIndex> =
                 import_vec_from_method(env, java_operation, "rewrittenIndices", |env, index| {
@@ -1292,10 +1433,12 @@ fn convert_to_rust_operation(
                 |env, fragment| fragment.extract_object(env),
             )?;
 
-            let new_fragments: Vec<Fragment> =
+            let new_fragments: Vec<ImportedFragment> =
                 import_vec_from_method(env, java_operation, "newFragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
+            let (new_fragments, version) = split_imported_fragments(new_fragments)?;
+            new_fragment_clustering_version = version;
 
             let fields_modified = env
                 .call_method(java_operation, "fieldsModified", "()[J", &[])?
@@ -1411,13 +1554,13 @@ fn convert_to_rust_operation(
             let version: u64 = env
                 .call_method(java_operation, "version", "()J", &[])?
                 .j()? as u64;
-            return Ok(Operation::Restore { version });
+            Operation::Restore { version }
         }
         "ReserveFragments" => {
             let num_fragments = env
                 .call_method(java_operation, "numFragments", "()I", &[])?
                 .i()? as u32;
-            return Ok(Operation::ReserveFragments { num_fragments });
+            Operation::ReserveFragments { num_fragments }
         }
         "CreateIndex" => {
             let new_indices =
@@ -1428,14 +1571,17 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
                     index.extract_object(env)
                 })?;
-            return Ok(Operation::CreateIndex {
+            Operation::CreateIndex {
                 new_indices,
                 removed_indices,
-            });
+            }
         }
         _ => unimplemented!(),
     };
-    Ok(op)
+    Ok(ImportedOperation {
+        operation,
+        new_fragment_clustering_version,
+    })
 }
 
 fn extract_update_map(env: &mut JNIEnv, update_map_obj: &JObject) -> Result<Option<UpdateMap>> {
@@ -1516,6 +1662,40 @@ fn export_update_map<'a>(
             )?;
             Ok(update_map_obj)
         }
+    }
+}
+
+#[cfg(test)]
+mod clustering_version_tests {
+    use super::uniform_new_fragment_clustering_version;
+
+    #[test]
+    fn accepts_empty_and_uniform_fragment_versions() {
+        assert_eq!(
+            uniform_new_fragment_clustering_version(std::iter::empty()).unwrap(),
+            None
+        );
+        assert_eq!(
+            uniform_new_fragment_clustering_version([&None, &None]).unwrap(),
+            None
+        );
+        assert_eq!(
+            uniform_new_fragment_clustering_version([&Some(7), &Some(7)]).unwrap(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_and_conflicting_fragment_versions() {
+        let zero = uniform_new_fragment_clustering_version([&Some(0)]).unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let mixed = uniform_new_fragment_clustering_version([&Some(7), &None]).unwrap_err();
+        assert!(mixed.to_string().contains("all have the same"));
+
+        let conflicting =
+            uniform_new_fragment_clustering_version([&Some(7), &Some(8)]).unwrap_err();
+        assert!(conflicting.to_string().contains("all have the same"));
     }
 }
 

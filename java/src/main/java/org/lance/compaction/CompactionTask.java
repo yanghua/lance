@@ -24,6 +24,8 @@ import java.util.Optional;
 
 /** The compaction task which can be sent across network and executed individually. */
 public class CompactionTask implements Serializable {
+  private static final long serialVersionUID = 6068018867120518748L;
+
   private final TaskData taskData;
   private final long readVersion;
   private final CompactionOptions compactionOptions;
@@ -48,6 +50,7 @@ public class CompactionTask implements Serializable {
       return nativeExecute(
           dataset,
           taskData,
+          taskData.getClusteringTaskPayload(),
           readVersion,
           compactionOptions.getTargetRowsPerFragment(),
           compactionOptions.getMaxRowsPerGroup(),
@@ -69,6 +72,7 @@ public class CompactionTask implements Serializable {
   private native RewriteResult nativeExecute(
       Dataset dataset,
       TaskData taskData,
+      byte[] clusteringTaskPayload,
       long readVersion,
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,

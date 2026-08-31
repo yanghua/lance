@@ -15,24 +15,24 @@ package org.lance.compaction;
 
 import org.lance.FragmentMetadata;
 
-import java.io.Serializable;
 import java.util.List;
 
-/** Data of compaction task. */
-public class TaskData implements Serializable {
-  private static final long serialVersionUID = -4884632518342713596L;
+/** Task data carrying the core's tagged clustering-task provenance payload. */
+public final class ClusteringTaskData extends TaskData {
+  private static final long serialVersionUID = 1L;
 
-  private final List<FragmentMetadata> fragments;
+  private final byte[] clusteringTaskPayload;
 
-  public TaskData(List<FragmentMetadata> fragments) {
-    this.fragments = fragments;
+  public ClusteringTaskData(List<FragmentMetadata> fragments, byte[] clusteringTaskPayload) {
+    super(fragments);
+    if (clusteringTaskPayload == null) {
+      throw new IllegalArgumentException("clusteringTaskPayload cannot be null");
+    }
+    this.clusteringTaskPayload = clusteringTaskPayload;
   }
 
-  public List<FragmentMetadata> getFragments() {
-    return fragments;
-  }
-
+  @Override
   public byte[] getClusteringTaskPayload() {
-    return null;
+    return clusteringTaskPayload;
   }
 }

@@ -45,7 +45,7 @@ use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal_with_clustering,
 };
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -1802,7 +1802,7 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let (fragments, _) = write_fragments_internal(
+                let (fragments, _) = write_fragments_internal_with_clustering(
                     dataset.manifest.data_storage_format.lance_file_format(),
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
@@ -1811,6 +1811,7 @@ impl MergeInsertJob {
                     stream,
                     Default::default(), // TODO: support write params.
                     (*target_bases_info).clone(),
+                    None,
                 )
                 .await?;
 
@@ -2748,7 +2749,7 @@ impl MergeInsertJob {
             (operation, None)
         } else {
             let cleanup_bases = target_bases_info.clone();
-            let (mut new_fragments, _) = write_fragments_internal(
+            let (mut new_fragments, _) = write_fragments_internal_with_clustering(
                 self.dataset
                     .manifest
                     .data_storage_format
@@ -2760,6 +2761,7 @@ impl MergeInsertJob {
                 Box::pin(stream),
                 WriteParams::default(),
                 target_bases_info,
+                None,
             )
             .await?;
 

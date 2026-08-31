@@ -401,10 +401,11 @@ impl MemTableFlusher {
                 dataset.object_store.as_ref(),
             )
             .await?;
-            let fragments = Arc::make_mut(&mut manifest.fragments);
+            let mut fragments = manifest.fragments.as_ref().clone();
             if let Some(fragment) = fragments.first_mut() {
                 fragment.deletion_file = deletion_file;
             }
+            manifest.replace_fragments(Arc::new(fragments))?;
         }
 
         // Clear stale section offsets from the v1 manifest since the rewritten

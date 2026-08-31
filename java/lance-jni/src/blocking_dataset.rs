@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::fragment::fragment_into_java;
 use crate::index_progress::JavaIndexBuildProgress;
 use crate::namespace::{
     BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
@@ -10,7 +11,7 @@ use crate::namespace::{
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_base_store_params, extract_storage_options,
+    build_compaction_request, extract_base_store_params, extract_storage_options,
     extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
     to_rust_map,
 };
@@ -33,10 +34,13 @@ use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
     CleanupReferencedBranch, RemovalStats,
 };
-use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
+use lance::dataset::optimize::{
+    CompactionOptions as RustCompactionOptions, CompactionRequest, compact_files,
+    compact_files_with_clustering,
+};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version,
@@ -46,7 +50,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
-use lance::table::format::{BasePath, Fragment, WriterVersion};
+use lance::table::format::{BasePath, WriterVersion};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
@@ -236,8 +240,7 @@ impl BlockingDataset {
 
     pub fn commit(
         uri: &str,
-        operation: Operation,
-        read_version: Option<u64>,
+        transaction: Transaction,
         storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         let accessor = if storage_options.is_empty() {
@@ -247,18 +250,14 @@ impl BlockingDataset {
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
             ))
         };
-        let inner = block_on(Dataset::commit(
-            uri,
-            operation,
-            read_version,
-            Some(ObjectStoreParams {
-                storage_options_accessor: accessor,
-                ..Default::default()
-            }),
-            None,
-            Default::default(),
-            false,
-        ))?;
+        let inner = block_on(
+            CommitBuilder::new(uri)
+                .with_store_params(ObjectStoreParams {
+                    storage_options_accessor: accessor,
+                    ..Default::default()
+                })
+                .execute(transaction),
+        )?;
         Ok(Self { inner })
     }
 
@@ -432,6 +431,11 @@ impl BlockingDataset {
 
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
         block_on(compact_files(&mut self.inner, options, None))?;
+        Ok(())
+    }
+
+    pub fn compact_with_clustering(&mut self, options: RustCompactionOptions) -> Result<()> {
+        block_on(compact_files_with_clustering(&mut self.inner, options))?;
         Ok(())
     }
 
@@ -712,7 +716,7 @@ fn create_dataset<'local>(
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
-    let mut write_params = extract_write_params(
+    let (mut write_params, cluster_by_columns) = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -770,7 +774,6 @@ fn create_dataset<'local>(
         });
     }
 
-    let cluster_by_columns = write_params.cluster_by.take().map(|spec| spec.columns);
     let mut builder =
         lance::dataset::InsertBuilder::new(path_str.as_str()).with_params(&write_params);
     if let Some(columns) = cluster_by_columns {
@@ -929,15 +932,23 @@ pub fn inner_commit_append<'local>(
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let fragment_objs = import_vec(env, &fragment_objs)?;
-    let mut fragments = Vec::with_capacity(fragment_objs.len());
+    let mut imported_fragments = Vec::with_capacity(fragment_objs.len());
     for f in fragment_objs {
-        fragments.push(f.extract_object(env)?);
+        imported_fragments.push(f.extract_object(env)?);
     }
+    let (fragments, clustering_version) =
+        crate::transaction::split_imported_fragments(imported_fragments)?;
     let op = Operation::Append { fragments };
     let path_str = path.extract(env)?;
-    let read_version = env.get_u64_opt(&read_version_obj)?;
+    let read_version = env.get_u64_opt(&read_version_obj)?.ok_or_else(|| {
+        Error::input_error("read_version must be specified for this operation".to_string())
+    })?;
     let storage_options = extract_storage_options(env, &storage_options_obj)?;
-    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    let mut transaction_builder = TransactionBuilder::new(read_version, op);
+    if let Some(version) = clustering_version {
+        transaction_builder = transaction_builder.new_fragment_clustering_version(version);
+    }
+    let dataset = BlockingDataset::commit(&path_str, transaction_builder.build(), storage_options)?;
     dataset.into_java(env)
 }
 
@@ -973,10 +984,12 @@ pub fn inner_commit_overwrite<'local>(
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let fragment_objs = import_vec(env, &fragments_obj)?;
-    let mut fragments = Vec::with_capacity(fragment_objs.len());
+    let mut imported_fragments = Vec::with_capacity(fragment_objs.len());
     for f in fragment_objs {
-        fragments.push(f.extract_object(env)?);
+        imported_fragments.push(f.extract_object(env)?);
     }
+    let (fragments, clustering_version) =
+        crate::transaction::split_imported_fragments(imported_fragments)?;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let arrow_schema = Schema::try_from(&c_schema)?;
@@ -989,10 +1002,14 @@ pub fn inner_commit_overwrite<'local>(
         initial_bases: None,
     };
     let path_str = path.extract(env)?;
-    let read_version = env.get_u64_opt(&read_version_obj)?;
+    let read_version = env.get_u64_opt(&read_version_obj)?.unwrap_or(0);
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
-    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    let mut transaction_builder = TransactionBuilder::new(read_version, op);
+    if let Some(version) = clustering_version {
+        transaction_builder = transaction_builder.new_fragment_clustering_version(version);
+    }
+    let dataset = BlockingDataset::commit(&path_str, transaction_builder.build(), storage_options)?;
     dataset.into_java(env)
 }
 
@@ -1644,13 +1661,32 @@ fn inner_get_fragments<'local>(
     let fragments = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.inner.get_fragments()
+        dataset
+            .inner
+            .get_fragments()
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.metadata().clone(),
+                    dataset
+                        .inner
+                        .manifest()
+                        .fragment_clustering_version(fragment.id() as u64),
+                )
+            })
+            .collect::<Vec<_>>()
     };
-    let fragments = fragments
-        .iter()
-        .map(|f| f.metadata().clone())
-        .collect::<Vec<Fragment>>();
-    export_vec(env, &fragments)
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for (fragment, clustering_version) in &fragments {
+        let fragment = fragment_into_java(env, fragment, *clustering_version)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&fragment)],
+        )?;
+    }
+    Ok(array_list)
 }
 
 #[unsafe(no_mangle)]
@@ -1711,10 +1747,21 @@ fn inner_get_fragment<'local>(
     let fragment = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.inner.get_fragment(fragment_id as usize)
+        dataset
+            .inner
+            .get_fragment(fragment_id as usize)
+            .map(|fragment| {
+                let clustering_version = dataset
+                    .inner
+                    .manifest()
+                    .fragment_clustering_version(fragment.id() as u64);
+                (fragment.metadata().clone(), clustering_version)
+            })
     };
     let obj = match fragment {
-        Some(f) => f.metadata().into_java(env)?,
+        Some((fragment, clustering_version)) => {
+            fragment_into_java(env, &fragment, clustering_version)?
+        }
         None => JObject::default(),
     };
     Ok(obj)
@@ -2228,7 +2275,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeSetClustering<'local>(
     java_dataset: JObject,
     columns: JObject, // List<String>
     curve: JString,
-    version: jlong,
+    version: JString,
     bits_per_dim: jint,
 ) {
     ok_or_throw_without_return!(
@@ -2249,13 +2296,19 @@ fn inner_set_clustering(
     java_dataset: JObject,
     columns: JObject,
     curve: JString,
-    version: jlong,
+    version: JString,
     bits_per_dim: jint,
 ) -> Result<()> {
-    if version <= 0 {
-        return Err(Error::input_error(format!(
-            "clustering version must be positive, got {version}"
-        )));
+    let version_str: String = env.get_string(&version)?.into();
+    let version = version_str.parse::<u64>().map_err(|error| {
+        Error::input_error(format!(
+            "invalid clustering version {version_str:?}: expected a positive u64: {error}"
+        ))
+    })?;
+    if version == 0 {
+        return Err(Error::input_error(
+            "clustering version must be positive, got 0".to_string(),
+        ));
     }
     if !(1..=64).contains(&bits_per_dim) {
         return Err(Error::input_error(format!(
@@ -2272,7 +2325,7 @@ fn inner_set_clustering(
     let spec = lance_index::clustering::ClusteringSpec::with_bits(
         columns,
         curve,
-        version as u64,
+        version,
         bits_per_dim as u32,
     )
     .map_err(|e| Error::input_error(e.to_string()))?;
@@ -3363,10 +3416,13 @@ fn inner_compact(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         dataset.inner.manifest.config.clone()
     };
-    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options, &config)?;
+    let request = convert_java_compaction_options_to_rust(env, compaction_options, &config)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.compact(rust_options)?;
+    match request {
+        CompactionRequest::Compaction(options) => dataset_guard.compact(options)?,
+        CompactionRequest::Clustering(options) => dataset_guard.compact_with_clustering(options)?,
+    }
     Ok(())
 }
 
@@ -3374,7 +3430,7 @@ fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
     config: &std::collections::HashMap<String, String>,
-) -> Result<RustCompactionOptions> {
+) -> Result<CompactionRequest> {
     let target_rows_per_fragment = env
         .call_method(
             &java_options,
@@ -3483,7 +3539,7 @@ fn convert_java_compaction_options_to_rust(
         )?
         .l()?;
 
-    build_compaction_options(
+    build_compaction_request(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,

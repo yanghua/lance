@@ -251,8 +251,11 @@ pub async fn set_clustering(dataset: &mut Dataset, spec: &ClusteringSpec) -> Res
             )));
         }
     } else if let Some(max_fragment_version) = dataset
-        .iter_fragments()
-        .filter_map(|fragment| fragment.clustering_version)
+        .manifest
+        .fragment_clustering_versions()
+        .iter()
+        .copied()
+        .flatten()
         .max()
         && spec.version <= max_fragment_version
     {
@@ -1228,26 +1231,12 @@ mod tests {
         let spec = ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert).unwrap();
         dataset.set_clustering(&spec).await.unwrap();
 
-        execute_metadata_update(
-            &mut dataset,
-            Operation::UpdateConfig {
-                config_updates: Some(UpdateMap {
-                    update_entries: vec![
-                        (
-                            "lance.clustering.future_option".to_string(),
-                            "value".to_string(),
-                        )
-                            .into(),
-                    ],
-                    replace: false,
-                }),
-                table_metadata_updates: None,
-                schema_metadata_updates: None,
-                field_metadata_updates: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
+        // Normal commits reject unknown reserved keys, so emulate a dataset
+        // opened from a future writer in order to exercise the repair path.
+        Arc::make_mut(&mut dataset.manifest).config.insert(
+            "lance.clustering.future_option".to_string(),
+            "value".to_string(),
+        );
 
         dataset.clear_clustering().await.unwrap();
         assert!(dataset.clustering_spec().unwrap().is_none());
@@ -1280,8 +1269,9 @@ mod tests {
         dataset.append(append, None).await.unwrap();
         assert!(
             dataset
-                .iter_fragments()
-                .any(|fragment| fragment.clustering_version == Some(initial.version))
+                .manifest
+                .fragment_clustering_versions()
+                .contains(&Some(initial.version))
         );
         dataset.clear_clustering().await.unwrap();
         assert!(dataset.clustering_spec().unwrap().is_none());

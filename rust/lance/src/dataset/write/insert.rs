@@ -25,7 +25,7 @@ use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal_with_clustering,
 };
 use crate::{Error, Result};
 use tracing::info;
@@ -216,21 +216,17 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
-        // Resolve the clustering spec for this user write. This also validates
-        // that an explicit append spec matches an active dataset declaration.
-        // (Compaction sets `cluster_by` itself and does not pass through here.)
-        context.params.cluster_by = if let Some(columns) = &self.cluster_by_columns {
-            if context.params.cluster_by.is_some() {
-                return Err(Error::invalid_input(
-                    "cannot set both WriteParams::cluster_by and InsertBuilder::with_cluster_by_columns",
-                ));
-            }
+        // User writes inherit an active declaration when clustering columns are
+        // omitted. Explicit columns either resolve to that same authoritative
+        // declaration or request a one-shot sort on an undeclared dataset.
+        let declared_clustering_spec = super::declared_clustering_spec(context.dest.dataset())?;
+        let clustering_spec = if let Some(columns) = &self.cluster_by_columns {
             Some(super::resolve_clustering_columns(
                 columns,
                 context.dest.dataset(),
             )?)
         } else {
-            super::resolve_clustering_spec(&context.params, context.dest.dataset())?
+            declared_clustering_spec.clone()
         };
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
@@ -243,7 +239,7 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let (written_fragments, written_schema) = write_fragments_internal(
+        let (written_fragments, written_schema) = write_fragments_internal_with_clustering(
             context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
@@ -252,10 +248,16 @@ impl<'a> InsertBuilder<'a> {
             stream,
             context.params.clone(),
             target_base_info,
+            clustering_spec,
         )
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = Self::build_transaction(
+            written_schema,
+            written_fragments,
+            &context,
+            declared_clustering_spec.map(|spec| spec.version),
+        )?;
 
         Ok((transaction, context))
     }
@@ -264,6 +266,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
+        new_fragment_clustering_version: Option<u64>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
@@ -305,7 +308,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments },
         };
 
-        let transaction = TransactionBuilder::new(
+        let mut transaction_builder = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
@@ -313,8 +316,11 @@ impl<'a> InsertBuilder<'a> {
                 .unwrap_or(0),
             operation,
         )
-        .transaction_properties(context.params.transaction_properties.clone())
-        .build();
+        .transaction_properties(context.params.transaction_properties.clone());
+        if let Some(version) = new_fragment_clustering_version {
+            transaction_builder = transaction_builder.new_fragment_clustering_version(version);
+        }
+        let transaction = transaction_builder.build();
 
         Ok(transaction)
     }

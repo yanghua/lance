@@ -19,6 +19,8 @@ import java.io.Serializable;
 
 /** The compaction metrics. */
 public class CompactionMetrics implements Serializable {
+  private static final long serialVersionUID = -1967306800680609067L;
+
   private final long fragmentsRemoved;
   private final long fragmentsAdded;
   private final long filesRemoved;

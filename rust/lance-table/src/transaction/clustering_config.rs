@@ -22,6 +22,16 @@ const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
 const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
 const MAX_TOTAL_BITS: usize = 128;
 
+fn is_known_clustering_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        CLUSTERING_COLUMNS_KEY
+            | CLUSTERING_CURVE_KEY
+            | CLUSTERING_VERSION_KEY
+            | CLUSTERING_BITS_PER_DIM_KEY
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClusteringCurve {
     Hilbert,
@@ -42,6 +52,20 @@ impl ClusteringConfig {
             && self.curve == other.curve
             && self.bits_per_dim == other.bits_per_dim
     }
+}
+
+/// Return the version of the complete clustering declaration on `manifest`.
+///
+/// This deliberately uses the same parser as transition validation so a
+/// partial or malformed declaration cannot authorize a fragment stamp.
+pub(super) fn clustering_version(manifest: &Manifest) -> Result<Option<u64>> {
+    Ok(parse_clustering_config(&manifest.config)?.map(|config| config.version))
+}
+
+pub(super) fn contains_clustering_key(config: &HashMap<String, String>) -> bool {
+    config
+        .keys()
+        .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
 }
 
 /// Validate the liquid-clustering declaration on the manifest being published.
@@ -80,10 +104,11 @@ pub(super) fn validate_clustering_config_transition(
                 current.version, next.version
             )));
         }
-    } else if let Some(max_fragment_version) = next_manifest
-        .fragments
+    } else if let Some(max_fragment_version) = current_manifest
+        .fragment_clustering_versions()
         .iter()
-        .filter_map(|fragment| fragment.clustering_version)
+        .copied()
+        .flatten()
         .max()
         && next.version <= max_fragment_version
     {
@@ -98,10 +123,23 @@ pub(super) fn validate_clustering_config_transition(
 }
 
 fn parse_clustering_config(config: &HashMap<String, String>) -> Result<Option<ClusteringConfig>> {
-    if !config
+    let mut has_clustering_config = false;
+    for key in config
         .keys()
-        .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
+        .filter(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
     {
+        has_clustering_config = true;
+        if !is_known_clustering_config_key(key) {
+            return Err(Error::invalid_input(format!(
+                "unknown clustering config key {key:?}; expected one of {}, {}, {}, or {}",
+                CLUSTERING_COLUMNS_KEY,
+                CLUSTERING_CURVE_KEY,
+                CLUSTERING_VERSION_KEY,
+                CLUSTERING_BITS_PER_DIM_KEY
+            )));
+        }
+    }
+    if !has_clustering_config {
         return Ok(None);
     }
 
@@ -228,4 +266,48 @@ fn validate_clustering_columns(config: &ClusteringConfig, schema: &Schema) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_config() -> HashMap<String, String> {
+        HashMap::from([
+            (CLUSTERING_COLUMNS_KEY.to_string(), r#"["x"]"#.to_string()),
+            (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
+            (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
+            (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+        ])
+    }
+
+    #[test]
+    fn parse_rejects_unknown_clustering_keys() {
+        let unknown_key = "lance.clustering.future_option";
+        for mut config in [HashMap::new(), complete_config()] {
+            config.insert(unknown_key.to_string(), "value".to_string());
+            let error = parse_clustering_config(&config)
+                .expect_err("unknown keys in the clustering namespace must be rejected");
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("unknown clustering config key"));
+            assert!(message.contains(unknown_key));
+        }
+    }
+
+    #[test]
+    fn parse_ignores_near_prefix_keys() {
+        let config = HashMap::from([(
+            "lance.clustering_other.key".to_string(),
+            "value".to_string(),
+        )]);
+        assert_eq!(parse_clustering_config(&config).unwrap(), None);
+
+        let mut config = complete_config();
+        config.insert(
+            "lance.clustering_other.key".to_string(),
+            "value".to_string(),
+        );
+        assert!(parse_clustering_config(&config).unwrap().is_some());
+    }
 }

@@ -55,6 +55,10 @@ impl FileFragment {
     }
 }
 
+/// A fragment plus the manifest- or transaction-owned clustering stamp exposed
+/// by the public Python `FragmentMetadata` compatibility object.
+pub struct PyFragmentMetadata(pub Fragment, pub Option<u64>);
+
 #[pymethods]
 impl FileFragment {
     fn __repr__(&self) -> PyResult<String> {
@@ -119,11 +123,17 @@ impl FileFragment {
         reader: &Bound<PyAny>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
-        let params = if let Some(kw_params) = kwargs {
+        let (params, cluster_by_columns) = if let Some(kw_params) = kwargs {
             get_write_params(kw_params, dataset_uri)?
         } else {
-            None
+            (None, None)
         };
+        if cluster_by_columns.is_some() {
+            return Err(PyValueError::new_err(
+                "cluster_by is only supported by multi-fragment writes; use \
+                 write_fragments or write_dataset",
+            ));
+        }
 
         let batches = convert_reader(reader)?;
 
@@ -143,8 +153,14 @@ impl FileFragment {
         self.fragment.id()
     }
 
-    pub fn metadata(&self) -> PyLance<Fragment> {
-        PyLance(self.fragment.metadata().clone())
+    pub fn metadata(&self) -> PyFragmentMetadata {
+        let metadata = self.fragment.metadata();
+        let clustering_version = self
+            .fragment
+            .dataset()
+            .manifest()
+            .fragment_clustering_version(metadata.id);
+        PyFragmentMetadata(metadata.clone(), clustering_version)
     }
 
     #[pyo3(signature=(filter=None))]
@@ -473,11 +489,13 @@ fn do_write_fragments(
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
-    let mut params = match kwargs {
-        Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
-        None => WriteParams::default(),
+    let (params, cluster_by_columns) = match kwargs {
+        Some(options) => {
+            let (params, cluster_by_columns) = get_write_params(options, &dest.table_root_uri()?)?;
+            (params.unwrap_or_default(), cluster_by_columns)
+        }
+        None => (WriteParams::default(), None),
     };
-    let cluster_by_columns = params.cluster_by.take().map(|spec| spec.columns);
     let mut builder = InsertBuilder::new(dest.as_dest()).with_params(&params);
     if let Some(columns) = cluster_by_columns {
         builder = builder.with_cluster_by_columns(columns);
@@ -497,6 +515,9 @@ pub fn write_fragments(
     kwargs: Option<&Bound<PyDict>>,
 ) -> PyResult<Vec<Py<PyAny>>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
+    let clustering_version = written
+        .new_fragment_clustering_version()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
@@ -506,7 +527,7 @@ pub fn write_fragments(
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
-    export_vec(reader.py(), &fragments)
+    export_fragment_metadata_vec(reader.py(), &fragments, clustering_version)
 }
 
 #[pyfunction(name = "_write_fragments_transaction")]
@@ -807,7 +828,7 @@ impl FragmentSession {
     }
 }
 
-impl FromPyObject<'_, '_> for PyLance<Fragment> {
+impl FromPyObject<'_, '_> for PyFragmentMetadata {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
@@ -825,27 +846,115 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             ob.getattr("created_at_version_meta")?.extract()?;
         let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
         // Objects serialized before this field was exposed have no attribute.
-        let clustering_version = ob
-            .getattr("clustering_version")
-            .ok()
-            .map(|value| value.extract::<Option<u64>>())
-            .transpose()?
-            .flatten();
+        let clustering_version = match ob.getattr("clustering_version") {
+            Ok(value) if !value.is_none() => {
+                let version = value.extract::<u64>().map_err(|_| {
+                    PyValueError::new_err(
+                        "clustering_version must be a positive integer that fits in u64",
+                    )
+                })?;
+                if version == 0 {
+                    return Err(PyValueError::new_err(
+                        "clustering_version must be greater than zero",
+                    ));
+                }
+                Some(version)
+            }
+            // Objects serialized before this field was exposed have no
+            // attribute, and Python None is the unstamped representation.
+            _ => None,
+        };
 
-        Ok(Self(Fragment {
-            id: ob.getattr("id")?.extract()?,
-            files,
-            deletion_file,
-            physical_rows: ob.getattr("physical_rows")?.extract()?,
+        Ok(Self(
+            Fragment {
+                id: ob.getattr("id")?.extract()?,
+                files,
+                deletion_file,
+                physical_rows: ob.getattr("physical_rows")?.extract()?,
+                row_id_meta,
+                last_updated_at_version_meta,
+                created_at_version_meta,
+                // Round-tripped so overlays survive operations that pass existing
+                // fragments back (a manual Delete/Update/Merge commit). Sorting
+                // newest-last is deferred to the manifest reload after commit.
+                overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
+            },
             clustering_version,
-            row_id_meta,
-            last_updated_at_version_meta,
-            created_at_version_meta,
-            // Round-tripped so overlays survive operations that pass existing
-            // fragments back (a manual Delete/Update/Merge commit). Sorting
-            // newest-last is deferred to the manifest reload after commit.
-            overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
-        }))
+        ))
+    }
+}
+
+impl FromPyObject<'_, '_> for PyLance<Fragment> {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        ob.extract::<PyFragmentMetadata>()
+            .map(|metadata| Self(metadata.0))
+    }
+}
+
+pub(crate) fn export_fragment_metadata<'py>(
+    py: Python<'py>,
+    fragment: &Fragment,
+    clustering_version: Option<u64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let cls = py
+        .import(intern!(py, "lance.fragment"))
+        .and_then(|m| m.getattr("FragmentMetadata"))
+        .expect("FragmentMetadata class not found");
+
+    let files = export_vec(py, &fragment.files)?;
+    let deletion_file = fragment
+        .deletion_file
+        .as_ref()
+        .map(|f| PyDeletionFile(f.clone()));
+    let row_id_meta = fragment
+        .row_id_meta
+        .as_ref()
+        .map(|r| PyRowIdMeta(r.clone()));
+    let last_updated_at_version_meta = fragment
+        .last_updated_at_version_meta
+        .as_ref()
+        .map(|r| PyRowDatasetVersionMeta(r.clone()));
+    let created_at_version_meta = fragment
+        .created_at_version_meta
+        .as_ref()
+        .map(|r| PyRowDatasetVersionMeta(r.clone()));
+    let overlays = export_vec(py, &fragment.overlays)?;
+
+    cls.call1((
+        fragment.id,
+        files,
+        fragment.physical_rows,
+        deletion_file,
+        row_id_meta,
+        created_at_version_meta,
+        last_updated_at_version_meta,
+        overlays,
+        clustering_version,
+    ))
+}
+
+pub(crate) fn export_fragment_metadata_vec<'py>(
+    py: Python<'py>,
+    fragments: &[Fragment],
+    clustering_version: Option<u64>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    fragments
+        .iter()
+        .map(|fragment| {
+            export_fragment_metadata(py, fragment, clustering_version).map(Bound::unbind)
+        })
+        .collect()
+}
+
+impl<'py> IntoPyObject<'py> for PyFragmentMetadata {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        export_fragment_metadata(py, &self.0, self.1)
     }
 }
 
@@ -855,41 +964,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        let cls = py
-            .import(intern!(py, "lance.fragment"))
-            .and_then(|m| m.getattr("FragmentMetadata"))
-            .expect("FragmentMetadata class not found");
-
-        let files = export_vec(py, &self.0.files)?;
-        let deletion_file = self
-            .0
-            .deletion_file
-            .as_ref()
-            .map(|f| PyDeletionFile(f.clone()));
-        let row_id_meta = self.0.row_id_meta.as_ref().map(|r| PyRowIdMeta(r.clone()));
-        let last_updated_at_version_meta = self
-            .0
-            .last_updated_at_version_meta
-            .as_ref()
-            .map(|r| PyRowDatasetVersionMeta(r.clone()));
-        let created_at_version_meta = self
-            .0
-            .created_at_version_meta
-            .as_ref()
-            .map(|r| PyRowDatasetVersionMeta(r.clone()));
-        let overlays = export_vec(py, &self.0.overlays)?;
-
-        cls.call1((
-            self.0.id,
-            files,
-            self.0.physical_rows,
-            deletion_file,
-            row_id_meta,
-            created_at_version_meta,
-            last_updated_at_version_meta,
-            overlays,
-            self.0.clustering_version,
-        ))
+        export_fragment_metadata(py, self.0, None)
     }
 }
 

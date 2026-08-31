@@ -149,6 +149,10 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(schema);
     Preconditions.checkNotNull(params);
+    Preconditions.checkArgument(
+        !params.getClusterBy().isPresent(),
+        "clusterBy cannot be used when creating a schema-only dataset because there are no rows "
+            + "to cluster");
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportSchema(allocator, schema, null, arrowSchema);
       Dataset dataset =
@@ -1681,6 +1685,9 @@ public class Dataset implements Closeable {
    *   <li>Merges fragments that are too small
    * </ul>
    *
+   * <p>When {@link org.lance.compaction.CompactionMode#CLUSTER} is selected, this method uses the
+   * dataset's clustering declaration to reorder under-clustered fragments.
+   *
    * @param options compaction options to control the behavior
    */
   public void compact(CompactionOptions options) {
@@ -1752,12 +1759,15 @@ public class Dataset implements Closeable {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       nativeSetClustering(
-          spec.getColumns(), spec.getCurve().getValue(), spec.getVersion(), spec.getBitsPerDim());
+          spec.getColumns(),
+          spec.getCurve().getValue(),
+          spec.getVersionUnsigned().toString(),
+          spec.getBitsPerDim());
     }
   }
 
   private native void nativeSetClustering(
-      List<String> columns, String curve, long version, int bitsPerDim);
+      List<String> columns, String curve, String version, int bitsPerDim);
 
   /**
    * Read the clustering spec declared on this dataset, if any.
@@ -1773,7 +1783,7 @@ public class Dataset implements Closeable {
       }
       // result layout: [curve, version, bitsPerDim, column0, column1, ...]
       ClusteringCurve curve = ClusteringCurve.fromValue(result[0]);
-      long version = Long.parseLong(result[1]);
+      java.math.BigInteger version = new java.math.BigInteger(result[1]);
       int bitsPerDim = Integer.parseInt(result[2]);
       List<String> columns = new ArrayList<>(Arrays.asList(result).subList(3, result.length));
       return Optional.of(new ClusteringSpec(columns, curve, version, bitsPerDim));

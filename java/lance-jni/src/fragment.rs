@@ -42,6 +42,18 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+pub(crate) struct ImportedFragment {
+    pub fragment: Fragment,
+    pub clustering_version: Option<u64>,
+}
+
+impl FromJObjectWithEnv<ImportedFragment> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<ImportedFragment> {
+        import_fragment(env, self)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct FragmentMergeResult {
     fragment: Fragment,
     schema: Schema,
@@ -332,7 +344,7 @@ fn create_fragment<'a>(
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
 
-    let mut write_params = extract_write_params(
+    let (mut write_params, cluster_by_columns) = extract_write_params(
         env,
         &max_rows_per_file,
         &max_rows_per_group,
@@ -378,7 +390,6 @@ fn create_fragment<'a>(
         });
     }
 
-    let cluster_by_columns = write_params.cluster_by.take().map(|spec| spec.columns);
     let mut builder = FragmentCreateBuilder::new(&path_str).write_params(&write_params);
     if let Some(columns) = cluster_by_columns {
         builder = builder.with_cluster_by_columns(columns);
@@ -394,8 +405,9 @@ fn create_fragment<'a>(
         builder = builder.schema(&schema);
     }
 
-    let fragments = block_on(builder.write_fragments(source))?;
-    export_vec(env, &fragments)
+    let (fragments, clustering_version) =
+        block_on(builder.write_fragments_with_clustering_version(source))?;
+    export_fragments_with_clustering_versions(env, &fragments, |_| clustering_version)
 }
 
 #[unsafe(no_mangle)]
@@ -419,7 +431,7 @@ fn inner_delete_rows<'local>(
     row_indexes: JObject, // List<Integer>
 ) -> Result<JObject<'local>> {
     let fragment_id = fragment_id as usize;
-    let fragment = {
+    let (fragment, clustering_version) = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let Some(fragment) = dataset.inner.get_fragment(fragment_id) else {
@@ -427,7 +439,11 @@ fn inner_delete_rows<'local>(
                 "Fragment not found: {fragment_id}"
             )));
         };
-        fragment
+        let clustering_version = dataset
+            .inner
+            .manifest()
+            .fragment_clustering_version(fragment.id() as u64);
+        (fragment, clustering_version)
     };
 
     let indexes: Vec<u32> = env
@@ -439,7 +455,7 @@ fn inner_delete_rows<'local>(
     let res = block_on(async move { fragment.extend_deletions(indexes).await });
 
     let obj = match res {
-        Ok(Some(f)) => f.metadata().into_java(env)?,
+        Ok(Some(f)) => fragment_into_java(env, f.metadata(), clustering_version)?,
         Ok(None) => JObject::default(),
         Err(e) => {
             return Err(Error::runtime_error(format!(
@@ -705,7 +721,6 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/lang/Long;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -839,56 +854,82 @@ impl IntoJava for &RowDatasetVersionMeta {
     }
 }
 
+pub(crate) fn fragment_into_java<'local>(
+    env: &mut JNIEnv<'local>,
+    fragment: &Fragment,
+    clustering_version: Option<u64>,
+) -> Result<JObject<'local>> {
+    let files = fragment.files.clone();
+    let files = export_vec::<DataFile>(env, &files)?;
+    let deletion_file = match &fragment.deletion_file {
+        Some(f) => f.into_java(env)?,
+        None => JObject::null(),
+    };
+    let physical_rows = &JLance(fragment.physical_rows).into_java(env)?;
+    let row_id_meta = match &fragment.row_id_meta {
+        Some(m) => m.into_java(env)?,
+        None => JObject::null(),
+    };
+    let created_at = match &fragment.created_at_version_meta {
+        Some(m) => m.into_java(env)?,
+        None => JObject::null(),
+    };
+    let last_updated_at = match &fragment.last_updated_at_version_meta {
+        Some(m) => m.into_java(env)?,
+        None => JObject::null(),
+    };
+    let clustering_version = match clustering_version {
+        Some(version) => {
+            let version = env.new_string(version.to_string())?;
+            env.new_object(
+                "java/math/BigInteger",
+                "(Ljava/lang/String;)V",
+                &[JValueGen::Object(&version)],
+            )?
+        }
+        None => JObject::null(),
+    };
+
+    env.call_static_method(
+        FRAGMENT_METADATA_CLASS,
+        "withClusteringVersionUnsigned",
+        "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/math/BigInteger;)Lorg/lance/FragmentMetadata;",
+        &[
+            JValueGen::Int(fragment.id as i32),
+            JValueGen::Object(&files),
+            JValueGen::Object(physical_rows),
+            JValueGen::Object(&deletion_file),
+            JValueGen::Object(&row_id_meta),
+            JValueGen::Object(&created_at),
+            JValueGen::Object(&last_updated_at),
+            JValueGen::Object(&clustering_version),
+        ],
+    )?
+    .l()
+    .map_err(|e| Error::runtime_error(format!("failed to get {}: {}", FRAGMENT_METADATA_CLASS, e)))
+}
+
+pub(crate) fn export_fragments_with_clustering_versions<'local>(
+    env: &mut JNIEnv<'local>,
+    fragments: &[Fragment],
+    mut clustering_version: impl FnMut(&Fragment) -> Option<u64>,
+) -> Result<JObject<'local>> {
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for fragment in fragments {
+        let fragment = fragment_into_java(env, fragment, clustering_version(fragment))?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValueGen::Object(&fragment)],
+        )?;
+    }
+    Ok(array_list)
+}
+
 impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
-        let files = self.files.clone();
-        let files = export_vec::<DataFile>(env, &files)?;
-        let deletion_file = match &self.deletion_file {
-            Some(f) => f.into_java(env)?,
-            None => JObject::null(),
-        };
-        let physical_rows = &JLance(self.physical_rows).into_java(env)?;
-        let row_id_meta = match &self.row_id_meta {
-            Some(m) => m.into_java(env)?,
-            None => JObject::null(),
-        };
-        let created_at = match &self.created_at_version_meta {
-            Some(m) => m.into_java(env)?,
-            None => JObject::null(),
-        };
-        let last_updated_at = match &self.last_updated_at_version_meta {
-            Some(m) => m.into_java(env)?,
-            None => JObject::null(),
-        };
-        let clustering_version = match self.clustering_version {
-            Some(version) => {
-                let version = i64::try_from(version).map_err(|_| {
-                    Error::runtime_error(format!(
-                        "clustering version {version} exceeds the Java long range"
-                    ))
-                })?;
-                JLance(version).into_java(env)?
-            }
-            None => JObject::null(),
-        };
-
-        env.new_object(
-            FRAGMENT_METADATA_CLASS,
-            FRAGMENT_METADATA_CONSTRUCTOR_SIG,
-            &[
-                JValueGen::Int(self.id as i32),
-                JValueGen::Object(&files),
-                JValueGen::Object(physical_rows),
-                JValueGen::Object(&deletion_file),
-                JValueGen::Object(&row_id_meta),
-                JValueGen::Object(&created_at),
-                JValueGen::Object(&last_updated_at),
-                JValueGen::Object(&clustering_version),
-            ],
-        )
-        .map_err(|e| {
-            Error::runtime_error(format!("failed to get {}: {}", FRAGMENT_METADATA_CLASS, e))
-        })
+        fragment_into_java(env, self, None)
     }
 }
 
@@ -937,57 +978,76 @@ where
 
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
-        let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
-        let file_objs = env
-            .call_method(self, "getFiles", "()Ljava/util/List;", &[])?
+        Ok(import_fragment(env, self)?.fragment)
+    }
+}
+
+fn import_fragment(env: &mut JNIEnv<'_>, obj: &JObject<'_>) -> Result<ImportedFragment> {
+    let id = env.call_method(obj, "getId", "()I", &[])?.i()? as u64;
+    let file_objs = env
+        .call_method(obj, "getFiles", "()Ljava/util/List;", &[])?
+        .l()?;
+    let physical_rows = env.call_method(obj, "getPhysicalRows", "()J", &[])?.j()? as usize;
+    let file_objs = import_vec(env, &file_objs)?;
+    let mut files = Vec::with_capacity(file_objs.len());
+    for f in file_objs {
+        files.push(f.extract_object(env)?);
+    }
+
+    let deletion_file = extract_nullable_field(env, obj, "getDeletionFile", DELETE_FILE_CLASS)?;
+    let row_id_meta = extract_nullable_field(env, obj, "getRowIdMeta", ROW_ID_META_CLASS)?;
+    let created_at_version_meta =
+        extract_nullable_field(env, obj, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
+    let last_updated_at_version_meta =
+        extract_nullable_field(env, obj, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
+    let clustering_version_obj = env
+        .call_method(
+            obj,
+            "getClusteringVersionUnsigned",
+            "()Ljava/math/BigInteger;",
+            &[],
+        )?
+        .l()?;
+    let clustering_version = if clustering_version_obj.is_null() {
+        None
+    } else {
+        let version = env
+            .call_method(
+                &clustering_version_obj,
+                "toString",
+                "()Ljava/lang/String;",
+                &[],
+            )?
             .l()?;
-        let physical_rows = env.call_method(self, "getPhysicalRows", "()J", &[])?.j()? as usize;
-        let file_objs = import_vec(env, &file_objs)?;
-        let mut files = Vec::with_capacity(file_objs.len());
-        for f in file_objs {
-            files.push(f.extract_object(env)?);
+        let version: String = env.get_string(&JString::from(version))?.into();
+        let version = version.parse::<u64>().map_err(|error| {
+            Error::input_error(format!(
+                "invalid clustering version {version:?}: expected a positive u64: {error}"
+            ))
+        })?;
+        if version == 0 {
+            return Err(Error::input_error(
+                "clustering version must be positive, got 0".to_string(),
+            ));
         }
+        Some(version)
+    };
 
-        let deletion_file =
-            extract_nullable_field(env, self, "getDeletionFile", DELETE_FILE_CLASS)?;
-        let row_id_meta = extract_nullable_field(env, self, "getRowIdMeta", ROW_ID_META_CLASS)?;
-        let created_at_version_meta =
-            extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
-        let last_updated_at_version_meta =
-            extract_nullable_field(env, self, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
-        let clustering_version_obj = env
-            .call_method(self, "getClusteringVersion", "()Ljava/lang/Long;", &[])?
-            .l()?;
-        let clustering_version: Option<i64> = clustering_version_obj.extract_object(env)?;
-        let clustering_version = clustering_version
-            .map(|version| {
-                if version <= 0 {
-                    return Err(Error::input_error(format!(
-                        "clustering version must be positive, got {version}"
-                    )));
-                }
-                u64::try_from(version).map_err(|_| {
-                    Error::input_error(format!(
-                        "clustering version must be positive, got {version}"
-                    ))
-                })
-            })
-            .transpose()?;
-
-        Ok(Fragment {
+    Ok(ImportedFragment {
+        fragment: Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
-            clustering_version,
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
             // Overlays are not exposed to Java yet, and the reverse conversion
             // does not export them, so this round-trip is overlay-free.
             overlays: vec![],
-        })
-    }
+        },
+        clustering_version,
+    })
 }
 
 impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {

@@ -412,22 +412,6 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
-
-    /// If set, incoming data is sorted by the clustering-key space-filling
-    /// curve value before fragments are written, producing value-coherent
-    /// fragments ("liquid clustering"). When `None`, the write preserves input
-    /// order as before.
-    ///
-    /// On append this is normally left `None` and resolved from the dataset's
-    /// declared clustering spec (see [`Dataset::set_clustering`]). An explicit
-    /// spec on a dataset with an active declaration may either exactly match
-    /// that declaration or use the default convenience tuning with the same
-    /// columns; the latter resolves to the authoritative declaration. On a new
-    /// or undeclared dataset, an explicit spec sorts only this write; it does
-    /// not declare a persistent clustering layout.
-    ///
-    /// [`Dataset::set_clustering`]: crate::Dataset::set_clustering
-    pub cluster_by: Option<ClusteringSpec>,
 }
 
 impl Default for WriteParams {
@@ -458,7 +442,6 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
-            cluster_by: None,
         }
     }
 }
@@ -656,8 +639,6 @@ where
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
     let mut files_written: u32 = 0;
-    let clustering_version = params.cluster_by.as_ref().map(|spec| spec.version);
-
     // Wrap the loop in an async block so `?` returns into `loop_result` and we
     // can run cleanup before propagating the error.
     let loop_result: Result<()> = async {
@@ -707,7 +688,6 @@ where
                 let last_fragment = fragments.last_mut().unwrap();
                 last_fragment.physical_rows = Some(num_rows as usize);
                 last_fragment.files.push(data_file);
-                last_fragment.clustering_version = clustering_version;
                 // Notify after pushing the data file so it's tracked for cleanup
                 // if the callback fails.
                 params.progress.complete(fragments.last().unwrap()).await?;
@@ -739,50 +719,41 @@ where
         return Err(e);
     }
 
-    // Complete the final writer
-    if let Some(mut writer) = writer.take() {
-        if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
-            drop(writer);
-            cleanup_data_fragments(
-                &object_store,
-                base_dir,
-                cleanup_bases.as_deref(),
-                &fragments,
-            )
-            .await;
-            return Err(e);
-        }
-        match writer.finish().await {
-            Ok((num_rows, data_file)) => {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-                rows_completed += num_rows as u64;
-                files_written += 1;
-                let last_fragment = fragments.last_mut().unwrap();
-                last_fragment.physical_rows = Some(num_rows as usize);
-                last_fragment.files.push(data_file);
-                last_fragment.clustering_version = clustering_version;
-                params.progress.complete(fragments.last().unwrap()).await?;
-                if let Some(cb) = &params.write_progress {
-                    cb.call(WriteStats {
-                        bytes_written: bytes_completed,
-                        rows_written: rows_completed,
-                        files_written,
-                    });
-                }
-            }
-            Err(e) => {
-                drop(writer);
-                cleanup_data_fragments(
-                    &object_store,
-                    base_dir,
-                    cleanup_bases.as_deref(),
-                    &fragments,
-                )
-                .await;
-                return Err(e);
+    // Complete the final writer inside one result boundary so every failure
+    // after a file has been opened takes the same cleanup path.
+    let final_result: Result<()> = async {
+        if let Some(mut writer) = writer.take() {
+            flush_seed_writers(writer.as_mut(), &mut seed_writers).await?;
+            let (num_rows, data_file) = writer.finish().await?;
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+            bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+            rows_completed += num_rows as u64;
+            files_written += 1;
+            let last_fragment = fragments.last_mut().unwrap();
+            last_fragment.physical_rows = Some(num_rows as usize);
+            last_fragment.files.push(data_file);
+            params.progress.complete(fragments.last().unwrap()).await?;
+            if let Some(cb) = &params.write_progress {
+                cb.call(WriteStats {
+                    bytes_written: bytes_completed,
+                    rows_written: rows_completed,
+                    files_written,
+                });
             }
         }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = final_result {
+        cleanup_data_fragments(
+            &object_store,
+            base_dir,
+            cleanup_bases.as_deref(),
+            &fragments,
+        )
+        .await;
+        return Err(e);
     }
 
     Ok(fragments)
@@ -1294,10 +1265,6 @@ pub(super) async fn blob_v2_external_base_resolver(
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
 ///
-/// This is a private variant that takes a `SendableRecordBatchStream` instead
-/// of a reader. We don't expose the stream at our interface because it is a
-/// DataFusion type.
-///
 /// The caller must resolve `storage_version` once for the operation. Operations
 /// that also select a commit format must reuse the same value when committing.
 #[allow(clippy::too_many_arguments)]
@@ -1311,6 +1278,34 @@ pub async fn write_fragments_internal(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_with_clustering(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        None,
+    )
+    .await
+}
+
+/// Internal variant that carries a resolved clustering spec separately from
+/// the public, struct-literal-compatible [`WriteParams`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_fragments_internal_with_clustering(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    clustering_spec: Option<ClusteringSpec>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
     let adapter = SchemaAdapter::new(data.schema());
@@ -1331,36 +1326,20 @@ pub async fn write_fragments_internal(
     validate_external_blob_write_params(&params)?;
     let normalized_converted_schema = prepared_to_logical_blob_schema(&converted_schema)?;
 
-    // If clustering is requested (via `params.cluster_by`), sort the incoming
-    // data by the clustering-key space-filling curve before writing so each
-    // fragment is value-coherent across the key columns. Callers decide when to
-    // set this: user writes inherit the dataset's declared spec (see
-    // `InsertBuilder`), and compaction sets it only for `CompactionMode::Cluster`.
-    let clustering_spec = params.cluster_by.clone();
-    let clustering_version = if let Some(write_spec) = clustering_spec.as_ref() {
-        match declared_clustering_spec(dataset)? {
-            Some(declared_spec) => {
-                validate_clustering_spec_identity(write_spec, &declared_spec)?;
-                Some(declared_spec.version)
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    // Callers resolve clustering explicitly because not every internal writer
+    // should inherit the dataset declaration. User inserts and reclustering
+    // compaction sort here; update and merge paths preserve their row order.
+    if let Some(write_spec) = clustering_spec.as_ref()
+        && let Some(declared_spec) = declared_clustering_spec(dataset)?
+    {
+        validate_clustering_spec_identity(write_spec, &declared_spec)?;
+    }
     let data = match &clustering_spec {
         Some(spec) => cluster_sort_write_stream(data, dataset, spec).await?,
         None => data,
     };
-    // The low-level writer uses this field to stamp fragments before invoking
-    // progress callbacks. A one-shot explicit sort without an active dataset
-    // declaration must remain unstamped, so pass through only the authoritative
-    // declared layout version.
-    params.cluster_by = clustering_spec
-        .clone()
-        .filter(|_| clustering_version.is_some());
 
-    let (mut fragments, out_schema) = versions::write_fragments(
+    versions::write_fragments(
         storage_version,
         dataset,
         object_store,
@@ -1370,18 +1349,7 @@ pub async fn write_fragments_internal(
         params,
         target_bases_info,
     )
-    .await?;
-
-    // Only an active dataset declaration establishes a current layout. An
-    // explicit one-shot sort on a new or undeclared dataset must remain
-    // unstamped so a later declaration will still select these fragments.
-    if let Some(version) = clustering_version {
-        for fragment in &mut fragments {
-            fragment.clustering_version = Some(version);
-        }
-    }
-
-    Ok((fragments, out_schema))
+    .await
 }
 
 async fn cluster_sort_write_stream(
@@ -1458,7 +1426,9 @@ async fn cluster_sort_write_stream(
     ))
 }
 
-fn declared_clustering_spec(dataset: Option<&Dataset>) -> Result<Option<ClusteringSpec>> {
+pub(crate) fn declared_clustering_spec(
+    dataset: Option<&Dataset>,
+) -> Result<Option<ClusteringSpec>> {
     dataset
         .map(Dataset::clustering_spec)
         .transpose()
@@ -1472,9 +1442,8 @@ fn validate_clustering_spec_identity(
     if write_spec != declared_spec {
         return Err(Error::invalid_input(format!(
             "write clustering spec {write_spec:?} does not exactly match the dataset's \
-             declared clustering spec {declared_spec:?}; omit WriteParams::cluster_by to \
-             inherit the declaration, or pass only its matching column list through a \
-             language binding"
+             declared clustering spec {declared_spec:?}; omit explicit clustering columns to \
+             inherit the declaration, or pass the declaration's matching column list"
         )));
     }
     Ok(())
@@ -1484,40 +1453,17 @@ pub(crate) fn resolve_clustering_columns(
     columns: &[String],
     dataset: Option<&Dataset>,
 ) -> Result<ClusteringSpec> {
-    let requested = ClusteringSpec::new(columns.to_vec(), Default::default())?;
     let Some(declared) = declared_clustering_spec(dataset)? else {
-        return Ok(requested);
+        return ClusteringSpec::new(columns.to_vec(), Default::default());
     };
-    if requested.columns != declared.columns {
+    if columns != declared.columns.as_slice() {
         return Err(Error::invalid_input(format!(
             "write clustering columns {:?} do not match the dataset's declared clustering \
              columns {:?}",
-            requested.columns, declared.columns
+            columns, declared.columns
         )));
     }
     Ok(declared)
-}
-
-/// Resolve the clustering spec that governs a user write. On an existing
-/// dataset, an explicit [`WriteParams::cluster_by`] must match the active
-/// declaration (or be the matching column-only convenience spec); otherwise
-/// the declaration is inherited. This includes overwrites because overwrite
-/// commits preserve dataset config.
-///
-/// Compaction does not go through this: it sets `cluster_by` directly only for
-/// [`CompactionMode::Cluster`](crate::dataset::optimize::CompactionMode::Cluster).
-pub(crate) fn resolve_clustering_spec(
-    params: &WriteParams,
-    dataset: Option<&Dataset>,
-) -> Result<Option<ClusteringSpec>> {
-    let declared_spec = declared_clustering_spec(dataset)?;
-    if let Some(spec) = &params.cluster_by {
-        if let Some(declared_spec) = &declared_spec {
-            validate_clustering_spec_identity(spec, declared_spec)?;
-        }
-        return Ok(Some(spec.clone()));
-    }
-    Ok(declared_spec)
 }
 
 pub(super) fn prepare_write_schema(
@@ -2071,8 +2017,9 @@ mod tests {
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::{Component, Prefix};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
+    use arrow_array::{Array, Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
@@ -2084,6 +2031,37 @@ mod tests {
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
+
+    #[derive(Debug)]
+    struct FailingCompleteProgress {
+        fail_on_completion: usize,
+        completions: AtomicUsize,
+    }
+
+    impl FailingCompleteProgress {
+        fn new(fail_on_completion: usize) -> Self {
+            Self {
+                fail_on_completion,
+                completions: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WriteFragmentProgress for FailingCompleteProgress {
+        async fn begin(&self, _fragment: &Fragment) -> Result<()> {
+            Ok(())
+        }
+
+        async fn complete(&self, _fragment: &Fragment) -> Result<()> {
+            let completion = self.completions.fetch_add(1, Ordering::SeqCst) + 1;
+            if completion == self.fail_on_completion {
+                Err(Error::io("injected progress failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     async fn open_v2_1_test_writer(
         object_store: Arc<ObjectStore>,
@@ -2270,7 +2248,7 @@ mod tests {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
                 let object_store = Arc::new(ObjectStore::memory());
-                write_fragments_internal(
+                write_fragments_internal_with_clustering(
                     write_params.storage_version_or_default(),
                     None,
                     object_store,
@@ -2278,6 +2256,7 @@ mod tests {
                     schema,
                     data_stream,
                     write_params,
+                    None,
                     None,
                 )
                 .await
@@ -2324,7 +2303,7 @@ mod tests {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
                 let object_store = Arc::new(ObjectStore::memory());
-                write_fragments_internal(
+                write_fragments_internal_with_clustering(
                     write_params.storage_version_or_default(),
                     None,
                     object_store,
@@ -2332,6 +2311,7 @@ mod tests {
                     schema,
                     data_stream,
                     write_params,
+                    None,
                     None,
                 )
                 .await
@@ -2386,7 +2366,7 @@ mod tests {
                 let schema = Schema::try_from(schema.as_ref()).unwrap();
 
                 let object_store = Arc::new(ObjectStore::memory());
-                write_fragments_internal(
+                write_fragments_internal_with_clustering(
                     write_params.storage_version_or_default(),
                     None,
                     object_store,
@@ -2394,6 +2374,7 @@ mod tests {
                     schema,
                     data_stream,
                     write_params,
+                    None,
                     None,
                 )
                 .await
@@ -2501,7 +2482,7 @@ mod tests {
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
             let object_store = Arc::new(ObjectStore::memory());
-            let (fragments, _) = write_fragments_internal(
+            let (fragments, _) = write_fragments_internal_with_clustering(
                 version.resolve(),
                 None,
                 object_store,
@@ -2509,6 +2490,7 @@ mod tests {
                 schema,
                 data_stream,
                 write_params,
+                None,
                 None,
             )
             .await
@@ -2577,7 +2559,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let (fragments, _) = write_fragments_internal(
+        let (fragments, _) = write_fragments_internal_with_clustering(
             ConcreteFileVersion::V1,
             None,
             object_store.clone(),
@@ -2585,6 +2567,7 @@ mod tests {
             schema.clone(),
             data_stream,
             write_params,
+            None,
             None,
         )
         .await
@@ -3739,7 +3722,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = write_fragments_internal(
+        let result = write_fragments_internal_with_clustering(
             write_params.storage_version_or_default(),
             None,
             object_store,
@@ -3747,6 +3730,7 @@ mod tests {
             schema,
             data_stream,
             write_params,
+            None,
             None,
         )
         .await;
@@ -3964,7 +3948,7 @@ mod tests {
         };
 
         // Attempt to write data - should fail with IO error due to disk full
-        let result = write_fragments_internal(
+        let result = write_fragments_internal_with_clustering(
             write_params.storage_version_or_default(),
             None,
             object_store,
@@ -3972,6 +3956,7 @@ mod tests {
             schema,
             data_stream,
             write_params,
+            None,
             None,
         )
         .await;
@@ -4169,6 +4154,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_final_progress_callback() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store,
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                progress: Arc::new(FailingCompleteProgress::new(1)),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        let error = result.expect_err("final progress callback should fail the write");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected progress failure"));
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "The final data file should be cleaned up on callback failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_completed_and_final_files_on_failed_progress_callback() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store,
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                progress: Arc::new(FailingCompleteProgress::new(2)),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+        )
+        .await;
+
+        let error = result.expect_err("second progress callback should fail the write");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected progress failure"));
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "both the completed and final data files should be cleaned up"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_data_files_on_failed_write_multi_file() {
         // Verify cleanup when a failure occurs after one file has already been completed
         // (i.e., max_rows_per_file causes a file boundary before the error).
@@ -4264,7 +4354,6 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(0),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         }];
 
@@ -4346,7 +4435,6 @@ mod tests {
             row_id_meta: None,
             physical_rows: Some(0),
             created_at_version_meta: None,
-            clustering_version: None,
             last_updated_at_version_meta: None,
         }];
 
@@ -4957,17 +5045,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_by_reorders_write() {
-        use crate::Dataset;
-        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+        use arrow_array::FixedSizeBinaryArray;
+        use lance_index::clustering::{ClusteringSpec, SpaceFillingEncoder};
 
-        // Two batches whose key column is shuffled. A single fragment written
-        // with a clustering spec must come out sorted by the key.
+        // A shuffled key column written with clustering must come out sorted by
+        // the configured space-filling-curve value.
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new("k", DataType::Int32, false),
         ]));
         let ids: Vec<i32> = (0..1000).collect();
-        let keys: Vec<i32> = (0..1000).map(|i| (i * 7 + 13) % 1000).collect();
+        let keys: Vec<i32> = (0..1000)
+            .map(|i| {
+                let rank = (i * 7 + 13) % 1000;
+                (i64::from(i32::MIN) + i64::from(rank) * i64::from(u32::MAX) / 999) as i32
+            })
+            .collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -4979,18 +5072,15 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let uri = lance_core::utils::tempfile::TempStrDir::default();
-        let params = WriteParams {
-            cluster_by: Some(
-                ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32)
-                    .unwrap(),
-            ),
-            ..Default::default()
-        };
-        let dataset = Dataset::write(reader, uri.as_str(), Some(params))
+        let dataset = InsertBuilder::new(uri.as_str())
+            .with_cluster_by_columns(vec!["k".into()])
+            .execute_stream(reader)
             .await
             .unwrap();
 
-        // Read the key column back in storage order and confirm it is sorted.
+        // Read the key column back in storage order and confirm its encoded
+        // curve values are sorted. Hilbert order is not necessarily the same as
+        // the raw numeric order, even for a single coordinate.
         let batches = dataset
             .scan()
             .project(&["k"])
@@ -5008,28 +5098,35 @@ mod tests {
             seen.extend((0..a.len()).map(|i| a.value(i)));
         }
         assert_eq!(seen.len(), 1000);
+        let spec = ClusteringSpec::new(vec!["k".into()], Default::default()).unwrap();
+        let encoded = SpaceFillingEncoder::from_spec(&spec)
+            .unwrap()
+            .encode(&[Arc::new(Int32Array::from(seen))])
+            .unwrap();
+        let encoded = encoded
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
         assert!(
-            seen.windows(2).all(|w| w[0] <= w[1]),
-            "clustered write must lay out rows sorted by the clustering key"
+            (1..encoded.len()).all(|i| encoded.value(i - 1) <= encoded.value(i)),
+            "clustered write must lay out rows sorted by the encoded curve key"
         );
 
         // An explicit one-shot sort does not declare a persistent dataset
         // layout, so these fragments must not claim to be current.
         assert!(
             dataset
-                .fragments()
+                .manifest
+                .fragment_clustering_versions()
                 .iter()
-                .all(|f| f.clustering_version.is_none()),
+                .all(Option::is_none),
             "one-shot clustered writes must remain unstamped"
         );
     }
 
     #[tokio::test]
     async fn test_one_shot_clustered_create_is_selected_after_declaration() {
-        use crate::Dataset;
-        use crate::dataset::optimize::{
-            ClusteringCompactionPlanner, CompactionOptions, CompactionPlanner,
-        };
+        use crate::dataset::optimize::{ClusteringCompactionPlanner, CompactionOptions};
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -5045,21 +5142,17 @@ mod tests {
         let spec =
             ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
         let uri = lance_core::utils::tempfile::TempStrDir::default();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            uri.as_str(),
-            Some(WriteParams {
-                cluster_by: Some(spec.clone()),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = InsertBuilder::new(uri.as_str())
+            .with_cluster_by_columns(vec!["k".into()])
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema))
+            .await
+            .unwrap();
         assert!(
             dataset
-                .fragments()
+                .manifest
+                .fragment_clustering_versions()
                 .iter()
-                .all(|fragment| fragment.clustering_version.is_none())
+                .all(Option::is_none)
         );
 
         dataset.set_clustering(&spec).await.unwrap();
@@ -5069,7 +5162,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            plan.tasks.len(),
+            plan.num_tasks(),
             1,
             "a later declaration must not skip one-shot sorted fragments"
         );
@@ -5137,7 +5230,9 @@ mod tests {
             "append must inherit the dataset's declared clustering spec"
         );
         assert_eq!(
-            dataset.fragments().last().unwrap().clustering_version,
+            dataset
+                .manifest
+                .fragment_clustering_version(dataset.fragments().last().unwrap().id),
             Some(spec.version)
         );
     }
@@ -5168,24 +5263,21 @@ mod tests {
             ClusteringSpec::with_bits(vec!["a".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
         dataset.set_clustering(&declared).await.unwrap();
 
-        let mismatched =
-            ClusteringSpec::with_bits(vec!["b".into()], ClusteringCurve::ZOrder, 1, 32).unwrap();
-        let error = Dataset::write(
-            make(),
-            uri.as_str(),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                cluster_by: Some(mismatched),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect_err("an explicit append spec must match the dataset declaration");
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let error = InsertBuilder::new(uri.as_str())
+            .with_params(&params)
+            .with_cluster_by_columns(vec!["b".into()])
+            .execute_stream(make())
+            .await
+            .expect_err("explicit append columns must match the dataset declaration");
         assert!(matches!(&error, Error::InvalidInput { .. }));
         assert!(
             error
                 .to_string()
-                .contains("does not exactly match the dataset's declared clustering spec"),
+                .contains("do not match the dataset's declared clustering columns"),
             "unexpected error: {error}"
         );
     }
@@ -5226,7 +5318,9 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.fragments().len(), 1);
         assert_eq!(
-            dataset.fragments()[0].clustering_version,
+            dataset
+                .manifest
+                .fragment_clustering_version(dataset.fragments()[0].id),
             Some(spec.version)
         );
         let batch = dataset
@@ -5247,27 +5341,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_column_only_write_spec_uses_declared_tuning() {
+    async fn test_column_only_builder_uses_wide_declared_spec() {
         use crate::Dataset;
         use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "k",
-            DataType::Int32,
-            false,
-        )]));
-        let make = |values| {
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))])
-                    .unwrap();
+        let columns = (0..9).map(|i| format!("k{i}")).collect::<Vec<_>>();
+        let schema = Arc::new(ArrowSchema::new(
+            columns
+                .iter()
+                .map(|column| ArrowField::new(column.as_str(), DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let make = |values: Vec<i32>| {
+            let arrays = columns
+                .iter()
+                .map(|_| Arc::new(Int32Array::from(values.clone())) as arrow_array::ArrayRef)
+                .collect();
+            let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
             RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
         };
         let uri = lance_core::utils::tempfile::TempStrDir::default();
         let mut dataset = Dataset::write(make(vec![1, 2, 3]), uri.as_str(), None)
             .await
             .unwrap();
+        // The default 16 bits per dimension would exceed the 128-bit limit for
+        // nine columns. Resolving the raw column list must therefore inherit
+        // this valid lower-bit declaration before constructing a default spec.
         let declared =
-            ClusteringSpec::with_bits(vec!["k".into()], ClusteringCurve::ZOrder, 7, 32).unwrap();
+            ClusteringSpec::with_bits(columns.clone(), ClusteringCurve::ZOrder, 7, 8).unwrap();
         dataset.set_clustering(&declared).await.unwrap();
 
         let params = WriteParams {
@@ -5276,13 +5377,15 @@ mod tests {
         };
         let dataset = InsertBuilder::new(uri.as_str())
             .with_params(&params)
-            .with_cluster_by_columns(vec!["k".into()])
+            .with_cluster_by_columns(columns.clone())
             .execute_stream(make(vec![3, 1, 2]))
             .await
             .unwrap();
 
         assert_eq!(
-            dataset.fragments().last().unwrap().clustering_version,
+            dataset
+                .manifest
+                .fragment_clustering_version(dataset.fragments().last().unwrap().id),
             Some(declared.version)
         );
     }
@@ -5338,7 +5441,10 @@ mod tests {
         .unwrap();
 
         let appended = dataset.fragments().last().unwrap();
-        assert_eq!(appended.clustering_version, Some(spec.version));
+        assert_eq!(
+            dataset.manifest.fragment_clustering_version(appended.id),
+            Some(spec.version)
+        );
         let batch = dataset
             .scan()
             .with_fragments(vec![appended.clone()])

@@ -2,17 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::DatasetBasePath;
+use crate::fragment::PyFragmentMetadata;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata, Manifest};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -21,6 +22,8 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+const NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY: &str = "__lance_new_fragment_clustering_version";
 
 // IndexFile bindings
 impl FromPyObject<'_, '_> for PyLance<IndexFile> {
@@ -353,6 +356,162 @@ impl FromPyObject<'_, '_> for PyUpdateMode {
                 mode_str
             ))),
         }
+    }
+}
+
+pub(crate) struct PyOperation {
+    pub operation: Operation,
+    pub new_fragment_clustering_version: Option<u64>,
+}
+
+impl PyOperation {
+    pub(crate) fn into_transaction(
+        self,
+        read_version: u64,
+        transaction_properties: Option<Arc<HashMap<String, String>>>,
+    ) -> Transaction {
+        // Reconstruct the reserved transport marker from fragment sidecars for
+        // uncommitted-transaction round trips. Ignore a duplicate generic
+        // property so it cannot override that value.
+        let transaction_properties = transaction_properties
+            .as_deref()
+            .map(|properties| {
+                let mut properties = properties.clone();
+                properties.remove(NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY);
+                properties
+            })
+            .filter(|properties| !properties.is_empty())
+            .map(Arc::new);
+        let mut builder = TransactionBuilder::new(read_version, self.operation)
+            .transaction_properties(transaction_properties);
+        if let Some(version) = self.new_fragment_clustering_version {
+            builder = builder.new_fragment_clustering_version(version);
+        }
+        builder.build()
+    }
+}
+
+fn append_fragment_clustering_versions(
+    fragments: &Bound<'_, PyAny>,
+    versions: &mut Vec<Option<u64>>,
+) -> PyResult<()> {
+    versions.extend(
+        fragments
+            .extract::<Vec<PyFragmentMetadata>>()?
+            .into_iter()
+            .map(|metadata| metadata.1),
+    );
+    Ok(())
+}
+
+fn extract_new_fragment_clustering_version(operation: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+    let mut versions = Vec::new();
+    match class_name(operation)?.as_str() {
+        "Append" | "Overwrite" => {
+            append_fragment_clustering_versions(&operation.getattr("fragments")?, &mut versions)?;
+        }
+        "Update" => {
+            append_fragment_clustering_versions(
+                &operation.getattr("new_fragments")?,
+                &mut versions,
+            )?;
+        }
+        "Rewrite" => {
+            for group in operation.getattr("groups")?.try_iter()? {
+                append_fragment_clustering_versions(
+                    &group?.getattr("new_fragments")?,
+                    &mut versions,
+                )?;
+            }
+        }
+        _ => {}
+    }
+
+    let Some(first) = versions.first().copied() else {
+        return Ok(None);
+    };
+    if versions.iter().any(|version| *version != first) {
+        return Err(PyValueError::new_err(
+            "new fragment clustering_version values must be either all None or all the same \
+             positive integer",
+        ));
+    }
+    match first {
+        Some(0) => Err(PyValueError::new_err(
+            "new fragment clustering_version must be greater than zero",
+        )),
+        version => Ok(version),
+    }
+}
+
+fn stamp_fragment_list(fragments: &Bound<'_, PyAny>, version: u64) -> PyResult<()> {
+    for fragment in fragments.try_iter()? {
+        fragment?.setattr("clustering_version", version)?;
+    }
+    Ok(())
+}
+
+fn stamp_new_fragment_metadata(operation: &Bound<'_, PyAny>, version: u64) -> PyResult<()> {
+    match class_name(operation)?.as_str() {
+        "Append" | "Overwrite" => stamp_fragment_list(&operation.getattr("fragments")?, version),
+        "Update" => stamp_fragment_list(&operation.getattr("new_fragments")?, version),
+        "Rewrite" => {
+            for group in operation.getattr("groups")?.try_iter()? {
+                stamp_fragment_list(&group?.getattr("new_fragments")?, version)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn stamp_fragment_list_from_manifest(
+    fragments: &Bound<'_, PyAny>,
+    manifest: &Manifest,
+) -> PyResult<()> {
+    for fragment in fragments.try_iter()? {
+        let fragment = fragment?;
+        let fragment_id = fragment.getattr("id")?.extract::<u64>()?;
+        if let Some(version) = manifest.fragment_clustering_version(fragment_id) {
+            fragment.setattr("clustering_version", version)?;
+        }
+    }
+    Ok(())
+}
+
+fn stamp_existing_fragment_metadata(
+    operation: &Bound<'_, PyAny>,
+    manifest: &Manifest,
+) -> PyResult<()> {
+    match class_name(operation)?.as_str() {
+        "Delete" => {
+            stamp_fragment_list_from_manifest(&operation.getattr("updated_fragments")?, manifest)
+        }
+        "Update" => {
+            stamp_fragment_list_from_manifest(&operation.getattr("updated_fragments")?, manifest)
+        }
+        "Rewrite" => {
+            for group in operation.getattr("groups")?.try_iter()? {
+                stamp_fragment_list_from_manifest(&group?.getattr("old_fragments")?, manifest)?;
+            }
+            Ok(())
+        }
+        "Merge" => stamp_fragment_list_from_manifest(&operation.getattr("fragments")?, manifest),
+        _ => Ok(()),
+    }
+}
+
+impl FromPyObject<'_, '_> for PyOperation {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let new_fragment_clustering_version =
+            extract_new_fragment_clustering_version(&ob.to_owned())?;
+        let operation = ob.extract::<PyLance<Operation>>()?.0;
+        Ok(Self {
+            operation,
+            new_fragment_clustering_version,
+        })
     }
 }
 
@@ -821,19 +980,15 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let read_version = ob.getattr("read_version")?.extract()?;
         let uuid = ob.getattr("uuid")?.extract()?;
-        let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
+        let operation = ob.getattr("operation")?.extract::<PyOperation>()?;
         let transaction_properties = ob
             .getattr("transaction_properties")?
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
-        Ok(Self(Transaction {
-            read_version,
-            uuid,
-            operation,
-            tag: None,
-            transaction_properties,
-        }))
+        let mut transaction = operation.into_transaction(read_version, transaction_properties);
+        transaction.uuid = uuid;
+        Ok(Self(transaction))
     }
 }
 
@@ -843,27 +998,56 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        let namespace = py
-            .import(intern!(py, "lance"))
-            .expect("Failed to import lance module");
-
-        let read_version = self.0.read_version;
-        let uuid = &self.0.uuid;
-        let operation = PyLance(&self.0.operation).into_pyobject(py)?;
-
-        let cls = namespace
-            .getattr("Transaction")
-            .expect("Failed to get Transaction class");
-
-        let py_transaction = cls.call1((read_version, operation, uuid))?;
-
-        if let Some(transaction_properties_arc) = &self.0.transaction_properties {
-            let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
-            py_transaction.setattr("transaction_properties", py_dict)?;
-        }
-        // Unwrap due to infallible
-        Ok(py_transaction.into_pyobject(py).unwrap())
+        transaction_into_pyobject(py, self.0, None)
     }
+}
+
+pub struct PyTransactionWithManifest(pub Transaction, pub Arc<Manifest>);
+
+impl<'py> IntoPyObject<'py> for PyTransactionWithManifest {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        transaction_into_pyobject(py, &self.0, Some(self.1.as_ref()))
+    }
+}
+
+fn transaction_into_pyobject<'py>(
+    py: Python<'py>,
+    transaction: &Transaction,
+    manifest: Option<&Manifest>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let namespace = py
+        .import(intern!(py, "lance"))
+        .expect("Failed to import lance module");
+
+    let read_version = transaction.read_version;
+    let uuid = &transaction.uuid;
+    let operation = PyLance(&transaction.operation).into_pyobject(py)?;
+    if let Some(manifest) = manifest {
+        stamp_existing_fragment_metadata(&operation, manifest)?;
+    }
+    if let Some(version) = transaction
+        .new_fragment_clustering_version()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?
+    {
+        stamp_new_fragment_metadata(&operation, version)?;
+    }
+
+    let cls = namespace
+        .getattr("Transaction")
+        .expect("Failed to get Transaction class");
+
+    let py_transaction = cls.call1((read_version, operation, uuid))?;
+
+    if let Some(transaction_properties_arc) = &transaction.transaction_properties {
+        let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
+        py_transaction.setattr("transaction_properties", py_dict)?;
+    }
+    // Unwrap due to infallible
+    Ok(py_transaction.into_pyobject(py).unwrap())
 }
 
 impl<'py> IntoPyObject<'py> for PyLance<Transaction> {

@@ -15,6 +15,8 @@ package org.lance;
 
 import org.lance.clustering.ClusteringCurve;
 import org.lance.clustering.ClusteringSpec;
+import org.lance.compaction.ClusteringRewriteResult;
+import org.lance.compaction.ClusteringTaskData;
 import org.lance.compaction.Compaction;
 import org.lance.compaction.CompactionMetrics;
 import org.lance.compaction.CompactionMode;
@@ -22,6 +24,7 @@ import org.lance.compaction.CompactionOptions;
 import org.lance.compaction.CompactionPlan;
 import org.lance.compaction.CompactionTask;
 import org.lance.compaction.RewriteResult;
+import org.lance.compaction.TaskData;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -34,6 +37,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.ObjectStreamClass;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -44,6 +48,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -269,6 +274,7 @@ public class CompactionTest {
         assertEquals(1, plan.getCompactionTasks().size());
 
         CompactionTask task = plan.getCompactionTasks().get(0);
+        assertTrue(task.getTaskData() instanceof ClusteringTaskData);
         assertEquals(2, task.getTaskData().getFragments().size());
         assertFragmentMetadataClusteringVersion(task.getTaskData().getFragments(), 1L);
         task = serializeAndDeserialize(task);
@@ -276,6 +282,7 @@ public class CompactionTest {
         assertFragmentMetadataClusteringVersion(task.getTaskData().getFragments(), 1L);
 
         RewriteResult result = task.execute(dataset);
+        assertTrue(result instanceof ClusteringRewriteResult);
         assertEquals(2, result.getOriginalFragments().size());
         assertEquals(1, result.getNewFragments().size());
         assertFragmentMetadataClusteringVersion(result.getOriginalFragments(), 1L);
@@ -285,6 +292,31 @@ public class CompactionTest {
         assertEquals(1, result.getNewFragments().size());
         assertFragmentMetadataClusteringVersion(result.getOriginalFragments(), 1L);
         assertFragmentMetadataClusteringVersion(result.getNewFragments(), 2L);
+
+        RewriteResult clusteringResult = result;
+        CompactionOptions ordinaryOptions =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withCompactionMode(CompactionMode.REENCODE)
+                .build();
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                Compaction.commitCompaction(
+                    dataset, Collections.singletonList(clusteringResult), ordinaryOptions));
+
+        RewriteResult ordinaryResult =
+            new RewriteResult(
+                result.getMetrics(),
+                result.getNewFragments(),
+                result.getOriginalFragments(),
+                result.getReadVersion(),
+                result.getRowAddrs());
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                Compaction.commitCompaction(
+                    dataset, Collections.singletonList(ordinaryResult), options));
 
         Compaction.commitCompaction(dataset, Collections.singletonList(result), options);
         dataset.checkoutLatest();
@@ -297,7 +329,98 @@ public class CompactionTest {
   }
 
   @Test
-  public void testDeserializeOptionsRejectsUnknownCompactionMode() throws Exception {
+  public void testDatasetCompactAcceptsClusterMode(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("test_dataset_compact_cluster").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        dataset.setClustering(
+            new ClusteringSpec(Collections.singletonList("id"), ClusteringCurve.HILBERT, 1, 16));
+      }
+      testDataset.write(2, 10).close();
+
+      try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+        dataset.compact(
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withNumThreads(1)
+                .withCompactionMode(CompactionMode.CLUSTER)
+                .build());
+        dataset.checkoutLatest();
+
+        assertEquals(1, dataset.getFragments().size());
+        assertClusteringVersion(dataset.getFragments(), 1L);
+      }
+    }
+  }
+
+  @Test
+  public void testCompactionPayloadKindsFailClosed() {
+    CompactionMetrics metrics = new CompactionMetrics(0, 0, 0, 0);
+    RewriteResult ordinary =
+        new RewriteResult(metrics, Collections.emptyList(), Collections.emptyList(), 1, null);
+    assertFalse(ordinary instanceof ClusteringRewriteResult);
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new ClusteringRewriteResult(
+                metrics, Collections.emptyList(), Collections.emptyList(), 1, null, null));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new ClusteringTaskData(Collections.emptyList(), null));
+  }
+
+  @Test
+  public void testLegacyCompactionDtoSerialVersionUidsRemainPinned() {
+    assertEquals(
+        -4884632518342713596L, ObjectStreamClass.lookup(TaskData.class).getSerialVersionUID());
+    assertEquals(
+        6068018867120518748L, ObjectStreamClass.lookup(CompactionTask.class).getSerialVersionUID());
+    assertEquals(
+        4501818269828675274L, ObjectStreamClass.lookup(RewriteResult.class).getSerialVersionUID());
+    assertEquals(
+        -1967306800680609067L,
+        ObjectStreamClass.lookup(CompactionMetrics.class).getSerialVersionUID());
+  }
+
+  @ParameterizedTest
+  @EnumSource(CompactionMode.class)
+  public void testCompactionModeSerializationProtocol(CompactionMode mode) throws Exception {
+    CompactionOptions options = CompactionOptions.builder().withCompactionMode(mode).build();
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    Object serializedMode;
+    try (ModeCapturingObjectOutputStream out = new ModeCapturingObjectOutputStream(outputStream)) {
+      out.writeObject(options);
+      serializedMode = out.getSerializedMode();
+    }
+
+    if (mode == CompactionMode.CLUSTER) {
+      assertEquals(CompactionMode.CLUSTER, serializedMode);
+    } else {
+      assertEquals(mode.getValue(), serializedMode);
+    }
+
+    CompactionOptions deserialized = deserialize(outputStream.toByteArray());
+    assertEquals(Optional.of(mode.getValue()), deserialized.getCompactionMode());
+  }
+
+  @Test
+  public void testDeserializeClusterModeFromLegacyString() throws Exception {
+    CompactionOptions options =
+        CompactionOptions.builder().withCompactionMode(CompactionMode.CLUSTER).build();
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    try (LegacyClusterObjectOutputStream out = new LegacyClusterObjectOutputStream(outputStream)) {
+      out.writeObject(options);
+    }
+
+    CompactionOptions deserialized = deserialize(outputStream.toByteArray());
+    assertEquals(Optional.of(CompactionMode.CLUSTER.getValue()), deserialized.getCompactionMode());
+  }
+
+  @Test
+  public void testDeserializeOptionsRejectsUnknownLegacyCompactionMode() throws Exception {
     CompactionOptions options =
         CompactionOptions.builder().withCompactionMode(CompactionMode.REENCODE).build();
     byte[] serialized = serialize(options);
@@ -305,6 +428,17 @@ public class CompactionTest {
 
     IOException exception = assertThrows(IOException.class, () -> deserialize(serialized));
     assertTrue(exception.getMessage().contains("unknown!"));
+  }
+
+  @Test
+  public void testDeserializeOptionsRejectsUnknownEnumCompactionMode() throws Exception {
+    CompactionOptions options =
+        CompactionOptions.builder().withCompactionMode(CompactionMode.CLUSTER).build();
+    byte[] serialized = serialize(options);
+    replaceSerializedToken(serialized, "CLUSTER", "UNKNOWN");
+
+    IOException exception = assertThrows(IOException.class, () -> deserialize(serialized));
+    assertTrue(exception.getMessage().contains("UNKNOWN"));
   }
 
   /**
@@ -360,6 +494,39 @@ public class CompactionTest {
       @SuppressWarnings("unchecked")
       T deserialized = (T) in.readObject();
       return deserialized;
+    }
+  }
+
+  private static class ModeCapturingObjectOutputStream extends ObjectOutputStream {
+    private Object serializedMode;
+
+    private ModeCapturingObjectOutputStream(ByteArrayOutputStream outputStream) throws IOException {
+      super(outputStream);
+      enableReplaceObject(true);
+    }
+
+    @Override
+    protected Object replaceObject(Object object) {
+      if (object instanceof CompactionMode || object instanceof String) {
+        serializedMode = object;
+      }
+      return object;
+    }
+
+    private Object getSerializedMode() {
+      return serializedMode;
+    }
+  }
+
+  private static class LegacyClusterObjectOutputStream extends ObjectOutputStream {
+    private LegacyClusterObjectOutputStream(ByteArrayOutputStream outputStream) throws IOException {
+      super(outputStream);
+      enableReplaceObject(true);
+    }
+
+    @Override
+    protected Object replaceObject(Object object) {
+      return object == CompactionMode.CLUSTER ? CompactionMode.CLUSTER.getValue() : object;
     }
   }
 

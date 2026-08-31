@@ -8051,6 +8051,12 @@ def write_dataset(
         else:
             data_storage_version = "stable"
 
+    if cluster_by is not None and isinstance(data_obj, list) and not data_obj:
+        raise ValueError(
+            "cluster_by cannot be used with schema-only dataset creation because \
+             there are no rows to cluster"
+        )
+
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here

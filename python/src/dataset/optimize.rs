@@ -15,20 +15,113 @@
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        ClusteringCompactionPlan, ClusteringCompactionTask, ClusteringRewriteResult,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionRequest,
+        CompactionTask, RewriteResult, commit_clustering_compaction, commit_compaction,
+        compact_files, compact_files_with_clustering, plan_clustering_compaction, plan_compaction,
+        resolve_compaction_options_from_dataset_config,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
 
 use super::*;
 
+type FragmentClusteringVersions = std::collections::HashMap<u64, u64>;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+enum CompactionPlanKind {
+    Clustering(ClusteringCompactionPlan),
+    Ordinary(CompactionPlan),
+}
+
+impl CompactionPlanKind {
+    fn read_version(&self) -> u64 {
+        match self {
+            Self::Clustering(plan) => plan.read_version(),
+            Self::Ordinary(plan) => plan.read_version(),
+        }
+    }
+
+    fn num_tasks(&self) -> usize {
+        match self {
+            Self::Clustering(plan) => plan.num_tasks(),
+            Self::Ordinary(plan) => plan.num_tasks(),
+        }
+    }
+
+    fn task_data(&self) -> &[lance::dataset::optimize::TaskData] {
+        match self {
+            Self::Clustering(plan) => plan.tasks(),
+            Self::Ordinary(plan) => &plan.tasks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+enum CompactionTaskKind {
+    Clustering(ClusteringCompactionTask),
+    Ordinary(CompactionTask),
+}
+
+impl CompactionTaskKind {
+    fn read_version(&self) -> u64 {
+        match self {
+            Self::Clustering(task) => task.read_version(),
+            Self::Ordinary(task) => task.read_version,
+        }
+    }
+
+    fn fragments(&self) -> &[Fragment] {
+        match self {
+            Self::Clustering(task) => task.fragments(),
+            Self::Ordinary(task) => &task.task.fragments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+enum RewriteResultKind {
+    Clustering(ClusteringRewriteResult),
+    Ordinary(RewriteResult),
+}
+
+impl RewriteResultKind {
+    fn rewrite_result(&self) -> &RewriteResult {
+        match self {
+            Self::Clustering(result) => result.rewrite_result(),
+            Self::Ordinary(result) => result,
+        }
+    }
+
+    fn clustering_version(&self) -> Option<u64> {
+        match self {
+            Self::Clustering(result) => Some(result.clustering_version()),
+            Self::Ordinary(_) => None,
+        }
+    }
+}
+
+#[allow(deprecated)]
 fn parse_compaction_options(
     options: &Bound<'_, PyDict>,
     config: &std::collections::HashMap<String, String>,
-) -> PyResult<CompactionOptions> {
-    let mut opts = CompactionOptions::from_dataset_config(config)
+) -> PyResult<(CompactionOptions, bool)> {
+    let mut config = config.clone();
+    let explicit_mode = options
+        .get_item("compaction_mode")?
+        .map(|value| value.extract::<Option<String>>())
+        .transpose()?
+        .flatten();
+    if explicit_mode.is_some() {
+        config.remove("lance.compaction.compaction_mode");
+    }
+    let configured = resolve_compaction_options_from_dataset_config(&config)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let mut is_clustering = matches!(configured, CompactionRequest::Clustering(_));
+    let mut opts = configured.into_options();
 
     for (key, value) in options.into_iter() {
         let key: String = key.extract()?;
@@ -64,10 +157,17 @@ fn parse_compaction_options(
             "compaction_mode" => {
                 let mode_str: Option<String> = value.extract()?;
                 if let Some(mode_str) = mode_str {
-                    opts.compaction_mode = Some(
-                        CompactionMode::try_from(mode_str.as_str())
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    );
+                    is_clustering = mode_str.eq_ignore_ascii_case("cluster");
+                    if is_clustering {
+                        opts.compaction_mode = Some(CompactionMode::Reencode);
+                        opts.enable_binary_copy = false;
+                        opts.enable_binary_copy_force = false;
+                    } else {
+                        opts.compaction_mode = Some(
+                            CompactionMode::try_from(mode_str.as_str())
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                        );
+                    }
                 }
             }
             "binary_copy_read_batch_bytes" => {
@@ -95,7 +195,7 @@ fn parse_compaction_options(
         }
     }
 
-    Ok(opts)
+    Ok((opts, is_clustering))
 }
 
 fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
@@ -103,13 +203,70 @@ fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
     Ok(ds.cast::<Dataset>()?.clone())
 }
 
-fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
-    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
-    let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
-        PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
-    })?;
+fn wrap_fragment<'py>(
+    py: Python<'py>,
+    fragment: &Fragment,
+    clustering_version: Option<u64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    crate::fragment::export_fragment_metadata(py, fragment, clustering_version)
+}
 
-    fragment_metadata.call_method1("from_json", (fragment_json,))
+#[derive(serde::Serialize)]
+struct CompactionPlanState {
+    #[serde(flatten)]
+    plan: CompactionPlanKind,
+    #[serde(default, skip_serializing_if = "FragmentClusteringVersions::is_empty")]
+    fragment_clustering_versions: FragmentClusteringVersions,
+}
+
+#[derive(serde::Serialize)]
+struct CompactionTaskState {
+    #[serde(flatten)]
+    task: CompactionTaskKind,
+    #[serde(default, skip_serializing_if = "FragmentClusteringVersions::is_empty")]
+    fragment_clustering_versions: FragmentClusteringVersions,
+}
+
+#[derive(serde::Serialize)]
+struct RewriteResultState {
+    #[serde(flatten)]
+    result: RewriteResultKind,
+    #[serde(default, skip_serializing_if = "FragmentClusteringVersions::is_empty")]
+    original_fragment_clustering_versions: FragmentClusteringVersions,
+}
+
+fn split_serialized_state(
+    json: &str,
+    clustering_tag: &str,
+    sidecar_key: &str,
+) -> PyResult<(serde_json::Value, FragmentClusteringVersions, bool)> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| PyValueError::new_err("compaction state must be a JSON object"))?;
+    let sidecar = object
+        .remove(sidecar_key)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?
+        .unwrap_or_default();
+    let is_clustering = object.contains_key(clustering_tag);
+    if is_clustering && object.len() != 1 {
+        return Err(PyValueError::new_err(
+            "clustering compaction state cannot contain ordinary payload fields",
+        ));
+    }
+    if !is_clustering
+        && object
+            .keys()
+            .any(|key| key.starts_with("lance_clustering_"))
+    {
+        return Err(PyValueError::new_err(
+            "unexpected clustering payload type in compaction state",
+        ));
+    }
+    Ok((value, sidecar, is_clustering))
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]
@@ -154,14 +311,17 @@ impl From<CompactionMetrics> for PyCompactionMetrics {
 ///
 /// Created by :py:meth:`lance.optimize.Compaction.plan`.
 #[pyclass(name = "CompactionPlan", module = "lance.optimize")]
-pub struct PyCompactionPlan(CompactionPlan);
+pub struct PyCompactionPlan {
+    plan: CompactionPlanKind,
+    fragment_clustering_versions: FragmentClusteringVersions,
+}
 
 #[pymethods]
 impl PyCompactionPlan {
     pub fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
             "CompactionPlan(read_version={}, tasks=<{} compaction tasks>)",
-            self.0.read_version(),
+            self.plan.read_version(),
             self.num_tasks()
         ))
     }
@@ -169,18 +329,44 @@ impl PyCompactionPlan {
     /// int : The read version of the dataset that this plan was created from.
     #[getter]
     pub fn read_version(&self) -> u64 {
-        self.0.read_version()
+        self.plan.read_version()
     }
 
     /// int : The number of compaction tasks in the plan.
     pub fn num_tasks(&self) -> usize {
-        self.0.num_tasks()
+        self.plan.num_tasks()
     }
 
     /// List[CompactionTask] : The individual tasks in the plan.
     #[getter]
     pub fn tasks(&self) -> Vec<PyCompactionTask> {
-        self.0.compaction_tasks().map(PyCompactionTask).collect()
+        match &self.plan {
+            CompactionPlanKind::Clustering(plan) => plan
+                .compaction_tasks()
+                .map(CompactionTaskKind::Clustering)
+                .collect::<Vec<_>>(),
+            CompactionPlanKind::Ordinary(plan) => plan
+                .compaction_tasks()
+                .map(CompactionTaskKind::Ordinary)
+                .collect::<Vec<_>>(),
+        }
+        .into_iter()
+        .map(|task| {
+            let fragment_clustering_versions = task
+                .fragments()
+                .iter()
+                .filter_map(|fragment| {
+                    self.fragment_clustering_versions
+                        .get(&fragment.id)
+                        .map(|version| (fragment.id, *version))
+                })
+                .collect();
+            PyCompactionTask {
+                task,
+                fragment_clustering_versions,
+            }
+        })
+        .collect()
     }
 
     /// Get a JSON representation of the plan.
@@ -193,7 +379,11 @@ impl PyCompactionPlan {
     /// -------
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.0).map_err(|err| {
+        serde_json::to_string(&CompactionPlanState {
+            plan: self.plan.clone(),
+            fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+        })
+        .map_err(|err| {
             PyValueError::new_err(format!(
                 "Could not dump CompactionPlan due to error: {}",
                 err
@@ -213,13 +403,30 @@ impl PyCompactionPlan {
     /// CompactionPlan
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
-        let task = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load CompactionPlan due to error: {}",
-                err
-            ))
-        })?;
-        Ok(Self(task))
+        let (value, fragment_clustering_versions, is_clustering) = split_serialized_state(
+            &json,
+            "lance_clustering_compaction_plan_v1",
+            "fragment_clustering_versions",
+        )?;
+        let plan = if is_clustering {
+            CompactionPlanKind::Clustering(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load CompactionPlan due to error: {}",
+                    err
+                ))
+            })?)
+        } else {
+            CompactionPlanKind::Ordinary(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load CompactionPlan due to error: {}",
+                    err
+                ))
+            })?)
+        };
+        Ok(Self {
+            plan,
+            fragment_clustering_versions,
+        })
     }
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
@@ -234,8 +441,10 @@ impl PyCompactionPlan {
 
     pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
         match op {
-            CompareOp::Eq => Ok(self.0 == other.0),
-            CompareOp::Ne => Ok(self.0 != other.0),
+            CompareOp::Eq => Ok(self.plan == other.plan
+                && self.fragment_clustering_versions == other.fragment_clustering_versions),
+            CompareOp::Ne => Ok(self.plan != other.plan
+                || self.fragment_clustering_versions != other.fragment_clustering_versions),
             _ => Err(PyNotImplementedError::new_err(
                 "Only == and != are supported for CompactionTask",
             )),
@@ -245,7 +454,10 @@ impl PyCompactionPlan {
 
 #[pyclass(name = "CompactionTask", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
-pub struct PyCompactionTask(CompactionTask);
+pub struct PyCompactionTask {
+    task: CompactionTaskKind,
+    fragment_clustering_versions: FragmentClusteringVersions,
+}
 
 #[pymethods]
 impl PyCompactionTask {
@@ -258,24 +470,30 @@ impl PyCompactionTask {
             .join(", ");
         Ok(format!(
             "CompactionTask(read_version={}, fragments=[{}])",
-            self.0.read_version, fragment_reprs
+            self.task.read_version(),
+            fragment_reprs
         ))
     }
 
     /// int : The read version of the dataset that this task was created from.
     #[getter]
     pub fn read_version(&self) -> u64 {
-        self.0.read_version
+        self.task.read_version()
     }
 
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.
     #[getter]
     pub fn fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        self.0
-            .task
-            .fragments
+        self.task
+            .fragments()
             .iter()
-            .map(|f| wrap_fragment(py, f))
+            .map(|fragment| {
+                wrap_fragment(
+                    py,
+                    fragment,
+                    self.fragment_clustering_versions.get(&fragment.id).copied(),
+                )
+            })
             .collect()
     }
 
@@ -285,18 +503,21 @@ impl PyCompactionTask {
     pub fn execute(&self, dataset: Bound<PyAny>) -> PyResult<PyRewriteResult> {
         let dataset = unwrap_dataset(dataset)?;
         let dataset = dataset.borrow().clone();
-        let is_clustering = matches!(self.0.options.compaction_mode(), CompactionMode::Cluster);
-        let result = rt().block_on(
-            None,
-            async move { self.0.execute(dataset.ds.as_ref()).await },
-        )?;
-        let result = if is_clustering {
-            result.infer_error()?
-        } else {
-            result.io_error()?
+        let result = match &self.task {
+            CompactionTaskKind::Clustering(task) => RewriteResultKind::Clustering(
+                rt().block_on(None, task.execute(dataset.ds.as_ref()))?
+                    .infer_error()?,
+            ),
+            CompactionTaskKind::Ordinary(task) => RewriteResultKind::Ordinary(
+                rt().block_on(None, task.execute(dataset.ds.as_ref()))?
+                    .io_error()?,
+            ),
         };
 
-        Ok(PyRewriteResult(result))
+        Ok(PyRewriteResult {
+            result,
+            original_fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+        })
     }
 
     /// Get a JSON representation of the task.
@@ -309,7 +530,11 @@ impl PyCompactionTask {
     /// -------
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.0).map_err(|err| {
+        serde_json::to_string(&CompactionTaskState {
+            task: self.task.clone(),
+            fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+        })
+        .map_err(|err| {
             PyValueError::new_err(format!(
                 "Could not dump CompactionTask due to error: {}",
                 err
@@ -329,13 +554,30 @@ impl PyCompactionTask {
     /// CompactionTask
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
-        let task = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load CompactionTask due to error: {}",
-                err
-            ))
-        })?;
-        Ok(Self(task))
+        let (value, fragment_clustering_versions, is_clustering) = split_serialized_state(
+            &json,
+            "lance_clustering_compaction_task_v1",
+            "fragment_clustering_versions",
+        )?;
+        let task = if is_clustering {
+            CompactionTaskKind::Clustering(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load CompactionTask due to error: {}",
+                    err
+                ))
+            })?)
+        } else {
+            CompactionTaskKind::Ordinary(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load CompactionTask due to error: {}",
+                    err
+                ))
+            })?)
+        };
+        Ok(Self {
+            task,
+            fragment_clustering_versions,
+        })
     }
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
@@ -350,8 +592,10 @@ impl PyCompactionTask {
 
     pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
         match op {
-            CompareOp::Eq => Ok(self.0 == other.0),
-            CompareOp::Ne => Ok(self.0 != other.0),
+            CompareOp::Eq => Ok(self.task == other.task
+                && self.fragment_clustering_versions == other.fragment_clustering_versions),
+            CompareOp::Ne => Ok(self.task != other.task
+                || self.fragment_clustering_versions != other.fragment_clustering_versions),
             _ => Err(PyNotImplementedError::new_err(
                 "Only == and != are supported for CompactionTask",
             )),
@@ -367,7 +611,10 @@ impl PyCompactionTask {
 /// main process to be passed to :py:meth:`lance.optimize.Compaction.commit`.
 #[pyclass(name = "RewriteResult", module = "lance.optimize", from_py_object)]
 #[derive(Clone)]
-pub struct PyRewriteResult(RewriteResult);
+pub struct PyRewriteResult {
+    result: RewriteResultKind,
+    original_fragment_clustering_versions: FragmentClusteringVersions,
+}
 
 #[pymethods]
 impl PyRewriteResult {
@@ -379,7 +626,7 @@ impl PyRewriteResult {
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         let new_fragment_reprs: String = self
-            .original_fragments(py)?
+            .new_fragments(py)?
             .iter()
             .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
@@ -387,33 +634,45 @@ impl PyRewriteResult {
 
         Ok(format!(
             "RewriteResult(read_version={}, new_fragments=[{}], old_fragments=[{}])",
-            self.0.read_version, new_fragment_reprs, orig_fragment_reprs,
+            self.result.rewrite_result().read_version,
+            new_fragment_reprs,
+            orig_fragment_reprs,
         ))
     }
 
     /// int : The version of the dataset the optimize operation is based on.
     #[getter]
     pub fn read_version(&self) -> u64 {
-        self.0.read_version
+        self.result.rewrite_result().read_version
     }
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being replaced.
     #[getter]
     pub fn original_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        self.0
+        self.result
+            .rewrite_result()
             .original_fragments
             .iter()
-            .map(|f| wrap_fragment(py, f))
+            .map(|fragment| {
+                wrap_fragment(
+                    py,
+                    fragment,
+                    self.original_fragment_clustering_versions
+                        .get(&fragment.id)
+                        .copied(),
+                )
+            })
             .collect()
     }
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being added.
     #[getter]
     pub fn new_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        self.0
+        self.result
+            .rewrite_result()
             .new_fragments
             .iter()
-            .map(|f| wrap_fragment(py, f))
+            .map(|fragment| wrap_fragment(py, fragment, self.result.clustering_version()))
             .collect()
     }
 
@@ -427,7 +686,13 @@ impl PyRewriteResult {
     /// -------
     /// The JSON representation is not guaranteed to be stable across versions.
     pub fn json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.0).map_err(|err| {
+        serde_json::to_string(&RewriteResultState {
+            result: self.result.clone(),
+            original_fragment_clustering_versions: self
+                .original_fragment_clustering_versions
+                .clone(),
+        })
+        .map_err(|err| {
             PyValueError::new_err(format!(
                 "Could not dump RewriteResult due to error: {}",
                 err
@@ -438,19 +703,36 @@ impl PyRewriteResult {
     /// Load a result from a JSON representation.
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
-        let result = serde_json::from_str(&json).map_err(|err| {
-            PyValueError::new_err(format!(
-                "Could not load RewriteResult due to error: {}",
-                err
-            ))
-        })?;
-        Ok(Self(result))
+        let (value, original_fragment_clustering_versions, is_clustering) = split_serialized_state(
+            &json,
+            "lance_clustering_rewrite_result_v1",
+            "original_fragment_clustering_versions",
+        )?;
+        let result = if is_clustering {
+            RewriteResultKind::Clustering(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load RewriteResult due to error: {}",
+                    err
+                ))
+            })?)
+        } else {
+            RewriteResultKind::Ordinary(serde_json::from_value(value).map_err(|err| {
+                PyValueError::new_err(format!(
+                    "Could not load RewriteResult due to error: {}",
+                    err
+                ))
+            })?)
+        };
+        Ok(Self {
+            result,
+            original_fragment_clustering_versions,
+        })
     }
 
     /// CompactionMetrics : The metrics from this compaction task.
     #[getter]
     pub fn metrics(&self) -> PyResult<PyCompactionMetrics> {
-        Ok(self.0.metrics.clone().into())
+        Ok(self.result.rewrite_result().metrics.clone().into())
     }
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
@@ -465,8 +747,12 @@ impl PyRewriteResult {
 
     pub fn __richcmp__(&self, other: Self, op: CompareOp) -> PyResult<bool> {
         match op {
-            CompareOp::Eq => Ok(self.0 == other.0),
-            CompareOp::Ne => Ok(self.0 != other.0),
+            CompareOp::Eq => Ok(self.result == other.result
+                && self.original_fragment_clustering_versions
+                    == other.original_fragment_clustering_versions),
+            CompareOp::Ne => Ok(self.result != other.result
+                || self.original_fragment_clustering_versions
+                    != other.original_fragment_clustering_versions),
             _ => Err(PyNotImplementedError::new_err(
                 "Only == and != are supported for RewriteResult",
             )),
@@ -511,18 +797,17 @@ impl PyCompaction {
         // aren't holding the GIL while blocking the thread on the operation.
         let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
-        let opts = parse_compaction_options(options, &config)?;
-        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
+        let (opts, is_clustering) = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
-        let fut = compact_files(&mut new_ds, opts, None);
-        let result = rt().block_on(None, fut)?;
-        let metrics = if is_clustering {
-            result.infer_error()?
+        let result = if is_clustering {
+            rt().block_on(None, compact_files_with_clustering(&mut new_ds, opts))?
+                .infer_error()?
         } else {
-            result.io_error()?
+            rt().block_on(None, compact_files(&mut new_ds, opts, None))?
+                .io_error()?
         };
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
-        Ok(metrics.into())
+        Ok(result.into())
     }
 
     /// Plan a compaction operation.
@@ -549,17 +834,37 @@ impl PyCompaction {
         // aren't holding the GIL while blocking the thread on the operation.
         let options = options.cast::<PyDict>()?;
         let config = dataset.ds.manifest.config.clone();
-        let opts = parse_compaction_options(options, &config)?;
-        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
-        let result = rt().block_on(None, async move {
-            plan_compaction(dataset.ds.as_ref(), &opts).await
-        })?;
+        let (opts, is_clustering) = parse_compaction_options(options, &config)?;
         let plan = if is_clustering {
-            result.infer_error()?
+            CompactionPlanKind::Clustering(
+                rt().block_on(None, plan_clustering_compaction(dataset.ds.as_ref(), &opts))?
+                    .infer_error()?,
+            )
         } else {
-            result.io_error()?
+            CompactionPlanKind::Ordinary(
+                rt().block_on(None, plan_compaction(dataset.ds.as_ref(), &opts))?
+                    .io_error()?,
+            )
         };
-        Ok(PyCompactionPlan(plan))
+        let planned_fragment_ids = plan
+            .task_data()
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .collect::<std::collections::HashSet<_>>();
+        let fragment_clustering_versions = planned_fragment_ids
+            .into_iter()
+            .filter_map(|fragment_id| {
+                dataset
+                    .ds
+                    .manifest()
+                    .fragment_clustering_version(fragment_id)
+                    .map(|version| (fragment_id, version))
+            })
+            .collect();
+        Ok(PyCompactionPlan {
+            plan,
+            fragment_clustering_versions,
+        })
     }
 
     /// Commit a compaction operation.
@@ -593,26 +898,84 @@ impl PyCompaction {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = dataset_ref.borrow().clone();
         let config = dataset.ds.manifest.config.clone();
-        let opts = match options {
+        let explicit_clustering = options
+            .as_ref()
+            .and_then(|dict| dict.get_item("compaction_mode").ok().flatten())
+            .and_then(|value| value.extract::<Option<String>>().ok().flatten())
+            .map(|mode| mode.eq_ignore_ascii_case("cluster"));
+        let (mut opts, configured_clustering) = match options {
             Some(ref dict) => parse_compaction_options(dict, &config)?,
-            None => CompactionOptions::default(),
+            None => (CompactionOptions::default(), false),
         };
-        let is_clustering = matches!(opts.compaction_mode(), CompactionMode::Cluster);
-        let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
+        let result_kind = rewrites.first().map(|rewrite| match rewrite.result {
+            RewriteResultKind::Clustering(_) => true,
+            RewriteResultKind::Ordinary(_) => false,
+        });
+        if rewrites
+            .iter()
+            .any(|rewrite| matches!(rewrite.result, RewriteResultKind::Clustering(_)))
+            && rewrites
+                .iter()
+                .any(|rewrite| matches!(rewrite.result, RewriteResultKind::Ordinary(_)))
+        {
+            return Err(PyValueError::new_err(
+                "cannot commit a mixture of ordinary and clustering RewriteResult values",
+            ));
+        }
+        if let (Some(requested), Some(actual)) = (explicit_clustering, result_kind)
+            && requested != actual
+        {
+            return Err(PyValueError::new_err(
+                "compaction_mode cannot change the operation kind carried by RewriteResult",
+            ));
+        }
+        let is_clustering = result_kind.unwrap_or(configured_clustering);
+        if is_clustering {
+            opts.compaction_mode = Some(CompactionMode::Reencode);
+            #[allow(deprecated)]
+            {
+                opts.enable_binary_copy = false;
+                opts.enable_binary_copy_force = false;
+            }
+        }
         let mut new_ds = dataset.ds.as_ref().clone();
-        let fut = commit_compaction(
-            &mut new_ds,
-            rewrites,
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &opts,
-        );
-        let result = rt().block_on(None, fut)?;
-        let metrics = if is_clustering {
-            result.infer_error()?
+        let result = if is_clustering {
+            let rewrites = rewrites
+                .into_iter()
+                .map(|rewrite| match rewrite.result {
+                    RewriteResultKind::Clustering(result) => Ok(result),
+                    RewriteResultKind::Ordinary(_) => Err(PyValueError::new_err(
+                        "ordinary RewriteResult cannot be committed as clustering compaction",
+                    )),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            rt().block_on(
+                None,
+                commit_clustering_compaction(&mut new_ds, rewrites, &opts),
+            )?
+            .infer_error()?
         } else {
-            result.io_error()?
+            let rewrites = rewrites
+                .into_iter()
+                .map(|rewrite| match rewrite.result {
+                    RewriteResultKind::Ordinary(result) => Ok(result),
+                    RewriteResultKind::Clustering(_) => Err(PyValueError::new_err(
+                        "clustering RewriteResult cannot be committed as ordinary compaction",
+                    )),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            rt().block_on(
+                None,
+                commit_compaction(
+                    &mut new_ds,
+                    rewrites,
+                    Arc::new(DatasetIndexRemapperOptions::default()),
+                    &opts,
+                ),
+            )?
+            .io_error()?
         };
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
-        Ok(metrics.into())
+        Ok(result.into())
     }
 }

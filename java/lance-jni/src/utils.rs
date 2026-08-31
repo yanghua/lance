@@ -8,7 +8,10 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions};
+use lance::dataset::optimize::{
+    CompactionMode, CompactionOptions, CompactionRequest,
+    resolve_compaction_options_from_dataset_config,
+};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -105,8 +108,12 @@ pub fn extract_write_params(
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: &JObject,     // Optional<Long>
     cluster_by: Option<&JObject>,                // Optional<List<String>>
-) -> Result<WriteParams> {
+) -> Result<(WriteParams, Option<Vec<String>>)> {
     let mut write_params = WriteParams::default();
+    let cluster_by_columns = match cluster_by {
+        Some(cluster_by) => env.get_strings_opt(cluster_by)?,
+        None => None,
+    };
 
     if let Some(max_rows_per_file_val) = env.get_int_opt(max_rows_per_file)? {
         write_params.max_rows_per_file = max_rows_per_file_val as usize;
@@ -159,21 +166,6 @@ pub fn extract_write_params(
         write_params.blob_pack_file_size_threshold = Some(max_bytes as usize);
     }
 
-    // A column-list request uses default tuning for a one-shot write. If the
-    // destination already declares these columns, the Rust write path resolves
-    // the declaration's full curve, version, and bit width.
-    if let Some(cluster_by) = cluster_by
-        && let Some(columns) = env.get_strings_opt(cluster_by)?
-    {
-        write_params.cluster_by = Some(
-            lance_index::clustering::ClusteringSpec::new(
-                columns,
-                lance_index::clustering::ClusteringCurve::default(),
-            )
-            .map_err(|e| Error::input_error(e.to_string()))?,
-        );
-    }
-
     // Create storage options accessor from static storage_options
     let accessor = if storage_options.is_empty() {
         None
@@ -190,7 +182,7 @@ pub fn extract_write_params(
     for (base_path, store_params) in base_store_params {
         write_params = write_params.with_base_store_params(base_path, store_params);
     }
-    Ok(write_params)
+    Ok((write_params, cluster_by_columns))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,16 +204,69 @@ pub fn build_compaction_options(
     excluded_fragment_ids: &JObject,           // List<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
-    let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
+    match build_compaction_request(
+        env,
+        target_rows_per_fragment,
+        max_rows_per_group,
+        max_bytes_per_file,
+        materialize_deletions,
+        materialize_deletions_threshold,
+        num_threads,
+        batch_size,
+        defer_index_remap,
+        compaction_mode,
+        binary_copy_read_batch_bytes,
+        max_source_fragments,
+        max_source_rows,
+        max_source_bytes,
+        excluded_fragment_ids,
+        config,
+    )? {
+        CompactionRequest::Compaction(options) => Ok(options),
+        CompactionRequest::Clustering(_) => Err(Error::input_error(
+            "clustering compaction requires the dedicated clustering API".to_string(),
+        )),
+    }
+}
 
-    if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
-        compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
+/// Build an explicit ordinary-versus-clustering request from Java options.
+///
+/// Java retains `cluster` as a serialized enum value for compatibility. Rust
+/// represents clustering as a distinct request and normalizes its low-level
+/// rewrite mode to `Reencode`, keeping ordinary and row-reordering payloads
+/// separate at every native boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn build_compaction_request(
+    env: &mut JNIEnv,
+    target_rows_per_fragment: &JObject,
+    max_rows_per_group: &JObject,
+    max_bytes_per_file: &JObject,
+    materialize_deletions: &JObject,
+    materialize_deletions_threshold: &JObject,
+    num_threads: &JObject,
+    batch_size: &JObject,
+    defer_index_remap: &JObject,
+    compaction_mode: &JObject,
+    binary_copy_read_batch_bytes: &JObject,
+    max_source_fragments: &JObject,
+    max_source_rows: &JObject,
+    max_source_bytes: &JObject,
+    excluded_fragment_ids: &JObject,
+    config: &std::collections::HashMap<String, String>,
+) -> Result<CompactionRequest> {
+    let configured_request = resolve_compaction_options_from_dataset_config(config)?;
+    let mut is_clustering = matches!(configured_request, CompactionRequest::Clustering(_));
+    let mut compaction_options = configured_request.into_options();
+
+    if let Some(value) = env.get_long_opt(target_rows_per_fragment)? {
+        compaction_options.target_rows_per_fragment =
+            non_negative_usize("targetRowsPerFragment", value)?;
     }
-    if let Some(max_rows_per_group_val) = env.get_long_opt(max_rows_per_group)? {
-        compaction_options.max_rows_per_group = max_rows_per_group_val as usize;
+    if let Some(value) = env.get_long_opt(max_rows_per_group)? {
+        compaction_options.max_rows_per_group = non_negative_usize("maxRowsPerGroup", value)?;
     }
-    if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
-        compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    if let Some(value) = env.get_long_opt(max_bytes_per_file)? {
+        compaction_options.max_bytes_per_file = Some(non_negative_usize("maxBytesPerFile", value)?);
     }
     if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
         compaction_options.materialize_deletions = materialize_deletions_val;
@@ -231,33 +276,37 @@ pub fn build_compaction_options(
     {
         compaction_options.materialize_deletions_threshold = materialize_deletions_threshold_val;
     }
-    if let Some(num_threads_val) = env.get_long_opt(num_threads)? {
-        compaction_options.num_threads = Some(num_threads_val as usize);
+    if let Some(value) = env.get_long_opt(num_threads)? {
+        compaction_options.num_threads = Some(non_negative_usize("numThreads", value)?);
     }
-    if let Some(batch_size_val) = env.get_long_opt(batch_size)? {
-        compaction_options.batch_size = Some(batch_size_val as usize);
+    if let Some(value) = env.get_long_opt(batch_size)? {
+        compaction_options.batch_size = Some(non_negative_usize("batchSize", value)?);
     }
     if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
         compaction_options.defer_index_remap = defer_index_remap_val;
     }
     if let Some(compaction_mode_val) = env.get_string_opt(compaction_mode)? {
-        compaction_options.compaction_mode =
-            Some(CompactionMode::try_from(compaction_mode_val.as_str())?);
+        is_clustering = compaction_mode_val.eq_ignore_ascii_case("cluster");
+        if is_clustering {
+            compaction_options.compaction_mode = Some(CompactionMode::Reencode);
+        } else {
+            compaction_options.compaction_mode =
+                Some(CompactionMode::try_from(compaction_mode_val.as_str())?);
+        }
     }
-    if let Some(binary_copy_read_batch_bytes_val) =
-        env.get_long_opt(binary_copy_read_batch_bytes)?
-    {
+    if let Some(value) = env.get_long_opt(binary_copy_read_batch_bytes)? {
         compaction_options.binary_copy_read_batch_bytes =
-            Some(binary_copy_read_batch_bytes_val as usize);
+            Some(non_negative_usize("binaryCopyReadBatchBytes", value)?);
     }
-    if let Some(max_source_fragments_val) = env.get_long_opt(max_source_fragments)? {
-        compaction_options.max_source_fragments = Some(max_source_fragments_val as usize);
+    if let Some(value) = env.get_long_opt(max_source_fragments)? {
+        compaction_options.max_source_fragments =
+            Some(non_negative_usize("maxSourceFragments", value)?);
     }
-    if let Some(max_source_rows_val) = env.get_long_opt(max_source_rows)? {
-        compaction_options.max_source_rows = Some(max_source_rows_val as usize);
+    if let Some(value) = env.get_long_opt(max_source_rows)? {
+        compaction_options.max_source_rows = Some(non_negative_usize("maxSourceRows", value)?);
     }
-    if let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)? {
-        compaction_options.max_source_bytes = Some(max_source_bytes_val as u64);
+    if let Some(value) = env.get_long_opt(max_source_bytes)? {
+        compaction_options.max_source_bytes = Some(non_negative_u64("maxSourceBytes", value)?);
     }
     compaction_options.excluded_fragment_ids = env
         .get_longs(excluded_fragment_ids)?
@@ -273,7 +322,27 @@ pub fn build_compaction_options(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(compaction_options)
+    if is_clustering {
+        Ok(CompactionRequest::Clustering(compaction_options))
+    } else {
+        Ok(CompactionRequest::Compaction(compaction_options))
+    }
+}
+
+fn non_negative_usize(name: &str, value: i64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::input_error(format!(
+            "{name} must be a non-negative integer that fits usize, got {value}"
+        ))
+    })
+}
+
+fn non_negative_u64(name: &str, value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        Error::input_error(format!(
+            "{name} must be a non-negative integer, got {value}"
+        ))
+    })
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>

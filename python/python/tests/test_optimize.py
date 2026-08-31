@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import CompactionPlan, CompactionTask, RewriteResult
 from lance.vector import vec_to_table
 
 
@@ -601,9 +601,15 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     )
     assert plan.read_version == 1
     assert plan.num_tasks() == 2
+    assert "lance_clustering_compaction_plan_v1" not in plan.json()
     assert plan.tasks[0].fragments == [frag.metadata for frag in fragments[0:2]]
     assert plan.tasks[1].fragments == [frag.metadata for frag in fragments[2:4]]
     assert repr(plan) == "CompactionPlan(read_version=1, tasks=<2 compaction tasks>)"
+    assert all(
+        fragment.clustering_version is None
+        for task in CompactionPlan.from_json(plan.json()).tasks
+        for fragment in task.fragments
+    )
 
     excluded_plan = Compaction.plan(
         dataset,
@@ -635,6 +641,11 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     pickled_task = pickle.dumps(plan.tasks[0])
     task = pickle.loads(pickled_task)
     assert task == plan.tasks[0]
+    assert "lance_clustering_compaction_task_v1" not in task.json()
+    assert all(
+        fragment.clustering_version is None
+        for fragment in CompactionTask.from_json(task.json()).fragments
+    )
 
     result1 = plan.tasks[0].execute(dataset)
     result1.metrics.fragments_removed == 2
@@ -644,6 +655,18 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     result = pickle.loads(pickled_result)
     assert isinstance(result, RewriteResult)
     assert result == result1
+    assert "lance_clustering_rewrite_result_v1" not in result.json()
+    result_from_json = RewriteResult.from_json(result.json())
+    assert all(
+        fragment.clustering_version is None
+        for fragment in result_from_json.original_fragments
+    )
+    assert all(
+        fragment.clustering_version is None
+        for fragment in result_from_json.new_fragments
+    )
+    with pytest.raises(ValueError, match="cannot change the operation kind"):
+        Compaction.commit(dataset, [result], options=dict(compaction_mode="cluster"))
     assert re.match(
         r"RewriteResult\(read_version=1, new_fragments=\[.+\], old_fragments=\[.+\]\)",
         repr(result),
@@ -654,6 +677,29 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert metrics.fragments_added == 1
     # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
+
+
+def test_compaction_json_rejects_hybrid_payloads(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(400)}),
+        tmp_path / "dataset",
+        max_rows_per_file=200,
+    )
+    plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=400, num_threads=1)
+    )
+    task = plan.tasks[0]
+    result = task.execute(dataset)
+
+    for state, clustering_tag in (
+        (plan, "lance_clustering_compaction_plan_v1"),
+        (task, "lance_clustering_compaction_task_v1"),
+        (result, "lance_clustering_rewrite_result_v1"),
+    ):
+        hybrid_payload = json.loads(state.json())
+        hybrid_payload[clustering_tag] = {}
+        with pytest.raises(ValueError, match="cannot contain ordinary payload fields"):
+            type(state).from_json(json.dumps(hybrid_payload))
 
 
 def test_migration_via_fragment_apis(tmp_path):
@@ -875,14 +921,17 @@ def test_write_cluster_by_sorts_fragments(tmp_path: Path):
 
 def test_write_dataset_inherits_declared_clustering_tuning(tmp_path: Path):
     base_dir = tmp_path / "dataset"
-    dataset = lance.write_dataset(pa.table({"k": [1, 2, 3]}), base_dir)
-    dataset.set_clustering(["k"], curve="zorder", version=7, bits_per_dim=32)
+    columns = [f"k{i}" for i in range(9)]
+    dataset = lance.write_dataset(
+        pa.table({column: [1, 2, 3] for column in columns}), base_dir
+    )
+    dataset.set_clustering(columns, curve="zorder", version=7, bits_per_dim=8)
 
     dataset = lance.write_dataset(
-        pa.table({"k": [6, 4, 5]}),
+        pa.table({column: [6, 4, 5] for column in columns}),
         dataset,
         mode="append",
-        cluster_by=["k"],
+        cluster_by=columns,
     )
 
     assert dataset.get_fragments()[-1].metadata.clustering_version == 7
@@ -894,6 +943,16 @@ def test_write_cluster_by_rejects_unknown_column(tmp_path: Path):
             pa.table({"k": [1, 2, 3]}),
             tmp_path,
             cluster_by=["missing"],
+        )
+
+
+def test_write_cluster_by_rejects_schema_only_create(tmp_path: Path):
+    with pytest.raises(ValueError, match="schema-only dataset creation"):
+        lance.write_dataset(
+            [],
+            tmp_path / "dataset",
+            schema=pa.schema([pa.field("k", pa.int32())]),
+            cluster_by=["k"],
         )
 
 
@@ -964,6 +1023,90 @@ def test_recluster_compaction_sorts_under_clustered(tmp_path: Path):
     metrics = dataset.optimize.compact_files(compaction_mode="cluster", num_threads=1)
     assert metrics.fragments_removed == 0
     assert dataset.version == version_before
+
+
+def test_distributed_recluster_preserves_fragment_clustering_versions(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    keys = [(i * 37 + 11) % 1000 for i in range(1000)]
+    dataset = lance.write_dataset(
+        pa.table({"k": pa.array(keys[:500], pa.int32())}),
+        base_dir,
+        max_rows_per_file=250,
+    )
+    dataset.set_clustering(["k"], curve="hilbert", version=6, bits_per_dim=32)
+    dataset = lance.write_dataset(
+        pa.table({"k": pa.array(keys[500:], pa.int32())}),
+        dataset,
+        mode="append",
+        max_rows_per_file=250,
+        cluster_by=["k"],
+    )
+    dataset.set_clustering(["k"], curve="hilbert", version=7, bits_per_dim=32)
+
+    plan = Compaction.plan(
+        dataset,
+        options=dict(
+            compaction_mode="cluster",
+            target_rows_per_fragment=100_000,
+            num_threads=1,
+        ),
+    )
+    assert "lance_clustering_compaction_plan_v1" in plan.json()
+    for round_trip in (
+        lambda value: type(value).from_json(value.json()),
+        lambda value: pickle.loads(pickle.dumps(value)),
+    ):
+        plan = round_trip(plan)
+        assert isinstance(plan, CompactionPlan)
+        assert {
+            fragment.clustering_version for fragment in plan.tasks[0].fragments
+        } == {None, 6}
+
+    task = plan.tasks[0]
+    assert "lance_clustering_compaction_task_v1" in task.json()
+    for round_trip in (
+        lambda value: type(value).from_json(value.json()),
+        lambda value: pickle.loads(pickle.dumps(value)),
+    ):
+        task = round_trip(task)
+        assert isinstance(task, CompactionTask)
+        assert {fragment.clustering_version for fragment in task.fragments} == {None, 6}
+
+    result = task.execute(dataset)
+    assert "lance_clustering_rewrite_result_v1" in result.json()
+    for round_trip in (
+        lambda value: type(value).from_json(value.json()),
+        lambda value: pickle.loads(pickle.dumps(value)),
+    ):
+        result = round_trip(result)
+        assert isinstance(result, RewriteResult)
+        assert {fragment.clustering_version for fragment in result.new_fragments} == {7}
+        assert {
+            fragment.clustering_version for fragment in result.original_fragments
+        } == {None, 6}
+
+    ordinary_plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=100_000, num_threads=1)
+    )
+    ordinary_result = ordinary_plan.tasks[0].execute(dataset)
+    with pytest.raises(ValueError, match="mixture of ordinary and clustering"):
+        Compaction.commit(dataset, [result, ordinary_result])
+    with pytest.raises(ValueError, match="cannot change the operation kind"):
+        Compaction.commit(dataset, [result], options=dict(compaction_mode="reencode"))
+
+    # Omitted commit options use CompactionOptions defaults. In particular,
+    # coordinator-side config changes after task execution cannot enable an
+    # unsupported clustering option or switch the result to an ordinary mode.
+    dataset.update_config(
+        {
+            "lance.compaction.defer_index_remap": "true",
+            "lance.compaction.compaction_mode": "force_binary_copy",
+        }
+    )
+    Compaction.commit(dataset, [result])
+    assert {
+        fragment.metadata.clustering_version for fragment in dataset.get_fragments()
+    } == {7}
 
 
 def test_recluster_compaction_requires_spec(tmp_path: Path):
