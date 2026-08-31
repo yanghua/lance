@@ -6,9 +6,11 @@ lance-format/lance#1045 (EPIC: statistics and data skipping), lance-format/lance
 partitioning, closed not-planned), lance-format/lance#6803 (recluster task for row-id healing).
 
 > This document describes the implemented core of Databricks-style "liquid clustering" in Lance
-> and the remaining follow-up work. A clustering layout is declared once, inherited by subsequent
-> append and overwrite writes, and maintained by explicit clustering compaction. Separately
-> declared zonemap indices can consume the resulting locality for data skipping.
+> and the remaining follow-up work. A clustering layout is declared once, inherited by normal
+> `InsertBuilder` append and overwrite writes, and maintained by explicit clustering compaction.
+> Update and merge-insert paths do not sort immediately; fragments whose layout they change remain
+> or become under-clustered and are handled by a later clustering compaction. Separately declared
+> zonemap indices can consume the resulting locality for data skipping.
 
 ## 1. Background and motivation
 
@@ -41,9 +43,9 @@ surfaces on top.
 
 Legacy `ZORDER BY` + Hive-style partitioning requires the user to pick partition columns up front,
 suffers small-file / skew problems, and needs full rewrites to change layout. Liquid clustering
-replaces both: clustering keys are declared once and can change without an immediate rewrite. New
-writes inherit the active declaration, while explicit clustering compaction brings older fragments
-into the current layout.
+replaces both: clustering keys are declared once and can change without an immediate rewrite. Normal
+append and overwrite writes inherit the active declaration, while explicit clustering compaction
+brings older fragments and fragments changed by other write paths into the current layout.
 
 ## 2. Goals and non-goals
 
@@ -51,8 +53,9 @@ into the current layout.
 
 1. Declare clustering keys on a dataset (`Dataset::set_clustering`), persisted in table metadata.
    SQL `CLUSTER BY (a, b, ...)` connector support is future work.
-2. Cluster newly written data by those keys using a multi-column space-filling curve
-   (Z-order/Hilbert), so each fragment/file is value-coherent across all key columns.
+2. Cluster writes that explicitly request it, and normal append/overwrite writes that inherit the
+   declaration, using a multi-column space-filling curve (Z-order/Hilbert), so each fragment/file is
+   value-coherent across all key columns.
 3. Re-cluster with an `OPTIMIZE`-driven task that picks up under-clustered data and merges it into
    the clustered layout. Optional source budgets can bound the amount of data touched per run.
 4. Change clustering keys without rewriting already-clustered data; new keys apply to future
@@ -103,9 +106,11 @@ Three cooperating pieces, all in Rust core:
   readers and writers that predate this contract.
 - **`SpaceFillingEncoder`** turns N key columns into a single 1-D ordering value using a
   space-filling curve. Sorting by this value gives multi-dimensional locality.
-- **The write path** optionally sorts each incoming batch stream by the clustering value before
-  fragment rolling. On append, the normal index-seed path may also seed a separately declared
-  zonemap index when that index has seeding enabled.
+- **The normal insert write path** optionally sorts each incoming batch stream by the clustering
+  value before fragment rolling. On append, the normal index-seed path may also seed a separately
+  declared zonemap index when that index has seeding enabled. Update and merge-insert do not run this
+  sort; changed or newly produced fragments without an authoritative clustering stamp are selected by
+  later clustering compaction.
 - **A clustering-aware compaction planner** selects under-clustered fragments and rewrites them
   through a reorder-enabled path. Optional source budgets make this incremental across runs; the
   defaults impose no source-volume limit.
@@ -155,9 +160,13 @@ Rationale: `config` is already an additive `HashMap<String,String>` mutated thro
 `UpdateConfig` operation (`rust/lance/src/dataset/metadata.rs`), so changing the desired layout is a
 cheap metadata-only commit. The complete declaration is updated atomically. Any change to columns,
 curve, or bit width must increase the layout version so existing fragments become eligible for
-incremental reclustering. Manifests carrying the declaration set both the clustering reader and
-writer feature flags, so older implementations do not open the dataset while ignoring the new
-invariants.
+incremental reclustering. Increasing only the version is also allowed and forces all fragments with
+an older stamp to become eligible again. Clearing the declaration retains existing fragment stamps;
+re-enabling clustering must therefore use a version greater than the maximum retained stamp. Every
+manifest build validates the complete declaration against the resulting schema, so a schema change
+cannot leave an active clustering column missing, nested, or of an unsupported type. Manifests
+carrying the declaration set both the clustering reader and writer feature flags, so older
+implementations do not open the dataset while ignoring the new invariants.
 
 **Per-fragment "clustered-at" marker.** To make re-clustering incremental we must know which
 fragments are already clustered under the current spec. The implemented marker records the
@@ -166,7 +175,8 @@ active declared clustering `version` that governed a fragment's write. A fragmen
 `lance.clustering.version`; an absent, older, or unexpected future stamp is selected. A one-shot
 sort on an undeclared dataset therefore remains unstamped.
 
-The protobuf `DataFragment.clustering_version` field (number 12, `0` = unset) persists this stamp.
+The protobuf scalar `DataFragment.clustering_version` field (number 12, `0` = unset) persists this
+stamp.
 In Rust, decoded stamps are kept in a private `Manifest` sidecar aligned positionally with
 `Manifest::fragments`; they are not fields on the public `Fragment` type. Manifest serialization
 writes the sidecar values back to `DataFragment.clustering_version`. A reader-and-writer feature
@@ -195,7 +205,17 @@ Effective write behavior:
    declaration, explicit columns must exactly match it. On a new or undeclared dataset, explicit
    columns request a one-shot sort and do not declare or stamp a persistent layout. Low-level
    multi-fragment writes must pass explicit columns through `FragmentCreateBuilder`; omitting them
-   does not inherit the declaration.
+   does not inherit the declaration. Update and merge-insert intentionally omit the clustering spec:
+   they preserve stamps only for fragments whose layout metadata is unchanged, while changed or new
+   fragments are left unstamped for a later clustering compaction.
+   The public Rust `FragmentCreateBuilder::write_fragments` return type contains only
+   `Vec<Fragment>`, so it does not transport the private manifest-sidecar version to a later manual
+   commit. Java's distributed fragment API calls the hidden
+   `write_fragments_with_clustering_version` transport directly. Python instead writes through
+   `InsertBuilder::execute_uncommitted_stream`, extracts the reserved version from the resulting
+   transaction, and carries it alongside exported fragment metadata. A Rust caller that separates
+   fragment writing from commit must likewise preserve the transaction's reserved
+   clustering-version marker; otherwise the sorted fragments are committed without a stamp.
 2. **Sort** the write's batch stream by the encoded clustering value before fragments are written.
    *(Implemented: `lance_index::clustering::cluster_sort_stream`, a `SortExec` over a hidden
    `FixedSizeBinary` ordering column, spilling to disk for large inputs.)* Oversized input batches
@@ -211,7 +231,9 @@ Effective write behavior:
    Automatic deferred zonemap declaration from the clustering spec is future work.
 4. **Stamp** each committed fragment governed by the active declaration with the current
    clustering version (§5). The write transaction carries the resolved version internally until
-   final fragment IDs are assigned; manifest construction then reconciles the private sidecar.
+   final fragment IDs are assigned; manifest construction then reconciles the private sidecar. It
+   preserves a prior stamp only when the fragment's layout-identifying metadata is unchanged and
+   clears the stamp when a non-clustering rewrite changes that layout.
 
 Connectors keep their current role: Spark's `RequiresDistributionAndOrdering` can still pre-sort at
 the engine for scale; the core sort is the correctness backstop when the engine does not.
@@ -231,7 +253,8 @@ version and re-sort rows through the private clustering rewrite strategy before
 `ClusteringRewriteResult`; `commit_clustering_compaction` validates and commits those results, then
 records the task's clustering version after final fragment IDs are assigned. Clustering requires
 the existing `CompactionMode::Reencode` behavior and does not use binary copy. Output still respects
-`target_rows_per_fragment` / `max_bytes_per_file`.
+the writer semantics of `target_rows_per_fragment` / `max_bytes_per_file`: the row target is passed
+as `WriteParams::max_rows_per_file`, while the byte limit remains the writer's existing soft limit.
 
 `compact_files_with_clustering` is the single-process convenience entry point over that same flow:
 it plans with `plan_clustering_compaction`, executes the dedicated tasks, and commits with
@@ -240,8 +263,11 @@ it plans with `plan_clustering_compaction`, executes the dedicated tasks, and co
 **Incremental planner. (implemented)** The dedicated `ClusteringCompactionPlanner` selects
 *under-clustered* fragments — those whose
 manifest-sidecar stamp does not equal the dataset's current `ClusteringSpec::version` — groups
-adjacent ones up to `target_rows_per_fragment`, and honors the optional `max_source_fragments`,
-`max_source_rows`, and `max_source_bytes` budgets. All three source budgets default to `None`, so
+adjacent whole source fragments until the accumulated live rows reach or exceed
+`target_rows_per_fragment`, and honors the optional `max_source_fragments`, `max_source_rows`, and
+`max_source_bytes` budgets. Because source fragments are not split during planning, a task can exceed
+`target_rows_per_fragment`; the option is separately forwarded to the output writer as
+`max_rows_per_file` during rewriting. All three source budgets default to `None`, so
 clustering compaction is unbounded by source volume unless the caller or dataset config sets at
 least one. When several are set, all are hard upper bounds: planning stops before the next eligible
 fragment would exceed any one. Rows mean live rows; bytes include source data and overlay files but
@@ -252,12 +278,20 @@ adjacency so it is left untouched, and a second run at the same version is a no-
 **Distributed operation separation.** `ClusteringCompactionTask` and
 `ClusteringRewriteResult` use dedicated, version-tagged serialized envelopes rather than the
 ordinary `CompactionTask` and `RewriteResult` payloads. The tags prevent accidental cross-routing
-between order-preserving and row-reordering work. Task execution validates its read snapshot and
-clustering declaration; `commit_clustering_compaction` requires one read version and clustering
-version across all results and checks that version against the declaration at the task snapshot
-before reserving fragment IDs. These checks provide operation separation and consistency
-validation; they are not cryptographic proof against a caller that already has direct transaction
-or file authority.
+between order-preserving and row-reordering work. Task execution checks out the declared read version
+and validates the clustering declaration and clustering-specific dataset restrictions at that
+snapshot. It does **not** compare caller-provided `TaskData` fragment descriptors with the manifest's
+fragment descriptors at that version. `commit_clustering_compaction` requires one read version and
+clustering version across all results and checks that version against the declaration at the task
+snapshot before reserving fragment IDs. It does not verify complete original-fragment identity or
+that output fragments preserve the input live-row count. The serialized task/result boundary is
+therefore a trusted-worker boundary, not an attestation of the referenced files or rewrite contents.
+Distributed callers must provide valid, non-empty fragment descriptors corresponding to the stated
+snapshot and preserve the tagged execution results unchanged. Planner-produced tasks satisfy the
+descriptor requirement, but provenance is not enforced: the public constructor also accepts
+caller-built `TaskData`. It currently accepts an empty fragment list and execution returns an empty
+result, but committing that result is unsupported: the lower rewrite path assumes each group has at
+least one original fragment and can panic.
 
 *Not yet done:* pulling in overlapping already-clustered fragments so new data merges into the
 right place (the planner currently only reclusters under-clustered fragments among themselves), and
@@ -299,7 +333,10 @@ Centralize resolution and validation in Rust while keeping the binding-level nam
   `commit_clustering_compaction`, or the single-process `compact_files_with_clustering` helper.
   `CompactionMode` has no clustering variant; `CompactionRequest::Clustering` is the separate
   request discriminator and carries options normalized to `CompactionMode::Reencode`.
-  `WriteParams` contains no clustering field. *(Implemented.)*
+  `WriteParams` contains no clustering field. `FragmentCreateBuilder::write_fragments` sorts but
+  does not expose the declaration version needed by a separate manual commit; the hidden
+  `write_fragments_with_clustering_version` API exists for binding transports. *(Implemented with
+  that low-level transport limitation.)*
 - **Python: (implemented)** `write_dataset(..., cluster_by=["a", "b"])`;
   `dataset.set_clustering(columns, *, curve, version, bits_per_dim)` /
   `dataset.clustering_spec()` (returns a dict or `None`) / `dataset.clear_clustering()`;
@@ -337,6 +374,9 @@ Centralize resolution and validation in Rust while keeping the binding-level nam
    fine enough; do we couple the default zone size to the clustering config?
 5. **Concurrency.** Recluster is a rewrite; confirm conflict resolution with concurrent
    appends/updates matches existing compaction guarantees (it should, since it reuses that path).
+6. **Distributed payload hardening.** Validate task fragment descriptors against the immutable read
+   snapshot, reject empty tasks/results at API boundaries, and verify row-count preservation before
+   committing worker output.
 
 ## 11. Phased delivery
 
@@ -350,17 +390,23 @@ Centralize resolution and validation in Rust while keeping the binding-level nam
   lists separately from `WriteParams`, resolve the private spec from the dataset on append and
   overwrite, and sort with `cluster_sort_stream`. Commits stamp fragments governed by the active
   declaration in the private manifest sidecar. An explicit one-shot sort on a new or undeclared
-  dataset is not stamped. Inline zonemap seeding from the clustering spec is deferred to Phase 4.
+  dataset is not stamped. Update and merge-insert do not inherit the sort; changed/new fragments from
+  those paths are left under-clustered. Low-level Rust fragment writes must preserve the separately
+  returned clustering-version transport when committing if their outputs are to be stamped.
+  Automatic zonemap declaration from the clustering spec is deferred to Phase 4; inline seeding of a
+  separately declared zonemap already uses the existing index-seed path.
 - **Phase 3 — incremental recluster. (implemented, partial)** The dedicated
   `ClusteringCompactionPlanner` / `plan_clustering_compaction` path selects under-clustered
   fragments and emits `ClusteringCompactionTask` values whose execution reorders rows by the
   clustering key. It honors any configured per-run source budgets (which are unbounded by default);
   `ClusteringRewriteResult` values are committed through `commit_clustering_compaction`, and the
-  private per-fragment stamp is persisted through the optional
-  `DataFragment.clustering_version` protobuf field and consumed here.
+  private per-fragment stamp is persisted through the scalar
+  `DataFragment.clustering_version` protobuf field (`0` means unset) and consumed here.
   Deferred: reclustering on datasets with stable row ids or a remappable index (currently rejected
   to avoid corrupting the positional row mapping), and pulling in overlapping already-clustered
-  fragments for better merge quality.
+  fragments for better merge quality. Distributed task/result structural validation is also
+  incomplete: callers must currently provide valid non-empty task descriptors for the stated
+  snapshot and preserve execution results unchanged; these constraints are not fully enforced.
 - **Phase 4 — bindings & connectors. (implemented, partial)** Python and Java wrappers over the
   Rust core: `cluster_by` on the write path, `set_clustering` / `clustering_spec` /
   `clear_clustering` for declaration, and the `"cluster"` / `CLUSTER` binding-level request
