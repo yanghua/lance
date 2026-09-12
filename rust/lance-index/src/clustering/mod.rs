@@ -30,8 +30,8 @@
 //!
 //! # Persistence
 //!
-//! The ordered clustering columns, curve, layout version, and per-dimension bit
-//! width are stored together in dataset configuration under
+//! The ordered clustering columns, curve, layout version, per-dimension bit
+//! width, and normalization algorithm are stored together in dataset configuration under
 //! `lance.clustering.*`. Keeping the liquid-clustering policy separate from
 //! schema-level physical-ordering hints lets the policy be changed or cleared
 //! without mutating those stable hints.
@@ -45,6 +45,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance_core::{Error, Result};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 mod sort;
@@ -60,6 +61,12 @@ pub const CLUSTERING_COLUMNS_KEY: &str = "lance.clustering.columns";
 pub const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
 /// Config key holding the per-column bit width used when quantizing values.
 pub const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
+/// Config key identifying the coordinate-normalization algorithm.
+pub const CLUSTERING_ALGORITHM_KEY: &str = "lance.clustering.algorithm";
+/// Current normalization and curve-input contract. This value must change if
+/// coordinate semantics change so incompatible layouts cannot share an
+/// apparently identical declaration.
+pub const CLUSTERING_ALGORITHM: &str = "quantile-rank-v1";
 
 const CLUSTERING_CONFIG_PREFIX: &str = "lance.clustering.";
 
@@ -70,6 +77,7 @@ fn is_known_clustering_config_key(key: &str) -> bool {
             | CLUSTERING_CURVE_KEY
             | CLUSTERING_VERSION_KEY
             | CLUSTERING_BITS_PER_DIM_KEY
+            | CLUSTERING_ALGORITHM_KEY
     )
 }
 
@@ -81,6 +89,171 @@ pub const DEFAULT_BITS_PER_DIM: u32 = 16;
 /// accumulates the interleaved index in a `u128`, so the total cannot exceed
 /// 128 bits.
 pub const MAX_TOTAL_BITS: u32 = 128;
+
+/// Maximum number of non-null values sampled per clustering column when
+/// fitting distribution-aware coordinates for one write or compaction task.
+///
+/// The sample is bounded independently of the number of input rows and is used
+/// only to estimate each column's empirical cumulative distribution. 65,536
+/// samples keep the default 16-bit coordinate useful without making sampling
+/// memory grow with the input.
+pub const MAX_QUANTILE_SAMPLES_PER_COLUMN: usize = 65_536;
+
+/// Distribution-aware coordinate model fitted for one clustering write unit.
+///
+/// Each column stores a sorted reservoir sample of its non-null,
+/// order-preserving values. Encoding maps a value to its approximate empirical
+/// rank in that sample before applying the configured space-filling curve. The
+/// model is intentionally task-local: it describes how to lay out one write or
+/// compaction task and is not persisted as table metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct QuantileModel {
+    samples: Vec<Vec<u64>>,
+}
+
+impl QuantileModel {
+    fn coordinate(&self, column: usize, key: u64, bits: u32) -> u64 {
+        let sample = &self.samples[column];
+        if sample.len() <= 1 {
+            return 0;
+        }
+
+        // Use the empirical CDF (the last sampled value <= key) so duplicate
+        // values always receive the same coordinate and skew is reflected in
+        // the available coordinate space.
+        let upper = sample.partition_point(|sampled| *sampled <= key);
+        let rank = upper.saturating_sub(1);
+        let max_coordinate = max_coordinate(bits);
+        ((rank as u128 * max_coordinate as u128) / (sample.len() - 1) as u128) as u64
+    }
+}
+
+#[derive(Debug)]
+struct ReservoirSample {
+    values: Vec<u64>,
+    seen: u64,
+}
+
+impl ReservoirSample {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            seen: 0,
+        }
+    }
+
+    fn push(&mut self, value: u64, capacity: usize, rng: &mut SmallRng) -> Result<()> {
+        self.seen = self.seen.checked_add(1).ok_or_else(|| {
+            Error::invalid_input("clustering quantile sample row count exceeds u64")
+        })?;
+        if self.values.len() < capacity {
+            self.values.push(value);
+            return Ok(());
+        }
+
+        let replacement = rng.random_range(0..self.seen);
+        if replacement < capacity as u64 {
+            self.values[replacement as usize] = value;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, deterministic reservoir sampler used to fit a [`QuantileModel`].
+pub(crate) struct QuantileModelBuilder {
+    columns: Vec<ReservoirSample>,
+    capacity: usize,
+    rngs: Vec<SmallRng>,
+}
+
+impl QuantileModelBuilder {
+    pub(crate) fn new(num_columns: usize) -> Result<Self> {
+        if num_columns == 0 {
+            return Err(Error::invalid_input(
+                "clustering quantile model requires at least one column",
+            ));
+        }
+        let rngs = (0..num_columns)
+            .map(|column| {
+                SmallRng::seed_from_u64(0x4c41_4e43_455f_514e_u64.wrapping_add(column as u64))
+            })
+            .collect();
+        Ok(Self {
+            columns: (0..num_columns)
+                .map(|_| ReservoirSample::new(MAX_QUANTILE_SAMPLES_PER_COLUMN))
+                .collect(),
+            capacity: MAX_QUANTILE_SAMPLES_PER_COLUMN,
+            // Per-column fixed seeds make identical row order produce identical
+            // boundaries regardless of RecordBatch partitioning.
+            rngs,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_capacity(num_columns: usize, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::invalid_input(
+                "clustering quantile sample capacity must be positive",
+            ));
+        }
+        let mut builder = Self::new(num_columns)?;
+        builder.capacity = capacity;
+        builder.columns = (0..num_columns)
+            .map(|_| ReservoirSample::new(capacity))
+            .collect();
+        Ok(builder)
+    }
+
+    pub(crate) fn add(&mut self, key_columns: &[ArrayRef]) -> Result<()> {
+        if key_columns.len() != self.columns.len() {
+            return Err(Error::invalid_input(format!(
+                "clustering quantile model expected {} columns but received {}",
+                self.columns.len(),
+                key_columns.len()
+            )));
+        }
+        let expected_rows = key_columns.first().map_or(0, |column| column.len());
+        for (column_index, array) in key_columns.iter().enumerate() {
+            if array.len() != expected_rows {
+                return Err(Error::invalid_input(format!(
+                    "clustering sample columns must all have the same length; column 0 has \
+                     {expected_rows} rows but column {column_index} has {}",
+                    array.len()
+                )));
+            }
+            let reservoir = &mut self.columns[column_index];
+            let rng = &mut self.rngs[column_index];
+            let keys = order_preserving_keys(array)?;
+            for (row, key) in keys.into_iter().enumerate() {
+                if !array.is_null(row) {
+                    reservoir.push(key, self.capacity, rng)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> QuantileModel {
+        for column in &mut self.columns {
+            column.values.sort_unstable();
+        }
+        QuantileModel {
+            samples: self
+                .columns
+                .into_iter()
+                .map(|column| column.values)
+                .collect(),
+        }
+    }
+}
+
+fn max_coordinate(bits: u32) -> u64 {
+    if bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    }
+}
 
 /// Validate that a data type can be encoded as a clustering coordinate.
 ///
@@ -113,7 +286,7 @@ fn unsupported_clustering_type(data_type: &DataType) -> Error {
 }
 
 /// The space-filling curve used to order clustering-key values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ClusteringCurve {
     /// Z-order (Morton) curve: interleave the bits of each column.
     #[serde(rename = "zorder")]
@@ -244,23 +417,28 @@ impl ClusteringSpec {
                 CLUSTERING_BITS_PER_DIM_KEY.to_string(),
                 self.bits_per_dim.to_string(),
             ),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ]
     }
 
     /// The config keys this spec writes, for use when clearing a declaration.
-    pub fn config_keys() -> [&'static str; 4] {
+    pub fn config_keys() -> [&'static str; 5] {
         [
             CLUSTERING_COLUMNS_KEY,
             CLUSTERING_CURVE_KEY,
             CLUSTERING_VERSION_KEY,
             CLUSTERING_BITS_PER_DIM_KEY,
+            CLUSTERING_ALGORITHM_KEY,
         ]
     }
 
     /// Read a clustering spec from a table configuration map.
     ///
     /// No `lance.clustering.*` entries means clustering is not declared. A
-    /// declaration must contain all four keys written by [`Self::to_config`]; a
+    /// declaration must contain all five keys written by [`Self::to_config`]; a
     /// partial declaration is rejected instead of being silently defaulted.
     pub fn from_config(config: &HashMap<String, String>) -> Result<Option<Self>> {
         let mut has_clustering_config = false;
@@ -271,11 +449,12 @@ impl ClusteringSpec {
             has_clustering_config = true;
             if !is_known_clustering_config_key(key) {
                 return Err(Error::invalid_input(format!(
-                    "unknown clustering config key {key:?}; expected one of {}, {}, {}, or {}",
+                    "unknown clustering config key {key:?}; expected one of {}, {}, {}, {}, or {}",
                     CLUSTERING_COLUMNS_KEY,
                     CLUSTERING_CURVE_KEY,
                     CLUSTERING_VERSION_KEY,
-                    CLUSTERING_BITS_PER_DIM_KEY
+                    CLUSTERING_BITS_PER_DIM_KEY,
+                    CLUSTERING_ALGORITHM_KEY
                 )));
             }
         }
@@ -287,8 +466,8 @@ impl ClusteringSpec {
                 Error::invalid_input(format!(
                     "incomplete clustering config: missing required {key}; all of \
                      {CLUSTERING_COLUMNS_KEY}, {CLUSTERING_CURVE_KEY}, \
-                     {CLUSTERING_VERSION_KEY}, and {CLUSTERING_BITS_PER_DIM_KEY} must be set \
-                     together"
+                     {CLUSTERING_VERSION_KEY}, {CLUSTERING_BITS_PER_DIM_KEY}, and \
+                     {CLUSTERING_ALGORITHM_KEY} must be set together"
                 ))
             })
         };
@@ -296,6 +475,13 @@ impl ClusteringSpec {
         let curve = required_value(CLUSTERING_CURVE_KEY)?;
         let version = required_value(CLUSTERING_VERSION_KEY)?;
         let bits_per_dim = required_value(CLUSTERING_BITS_PER_DIM_KEY)?;
+        let algorithm = required_value(CLUSTERING_ALGORITHM_KEY)?;
+        if algorithm != CLUSTERING_ALGORITHM {
+            return Err(Error::invalid_input(format!(
+                "invalid {CLUSTERING_ALGORITHM_KEY} value {algorithm:?}: expected \
+                 {CLUSTERING_ALGORITHM:?}"
+            )));
+        }
         let columns = serde_json::from_str::<Vec<String>>(columns).map_err(|e| {
             Error::invalid_input(format!(
                 "invalid {CLUSTERING_COLUMNS_KEY} value {columns:?}: expected a JSON array of \
@@ -347,10 +533,11 @@ fn validate_bits(num_columns: usize, bits_per_dim: u32) -> Result<()> {
 
 /// Encodes clustering-key columns into a single space-filling-curve ordering
 /// value per row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpaceFillingEncoder {
     curve: ClusteringCurve,
     bits_per_dim: u32,
+    quantile_model: Option<QuantileModel>,
 }
 
 impl SpaceFillingEncoder {
@@ -364,7 +551,20 @@ impl SpaceFillingEncoder {
         Ok(Self {
             curve,
             bits_per_dim,
+            quantile_model: None,
         })
+    }
+
+    /// Attach a task-wide distribution model used to convert raw values to
+    /// approximate ranks before curve encoding.
+    pub(crate) fn with_quantile_model(mut self, model: QuantileModel) -> Result<Self> {
+        if model.samples.is_empty() {
+            return Err(Error::invalid_input(
+                "clustering quantile model requires at least one column",
+            ));
+        }
+        self.quantile_model = Some(model);
+        Ok(self)
     }
 
     /// Build an encoder matching a [`ClusteringSpec`].
@@ -411,9 +611,22 @@ impl SpaceFillingEncoder {
 
         let bits = self.bits_per_dim;
         // Per-column quantized coordinates: coords[col][row], each in [0, 2^bits).
+        if let Some(model) = &self.quantile_model
+            && model.samples.len() != key_columns.len()
+        {
+            return Err(Error::invalid_input(format!(
+                "clustering quantile model has {} columns but encoder received {}",
+                model.samples.len(),
+                key_columns.len()
+            )));
+        }
         let coords: Vec<Vec<u64>> = key_columns
             .iter()
-            .map(|col| quantize_column(col, bits))
+            .enumerate()
+            .map(|(column, array)| match &self.quantile_model {
+                Some(model) => quantile_rank_column(array, column, bits, model),
+                None => quantize_column(array, bits),
+            })
             .collect::<Result<_>>()?;
 
         let num_columns = key_columns.len();
@@ -438,6 +651,27 @@ impl SpaceFillingEncoder {
         }
         Ok(std::sync::Arc::new(builder.finish()))
     }
+}
+
+fn quantile_rank_column(
+    array: &ArrayRef,
+    column: usize,
+    bits: u32,
+    model: &QuantileModel,
+) -> Result<Vec<u64>> {
+    let keys = order_preserving_keys(array)?;
+    let null_coordinate = max_coordinate(bits);
+    Ok(keys
+        .into_iter()
+        .enumerate()
+        .map(|(row, key)| {
+            if array.is_null(row) {
+                null_coordinate
+            } else {
+                model.coordinate(column, key, bits)
+            }
+        })
+        .collect())
 }
 
 /// Quantize one column to `bits` bits per value, mapping each value to an
@@ -659,6 +893,67 @@ mod tests {
         let mut by_encoded: Vec<usize> = (0..encoded.len()).collect();
         by_encoded.sort_by(|&a, &b| encoded[a].cmp(&encoded[b]));
         assert_eq!(by_value, by_encoded);
+    }
+
+    #[test]
+    fn quantile_model_uses_small_int64_ranges_effectively() {
+        // Fixed-domain truncation maps all of these ordinary positive i64
+        // values to the same default 16-bit coordinate. A fitted empirical CDF
+        // must spread them across the available coordinate range instead.
+        let values = Int64Array::from(vec![3_i64, 1, 4, 2]);
+        let column: ArrayRef = Arc::new(values.clone());
+        let fixed = SpaceFillingEncoder::new(ClusteringCurve::ZOrder, 16).unwrap();
+        let fixed_keys = encode_rows(&fixed, std::slice::from_ref(&column));
+        assert!(fixed_keys.windows(2).all(|keys| keys[0] == keys[1]));
+
+        let mut builder = QuantileModelBuilder::new(1).unwrap();
+        builder.add(std::slice::from_ref(&column)).unwrap();
+        let fitted = SpaceFillingEncoder::new(ClusteringCurve::ZOrder, 16)
+            .unwrap()
+            .with_quantile_model(builder.finish())
+            .unwrap();
+        let fitted_keys = encode_rows(&fitted, std::slice::from_ref(&column));
+
+        let mut by_value: Vec<usize> = (0..values.len()).collect();
+        by_value.sort_by_key(|&row| values.value(row));
+        let mut by_key: Vec<usize> = (0..values.len()).collect();
+        by_key.sort_by(|&left, &right| fitted_keys[left].cmp(&fitted_keys[right]));
+        assert_eq!(by_key, by_value);
+        assert!(fitted_keys.windows(2).any(|keys| keys[0] != keys[1]));
+    }
+
+    #[test]
+    fn quantile_model_is_bounded_and_deterministic() {
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(0_i64..10_000));
+        let fit = || {
+            let mut builder = QuantileModelBuilder::with_capacity(1, 32).unwrap();
+            builder.add(std::slice::from_ref(&values)).unwrap();
+            builder.finish()
+        };
+
+        let first = fit();
+        let second = fit();
+        assert_eq!(first.samples, second.samples);
+        assert_eq!(first.samples[0].len(), 32);
+        assert!(first.samples[0].windows(2).all(|keys| keys[0] <= keys[1]));
+    }
+
+    #[test]
+    fn quantile_model_is_independent_of_batch_boundaries() {
+        let ascending: ArrayRef = Arc::new(Int64Array::from_iter_values(0_i64..1_000));
+        let descending: ArrayRef = Arc::new(Int64Array::from_iter_values((0_i64..1_000).rev()));
+
+        let mut whole = QuantileModelBuilder::with_capacity(2, 32).unwrap();
+        whole.add(&[ascending.clone(), descending.clone()]).unwrap();
+
+        let mut chunked = QuantileModelBuilder::with_capacity(2, 32).unwrap();
+        for (offset, len) in [(0, 137), (137, 509), (646, 354)] {
+            chunked
+                .add(&[ascending.slice(offset, len), descending.slice(offset, len)])
+                .unwrap();
+        }
+
+        assert_eq!(whole.finish().samples, chunked.finish().samples);
     }
 
     #[test]
@@ -937,8 +1232,10 @@ mod tests {
                 CLUSTERING_CURVE_KEY,
                 CLUSTERING_VERSION_KEY,
                 CLUSTERING_BITS_PER_DIM_KEY,
+                CLUSTERING_ALGORITHM_KEY,
             ]
         );
+        assert_eq!(config[CLUSTERING_ALGORITHM_KEY], CLUSTERING_ALGORITHM);
         config.insert(
             "lance.clustering_other.key".to_string(),
             "value".to_string(),
@@ -969,6 +1266,10 @@ mod tests {
             (CLUSTERING_CURVE_KEY.to_string(), "zorder".to_string()),
             (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
             (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "8".to_string()),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ]);
         for missing_key in ClusteringSpec::config_keys() {
             let mut config = complete_config.clone();
@@ -1024,6 +1325,10 @@ mod tests {
                 CLUSTERING_BITS_PER_DIM_KEY.to_string(),
                 bits_per_dim.to_string(),
             ),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ]);
 
         let error = ClusteringSpec::from_config(&config)
@@ -1043,6 +1348,10 @@ mod tests {
                 (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
                 (CLUSTERING_VERSION_KEY.to_string(), version.to_string()),
                 (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+                (
+                    CLUSTERING_ALGORITHM_KEY.to_string(),
+                    CLUSTERING_ALGORITHM.to_string(),
+                ),
             ]);
             let error = ClusteringSpec::from_config(&config)
                 .expect_err("an invalid active clustering version must be rejected");
@@ -1062,6 +1371,10 @@ mod tests {
                 CLUSTERING_BITS_PER_DIM_KEY.to_string(),
                 "not-a-width".to_string(),
             ),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ]);
         let error = ClusteringSpec::from_config(&config)
             .expect_err("an invalid active bit width must be rejected");
@@ -1077,6 +1390,10 @@ mod tests {
                 (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
                 (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
                 (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+                (
+                    CLUSTERING_ALGORITHM_KEY.to_string(),
+                    CLUSTERING_ALGORITHM.to_string(),
+                ),
             ]);
             let error = ClusteringSpec::from_config(&config)
                 .expect_err("invalid clustering columns JSON must be rejected");
@@ -1089,10 +1406,32 @@ mod tests {
             (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
             (CLUSTERING_CURVE_KEY.to_string(), "spiral".to_string()),
             (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ]);
         let error = ClusteringSpec::from_config(&config)
             .expect_err("an invalid active curve must be rejected");
         assert!(matches!(&error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("spiral"));
+    }
+
+    #[test]
+    fn from_config_rejects_incompatible_algorithm() {
+        let mut config: HashMap<String, String> =
+            ClusteringSpec::new(vec!["x".into()], ClusteringCurve::Hilbert)
+                .unwrap()
+                .to_config()
+                .into_iter()
+                .collect();
+        config.insert(
+            CLUSTERING_ALGORITHM_KEY.to_string(),
+            "fixed-domain-v0".to_string(),
+        );
+        let error = ClusteringSpec::from_config(&config)
+            .expect_err("an incompatible clustering algorithm must be rejected");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(CLUSTERING_ALGORITHM_KEY));
     }
 }

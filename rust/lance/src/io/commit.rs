@@ -444,9 +444,11 @@ async fn do_commit_new_dataset(
                     }
                 }
                 let clustering_versions = new_manifest.fragment_clustering_versions().to_vec();
-                new_manifest.replace_fragments_with_clustering_versions(
+                let clustering_groups = new_manifest.fragment_clustering_groups().to_vec();
+                new_manifest.replace_fragments_with_clustering_metadata(
                     Arc::new(new_frags),
                     clustering_versions,
+                    clustering_groups,
                 )?;
 
                 // Indices: keep metadata but normalize base to local
@@ -687,12 +689,18 @@ async fn migrate_manifest(
     let migrated_fragments =
         migrate_fragments_with_positions(dataset, &manifest.fragments, recompute_stats).await?;
     let mut migrated_versions = Vec::with_capacity(migrated_fragments.len());
+    let mut migrated_groups = Vec::with_capacity(migrated_fragments.len());
     let mut fragments = Vec::with_capacity(migrated_fragments.len());
     for (source_position, fragment) in migrated_fragments {
         migrated_versions.push(manifest.fragment_clustering_versions()[source_position]);
+        migrated_groups.push(manifest.fragment_clustering_groups()[source_position].clone());
         fragments.push(fragment);
     }
-    manifest.replace_fragments_with_clustering_versions(Arc::new(fragments), migrated_versions)?;
+    manifest.replace_fragments_with_clustering_metadata(
+        Arc::new(fragments),
+        migrated_versions,
+        migrated_groups,
+    )?;
 
     Ok(())
 }
@@ -807,8 +815,12 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     }
 
     let clustering_versions = manifest.fragment_clustering_versions().to_vec();
-    manifest
-        .replace_fragments_with_clustering_versions(Arc::new(fragments), clustering_versions)?;
+    let clustering_groups = manifest.fragment_clustering_groups().to_vec();
+    manifest.replace_fragments_with_clustering_metadata(
+        Arc::new(fragments),
+        clustering_versions,
+        clustering_groups,
+    )?;
 
     Ok(())
 }
@@ -2169,7 +2181,15 @@ mod tests {
             .unwrap();
         let mut manifest = dataset.manifest.as_ref().clone();
         manifest
-            .set_fragment_clustering_versions(vec![Some(10), Some(20), Some(30)])
+            .replace_fragments_with_clustering_metadata(
+                manifest.fragments.clone(),
+                vec![Some(10), Some(20), Some(30)],
+                vec![
+                    Some("group-a".to_string()),
+                    Some("group-b".to_string()),
+                    Some("group-c".to_string()),
+                ],
+            )
             .unwrap();
         let manifest_version = manifest.version;
         let mut fragments = manifest.fragments.as_ref().clone();
@@ -2181,9 +2201,14 @@ mod tests {
             base_id: None,
         });
         manifest
-            .replace_fragments_with_clustering_versions(
+            .replace_fragments_with_clustering_metadata(
                 Arc::new(fragments),
                 vec![Some(10), Some(20), Some(30)],
+                vec![
+                    Some("group-a".to_string()),
+                    Some("group-b".to_string()),
+                    Some("group-c".to_string()),
+                ],
             )
             .unwrap();
         dataset.manifest = Arc::new(manifest.clone());
@@ -2203,6 +2228,10 @@ mod tests {
         assert_eq!(
             manifest.fragment_clustering_versions(),
             &[Some(10), Some(30)]
+        );
+        assert_eq!(
+            manifest.fragment_clustering_groups(),
+            &[Some("group-a".to_string()), Some("group-c".to_string())]
         );
         let fragments = manifest.fragments_by_offset_range(1..2);
         assert_eq!(fragments.len(), 1);
@@ -2233,12 +2262,20 @@ mod tests {
             HashMap::new(),
         );
         manifest
-            .set_fragment_clustering_versions(vec![Some(7)])
+            .replace_fragments_with_clustering_metadata(
+                manifest.fragments.clone(),
+                vec![Some(7)],
+                vec![Some("group-a".to_string())],
+            )
             .unwrap();
 
         fix_schema(&mut manifest).unwrap();
 
         assert_eq!(manifest.fragment_clustering_versions(), &[Some(7)]);
+        assert_eq!(
+            manifest.fragment_clustering_groups(),
+            &[Some("group-a".to_string())]
+        );
         manifest.validate_fragment_invariants().unwrap();
     }
 

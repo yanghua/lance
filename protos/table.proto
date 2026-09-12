@@ -405,6 +405,13 @@ message DataFragment {
   // candidate for re-clustering during optimize. Zero means unset.
   // Readers and writers require feature flag 256 when this field is nonzero.
   uint64 clustering_version = 12;
+
+  // Identifies the write or clustering-compaction group that produced this
+  // fragment. All fragments in one group were sorted together using one
+  // task-wide coordinate model. Empty means the fragment has no authoritative
+  // clustering group. A current-version group remains eligible for merging
+  // until its aggregate live-row count reaches the configured target.
+  string clustering_group_id = 13;
 }
 
 message DataFile {

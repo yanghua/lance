@@ -88,6 +88,20 @@ impl Transaction {
         // boundary: this validates operation and snapshot/version consistency,
         // but does not re-read files to prove their physical ordering.
         let new_fragment_version = self.new_fragment_clustering_version()?;
+        let default_new_fragment_group = new_fragment_version.as_ref().map(|_| self.uuid.clone());
+        let rewrite_group_for_fragment = |fragment: &Fragment| {
+            new_fragment_version?;
+            let Operation::Rewrite { groups, .. } = &self.operation else {
+                return None;
+            };
+            groups.iter().enumerate().find_map(|(group_index, group)| {
+                group
+                    .new_fragments
+                    .iter()
+                    .any(|candidate| Self::clustering_layout_unchanged(candidate, fragment))
+                    .then(|| format!("{}:{group_index}", self.uuid))
+            })
+        };
         if let Some(marker_version) = new_fragment_version {
             if !matches!(
                 self.operation,
@@ -145,13 +159,14 @@ impl Transaction {
         let mut duplicate_ids = HashSet::new();
         if !is_overwrite && let Some(current) = current_manifest {
             current.validate_fragment_invariants()?;
-            for (fragment, version) in current
+            for ((fragment, version), group) in current
                 .fragments
                 .iter()
                 .zip(current.fragment_clustering_versions())
+                .zip(current.fragment_clustering_groups())
             {
                 if previous_by_id
-                    .insert(fragment.id, (fragment, *version))
+                    .insert(fragment.id, (fragment, *version, group.clone()))
                     .is_some()
                 {
                     duplicate_ids.insert(fragment.id);
@@ -159,31 +174,40 @@ impl Transaction {
             }
         }
 
-        let versions = manifest
+        let metadata = manifest
             .fragments
             .iter()
             .map(|fragment| {
                 if schema_changed {
-                    return None;
+                    return (None, None);
                 }
                 if is_overwrite || current_manifest.is_none() {
-                    return new_fragment_version;
+                    return (new_fragment_version, default_new_fragment_group.clone());
                 }
                 if duplicate_ids.contains(&fragment.id) {
-                    return None;
+                    return (None, None);
                 }
                 match previous_by_id.get(&fragment.id) {
-                    Some((previous, version))
+                    Some((previous, version, group))
                         if Self::clustering_layout_unchanged(previous, fragment) =>
                     {
-                        *version
+                        (*version, group.clone())
                     }
-                    Some(_) => None,
-                    None => new_fragment_version,
+                    Some(_) => (None, None),
+                    None => (
+                        new_fragment_version,
+                        rewrite_group_for_fragment(fragment)
+                            .or_else(|| default_new_fragment_group.clone()),
+                    ),
                 }
             })
-            .collect();
-        manifest.set_fragment_clustering_versions(versions)
+            .collect::<Vec<_>>();
+        let (versions, groups) = metadata.into_iter().unzip();
+        manifest.replace_fragments_with_clustering_metadata(
+            manifest.fragments.clone(),
+            versions,
+            groups,
+        )
     }
 
     pub(super) fn fragments_with_ids<'a, T>(
@@ -1746,6 +1770,7 @@ mod tests {
     const CLUSTERING_CURVE_KEY: &str = "lance.clustering.curve";
     const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
     const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
+    const CLUSTERING_ALGORITHM_KEY: &str = "lance.clustering.algorithm";
 
     fn clustering_entries(
         columns: &str,
@@ -1758,6 +1783,7 @@ mod tests {
             (CLUSTERING_CURVE_KEY, Some(curve)),
             (CLUSTERING_VERSION_KEY, Some(version)),
             (CLUSTERING_BITS_PER_DIM_KEY, Some(bits_per_dim)),
+            (CLUSTERING_ALGORITHM_KEY, Some("quantile-rank-v1")),
         ]
         .into_iter()
         .map(Into::into)
@@ -1817,6 +1843,7 @@ mod tests {
         assert_eq!(result.config[CLUSTERING_CURVE_KEY], "hilbert");
         assert_eq!(result.config[CLUSTERING_VERSION_KEY], "1");
         assert_eq!(result.config[CLUSTERING_BITS_PER_DIM_KEY], "16");
+        assert_eq!(result.config[CLUSTERING_ALGORITHM_KEY], "quantile-rank-v1");
         assert_ne!(result.writer_feature_flags & FLAG_TABLE_CONFIG, 0);
         assert_ne!(result.writer_feature_flags & FLAG_CLUSTERING_VERSION, 0);
     }
@@ -1829,6 +1856,7 @@ mod tests {
             CLUSTERING_CURVE_KEY,
             CLUSTERING_VERSION_KEY,
             CLUSTERING_BITS_PER_DIM_KEY,
+            CLUSTERING_ALGORITHM_KEY,
         ] {
             let mut update_entries = clustering_entries(r#"["id"]"#, "hilbert", "1", "16");
             update_entries.retain(|entry| entry.key != missing_key);
@@ -2059,6 +2087,7 @@ mod tests {
             .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
         assert_eq!(result.fragment_clustering_versions(), &[Some(5)]);
+        assert!(result.fragment_clustering_groups()[0].is_some());
     }
 
     #[test]
@@ -2165,6 +2194,34 @@ mod tests {
             .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
         assert_eq!(result.fragment_clustering_versions(), &[Some(7), Some(7)]);
+        assert_eq!(result.fragment_clustering_groups()[0], None);
+        assert!(result.fragment_clustering_groups()[1].is_some());
+    }
+
+    #[test]
+    fn test_ordinary_rewrite_does_not_create_clustering_group() {
+        let manifest = stamped_manifest_with_fragments(1);
+        let old_fragment = manifest.fragments[0].clone();
+        let mut new_fragment = old_fragment.clone();
+        new_fragment.files[0].path = "rewritten.lance".to_string();
+        let transaction = TransactionBuilder::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![old_fragment],
+                    new_fragments: vec![new_fragment],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+        )
+        .build();
+
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(result.fragment_clustering_versions(), &[None]);
+        assert_eq!(result.fragment_clustering_groups(), &[None]);
     }
 
     #[test]
@@ -2263,6 +2320,7 @@ mod tests {
             CLUSTERING_CURVE_KEY,
             CLUSTERING_VERSION_KEY,
             CLUSTERING_BITS_PER_DIM_KEY,
+            CLUSTERING_ALGORITHM_KEY,
         ]
         .into_iter()
         .map(|key| (key, None).into())

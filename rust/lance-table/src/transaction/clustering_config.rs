@@ -20,6 +20,8 @@ const CLUSTERING_COLUMNS_KEY: &str = "lance.clustering.columns";
 const CLUSTERING_CURVE_KEY: &str = "lance.clustering.curve";
 const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
 const CLUSTERING_BITS_PER_DIM_KEY: &str = "lance.clustering.bits_per_dim";
+const CLUSTERING_ALGORITHM_KEY: &str = "lance.clustering.algorithm";
+const CLUSTERING_ALGORITHM: &str = "quantile-rank-v1";
 const MAX_TOTAL_BITS: usize = 128;
 
 fn is_known_clustering_config_key(key: &str) -> bool {
@@ -29,6 +31,7 @@ fn is_known_clustering_config_key(key: &str) -> bool {
             | CLUSTERING_CURVE_KEY
             | CLUSTERING_VERSION_KEY
             | CLUSTERING_BITS_PER_DIM_KEY
+            | CLUSTERING_ALGORITHM_KEY
     )
 }
 
@@ -131,11 +134,12 @@ fn parse_clustering_config(config: &HashMap<String, String>) -> Result<Option<Cl
         has_clustering_config = true;
         if !is_known_clustering_config_key(key) {
             return Err(Error::invalid_input(format!(
-                "unknown clustering config key {key:?}; expected one of {}, {}, {}, or {}",
+                "unknown clustering config key {key:?}; expected one of {}, {}, {}, {}, or {}",
                 CLUSTERING_COLUMNS_KEY,
                 CLUSTERING_CURVE_KEY,
                 CLUSTERING_VERSION_KEY,
-                CLUSTERING_BITS_PER_DIM_KEY
+                CLUSTERING_BITS_PER_DIM_KEY,
+                CLUSTERING_ALGORITHM_KEY
             )));
         }
     }
@@ -213,6 +217,14 @@ fn parse_clustering_config(config: &HashMap<String, String>) -> Result<Option<Cl
         )));
     }
 
+    let algorithm = required_config_value(config, CLUSTERING_ALGORITHM_KEY)?;
+    if algorithm != CLUSTERING_ALGORITHM {
+        return Err(Error::invalid_input(format!(
+            "invalid {CLUSTERING_ALGORITHM_KEY} value {algorithm:?}: expected \
+             {CLUSTERING_ALGORITHM:?}"
+        )));
+    }
+
     Ok(Some(ClusteringConfig {
         columns,
         curve,
@@ -225,8 +237,8 @@ fn required_config_value<'a>(config: &'a HashMap<String, String>, key: &str) -> 
     config.get(key).ok_or_else(|| {
         Error::invalid_input(format!(
             "incomplete clustering config: missing required {key}; all of \
-             {CLUSTERING_COLUMNS_KEY}, {CLUSTERING_CURVE_KEY}, {CLUSTERING_VERSION_KEY}, and \
-             {CLUSTERING_BITS_PER_DIM_KEY} must be set together"
+             {CLUSTERING_COLUMNS_KEY}, {CLUSTERING_CURVE_KEY}, {CLUSTERING_VERSION_KEY}, \
+             {CLUSTERING_BITS_PER_DIM_KEY}, and {CLUSTERING_ALGORITHM_KEY} must be set together"
         ))
     })
 }
@@ -278,6 +290,10 @@ mod tests {
             (CLUSTERING_CURVE_KEY.to_string(), "hilbert".to_string()),
             (CLUSTERING_VERSION_KEY.to_string(), "1".to_string()),
             (CLUSTERING_BITS_PER_DIM_KEY.to_string(), "16".to_string()),
+            (
+                CLUSTERING_ALGORITHM_KEY.to_string(),
+                CLUSTERING_ALGORITHM.to_string(),
+            ),
         ])
     }
 

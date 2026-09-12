@@ -124,9 +124,12 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_index::IndexType;
 use lance_index::clustering::ClusteringSpec;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
+use lance_index::optimize::OptimizeOptions as IndexOptimizeOptions;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{
@@ -611,9 +614,10 @@ pub fn resolve_compaction_options_from_dataset_config(
     config: &HashMap<String, String>,
 ) -> Result<CompactionRequest> {
     let mode_key = format!("{COMPACTION_CONFIG_PREFIX}compaction_mode");
-    let is_clustering = config
-        .get(&mode_key)
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("cluster"));
+    let configured_mode = config.get(&mode_key);
+    let is_clustering = configured_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("cluster"))
+        || (configured_mode.is_none()
+            && config.contains_key(lance_index::clustering::CLUSTERING_VERSION_KEY));
     if !is_clustering {
         return CompactionOptions::from_dataset_config(config).map(CompactionRequest::Compaction);
     }
@@ -651,11 +655,23 @@ async fn validate_clustering_dataset(dataset: &Dataset) -> Result<()> {
              reordering rows would invalidate the positional row-id sequence rechunk",
         ));
     }
-    if load_indices_for_remapping(dataset).await?.is_some() {
+    let has_non_zonemap_index = if dataset.manifest.index_section.is_some() {
+        dataset.load_indices().await?.iter().any(|index| {
+            !is_system_index(index)
+                && !index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+        })
+    } else {
+        false
+    };
+    if has_non_zonemap_index {
         return Err(Error::not_supported(
             "reclustering is not yet supported on datasets with a remappable secondary index: \
              reordering rows would invalidate the positional row-address remap. Drop the index, \
-             recluster, then rebuild it",
+             recluster, then rebuild it. Zone-map indices are supported and refreshed after \
+             single-process or coordinated clustering commits",
         ));
     }
     Ok(())
@@ -999,9 +1015,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 /// version is different from the dataset's current
 /// [`ClusteringSpec::version`](lance_index::clustering::ClusteringSpec::version)
 /// — i.e. it was written before clustering was declared, under an older layout,
-/// or carries an unexpected future version. Selected fragments are grouped,
-/// oldest position first, and emitted as dedicated clustering tasks that
-/// re-sort them by the clustering key.
+/// or carries an unexpected future version. Adjacent current-version fragments
+/// that are individually smaller than the target are also merged in groups of
+/// two or more. This keeps independently sorted small appends from becoming
+/// permanently frozen just because each one already carries the current stamp.
+/// Selected fragments are grouped oldest position first and emitted as
+/// dedicated clustering tasks that re-sort them by the clustering key.
 ///
 /// The existing per-run budgets on [`CompactionOptions`]
 /// (`max_source_fragments` / `max_source_rows` / `max_source_bytes`) bound how
@@ -1037,10 +1056,26 @@ impl ClusteringCompactionPlanner {
         };
         let current_version = spec.version;
         let clustering_versions = dataset.manifest.fragment_clustering_versions();
+        let clustering_groups = dataset.manifest.fragment_clustering_groups();
+        let mut current_group_rows = HashMap::<&str, usize>::new();
+        for ((fragment, version), group) in dataset
+            .fragments()
+            .iter()
+            .zip(clustering_versions)
+            .zip(clustering_groups)
+        {
+            if *version == Some(current_version)
+                && let (Some(group), Some(rows)) = (group.as_deref(), fragment.num_rows())
+            {
+                *current_group_rows.entry(group).or_default() += rows;
+            }
+        }
 
         // A fragment needs reclustering unless its stamp exactly matches the
-        // current clustering version. This also repairs unexpected future
-        // stamps instead of silently treating them as current.
+        // current clustering version. Current-version fragments smaller than
+        // the target remain eligible for coalescing with an adjacent candidate.
+        // This also repairs unexpected future stamps instead of silently
+        // treating them as current.
         let fragments = dataset.get_fragments();
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
@@ -1063,20 +1098,43 @@ impl ClusteringCompactionPlanner {
             dataset.object_store.as_ref().io_parallelism()
         };
         let candidate_fragments = futures::stream::iter(fragments.into_iter().enumerate())
-            .map(|(position, fragment)| async move {
-                let is_excluded = u32::try_from(fragment.id())
-                    .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id));
-                let stamped = clustering_versions.get(position).copied().flatten();
-                let under_clustered = stamped != Some(current_version);
-                if is_excluded || !under_clustered {
-                    Ok::<_, Error>(None)
-                } else {
-                    let prefetched_rows = if has_source_budget {
-                        None
+            .map(|(position, fragment)| {
+                let current_group_rows = &current_group_rows;
+                async move {
+                    let is_excluded = u32::try_from(fragment.id())
+                        .is_ok_and(|fragment_id| self.excluded_fragment_ids.contains(fragment_id));
+                    let stamped = clustering_versions.get(position).copied().flatten();
+                    let group = clustering_groups.get(position).and_then(Option::as_deref);
+                    // A current-version stamp without a group was written by the
+                    // pre-group implementation. Treat it as under-clustered so the
+                    // next pass migrates it to the complete state instead of
+                    // assuming an unknowable write unit is stable.
+                    let under_clustered = stamped != Some(current_version) || group.is_none();
+                    let is_partial_current_group = !under_clustered
+                        && group.is_some_and(|group| {
+                            current_group_rows.get(group).copied().unwrap_or_default()
+                                < self.options.target_rows_per_fragment
+                        });
+                    if is_excluded {
+                        Ok::<_, Error>(None)
+                    } else if !under_clustered && !is_partial_current_group {
+                        Ok(None)
                     } else {
-                        Some(collect_metrics(&fragment).await?.num_rows())
-                    };
-                    Ok(Some((fragment, prefetched_rows)))
+                        // Current-version fragments need a row count to determine
+                        // whether they are partial. Under-clustered fragments keep
+                        // the existing lazy metrics behavior when budgets are set.
+                        let prefetched_rows = if has_source_budget && under_clustered {
+                            None
+                        } else {
+                            Some(collect_metrics(&fragment).await?.num_rows())
+                        };
+                        Ok(Some((
+                            fragment,
+                            prefetched_rows,
+                            under_clustered,
+                            group.map(str::to_owned),
+                        )))
+                    }
                 }
             })
             .buffered(metric_concurrency);
@@ -1094,6 +1152,8 @@ impl ClusteringCompactionPlanner {
         let mut selected_fragments = 0usize;
         let mut selected_rows = 0usize;
         let mut selected_bytes = 0u64;
+        let mut current_has_under_clustered = false;
+        let mut current_group_ids = HashSet::<String>::new();
         let schema_field_ids: HashSet<i32> = if self.options.max_source_bytes.is_some() {
             dataset.schema().field_ids().into_iter().collect()
         } else {
@@ -1103,12 +1163,33 @@ impl ClusteringCompactionPlanner {
         let flush = |group: &mut Vec<Fragment>,
                      group_rows: &mut usize,
                      group_bytes: &mut u64,
-                     tasks: &mut Vec<(TaskData, usize)>| {
+                     group_has_under_clustered: &mut bool,
+                     group_ids: &mut HashSet<String>,
+                     tasks: &mut Vec<(TaskData, usize)>,
+                     selected_fragments: &mut usize,
+                     selected_rows: &mut usize,
+                     selected_bytes: &mut u64| {
             if !group.is_empty() {
                 let fragments = std::mem::take(group);
-                tasks.push((TaskData { fragments }, *group_rows));
+                // A lone current-version partial fragment has no neighbor to
+                // merge with and rewriting it would produce the same state on
+                // every optimize run. Under-clustered fragments are always
+                // emitted, even alone, because they still need the current
+                // layout and stamp.
+                if *group_has_under_clustered
+                    || group_ids.len() > 1
+                    || (group_ids.is_empty() && fragments.len() > 1)
+                {
+                    tasks.push((TaskData { fragments }, *group_rows));
+                } else {
+                    *selected_fragments = selected_fragments.saturating_sub(fragments.len());
+                    *selected_rows = selected_rows.saturating_sub(*group_rows);
+                    *selected_bytes = selected_bytes.saturating_sub(*group_bytes);
+                }
                 *group_rows = 0;
                 *group_bytes = 0;
+                *group_has_under_clustered = false;
+                group_ids.clear();
             }
         };
 
@@ -1134,15 +1215,20 @@ impl ClusteringCompactionPlanner {
             let Some(candidate) = candidate_fragments.next().await else {
                 break;
             };
-            let Some((fragment, prefetched_rows)) = candidate? else {
-                // Already-clustered and explicitly excluded fragments both
+            let Some((fragment, prefetched_rows, under_clustered, group_id)) = candidate? else {
+                // Stable current-version and explicitly excluded fragments both
                 // break adjacency. In particular, never combine candidates on
-                // opposite sides of an excluded fragment.
+                // opposite sides of one of these barriers.
                 flush(
                     &mut current,
                     &mut current_rows,
                     &mut current_bytes,
+                    &mut current_has_under_clustered,
+                    &mut current_group_ids,
                     &mut all_tasks,
+                    &mut selected_fragments,
+                    &mut selected_rows,
+                    &mut selected_bytes,
                 );
                 continue;
             };
@@ -1181,7 +1267,12 @@ impl ClusteringCompactionPlanner {
                     &mut current,
                     &mut current_rows,
                     &mut current_bytes,
+                    &mut current_has_under_clustered,
+                    &mut current_group_ids,
                     &mut all_tasks,
+                    &mut selected_fragments,
+                    &mut selected_rows,
+                    &mut selected_bytes,
                 );
                 if selected_fragments == 0 {
                     warn!(
@@ -1216,11 +1307,20 @@ impl ClusteringCompactionPlanner {
                     &mut current,
                     &mut current_rows,
                     &mut current_bytes,
+                    &mut current_has_under_clustered,
+                    &mut current_group_ids,
                     &mut all_tasks,
+                    &mut selected_fragments,
+                    &mut selected_rows,
+                    &mut selected_bytes,
                 );
             }
 
             current.push(fragment);
+            current_has_under_clustered |= under_clustered;
+            if let Some(group_id) = group_id {
+                current_group_ids.insert(group_id);
+            }
             current_rows = current_rows.saturating_add(rows);
             current_bytes = current_bytes.saturating_add(bytes);
             selected_fragments += 1;
@@ -1244,7 +1344,12 @@ impl ClusteringCompactionPlanner {
                     &mut current,
                     &mut current_rows,
                     &mut current_bytes,
+                    &mut current_has_under_clustered,
+                    &mut current_group_ids,
                     &mut all_tasks,
+                    &mut selected_fragments,
+                    &mut selected_rows,
+                    &mut selected_bytes,
                 );
             }
         }
@@ -1252,7 +1357,12 @@ impl ClusteringCompactionPlanner {
             &mut current,
             &mut current_rows,
             &mut current_bytes,
+            &mut current_has_under_clustered,
+            &mut current_group_ids,
             &mut all_tasks,
+            &mut selected_fragments,
+            &mut selected_rows,
+            &mut selected_bytes,
         );
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
@@ -1297,6 +1407,7 @@ pub async fn compact_files_with_clustering(
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let plan = plan_clustering_compaction(dataset, &options).await?;
     if plan.num_tasks() == 0 {
+        maintain_clustering_zonemaps(dataset).await?;
         return Ok(CompactionMetrics::default());
     }
 
@@ -1315,6 +1426,85 @@ pub async fn compact_files_with_clustering(
         .await?;
 
     commit_clustering_compaction(dataset, completed_tasks, &options).await
+}
+
+async fn ensure_clustering_zonemaps(dataset: &mut Dataset) -> Result<()> {
+    let Some(spec) = dataset.clustering_spec()? else {
+        return Ok(());
+    };
+    let indices = dataset.load_indices().await?;
+    let mut zonemap_fields = HashSet::new();
+    for index in indices.iter().filter(|index| {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+    }) {
+        if let Some(field_id) = index.keyed_field() {
+            zonemap_fields.insert(field_id);
+        }
+    }
+
+    let columns = spec
+        .columns
+        .iter()
+        .map(|column| {
+            let field = dataset.schema().field(column).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "clustering column {column:?} does not exist in the dataset schema"
+                ))
+            })?;
+            Ok((column.clone(), field.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (column, field_id) in columns {
+        if zonemap_fields.contains(&field_id) {
+            continue;
+        }
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        let index_name = format!("__lance_clustering_zonemap_{field_id}");
+        dataset
+            .create_index_builder(&[column.as_str()], IndexType::ZoneMap, &params)
+            .name(index_name)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn refresh_clustering_zonemaps(dataset: &mut Dataset) -> Result<()> {
+    if dataset.clustering_spec()?.is_none() {
+        return Ok(());
+    }
+    let indices = dataset.load_indices().await?;
+    let mut zonemap_names = HashSet::new();
+    for index in indices.iter().filter(|index| {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+    }) {
+        zonemap_names.insert(index.name.clone());
+    }
+
+    // Existing zonemaps keep query correctness through the scanner's indexed +
+    // unindexed union. Catch them up after the rewrite; seed-enabled indices
+    // consume the summaries embedded by the clustering writer, while other
+    // zonemaps fall back to scanning only the new fragments.
+    if !zonemap_names.is_empty() {
+        dataset
+            .optimize_indices(
+                &IndexOptimizeOptions::append().index_names(zonemap_names.into_iter().collect()),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn maintain_clustering_zonemaps(dataset: &mut Dataset) -> Result<()> {
+    ensure_clustering_zonemaps(dataset).await?;
+    refresh_clustering_zonemaps(dataset).await
 }
 
 pub async fn compact_files_with_planner(
@@ -3446,7 +3636,8 @@ async fn rewrite_files_with_strategy(
         .sum::<u64>();
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
-    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
+    let capture_row_addrs = !is_clustering
+        && !dataset.manifest.uses_stable_row_ids()
         && (options.defer_index_remap
             || load_indices_for_remapping(dataset.as_ref())
                 .await?
@@ -3872,6 +4063,7 @@ pub async fn commit_clustering_compaction(
 ) -> Result<CompactionMetrics> {
     validate_clustering_options(options)?;
     if completed_tasks.is_empty() {
+        maintain_clustering_zonemaps(dataset).await?;
         return Ok(CompactionMetrics::default());
     }
 
@@ -3911,14 +4103,18 @@ pub async fn commit_clustering_compaction(
         .into_iter()
         .map(|result| result.inner.result)
         .collect();
-    commit_compaction_with_strategy(
+    let metrics = commit_compaction_with_strategy(
         dataset,
         completed_tasks,
         Arc::new(IgnoreRemap::default()),
         options,
         CommitStrategy::Cluster { clustering_version },
     )
-    .await
+    .await?;
+    if let Err(error) = maintain_clustering_zonemaps(dataset).await {
+        warn!("clustering data rewrite committed, but refreshing zonemap coverage failed: {error}");
+    }
+    Ok(metrics)
 }
 
 enum CommitStrategy {
@@ -8814,6 +9010,27 @@ mod tests {
     }
 
     #[test]
+    fn test_active_clustering_declaration_selects_clustering_by_default() {
+        let spec = ClusteringSpec::new(vec!["k".into()], Default::default()).unwrap();
+        let mut config: HashMap<String, String> = spec.to_config().into_iter().collect();
+
+        let request = resolve_compaction_options_from_dataset_config(&config).unwrap();
+        let CompactionRequest::Clustering(options) = request else {
+            panic!("an active clustering declaration must select clustering maintenance");
+        };
+        assert_eq!(options.compaction_mode(), CompactionMode::Reencode);
+
+        config.insert(
+            "lance.compaction.compaction_mode".to_string(),
+            "reencode".to_string(),
+        );
+        assert!(matches!(
+            resolve_compaction_options_from_dataset_config(&config).unwrap(),
+            CompactionRequest::Compaction(_)
+        ));
+    }
+
+    #[test]
     fn test_clustering_serialization_is_tagged_and_fail_closed() {
         let options = CompactionOptions::default();
         let task_data = TaskData {
@@ -11389,6 +11606,299 @@ mod tests {
         assert_eq!(plan2.num_tasks(), 0, "no under-clustered fragments remain");
     }
 
+    #[tokio::test]
+    async fn test_recluster_merges_adjacent_current_partial_fragments_once() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let make = |values: Vec<i64>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(make(vec![0]), &test_dir, None)
+            .await
+            .unwrap();
+        let spec = ClusteringSpec::new(vec!["k".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        Dataset::write(
+            make(vec![9, 1, 7]),
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset = Dataset::write(
+            make(vec![8, 0, 6]),
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        assert!(
+            dataset
+                .manifest
+                .fragment_clustering_versions()
+                .iter()
+                .all(|version| *version == Some(spec.version))
+        );
+        let groups = dataset.manifest.fragment_clustering_groups();
+        assert!(groups.iter().all(Option::is_some));
+        assert_ne!(groups[0], groups[1]);
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100,
+            ..Default::default()
+        };
+        let plan = plan_clustering_compaction(&dataset, &options)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        let expected_fragment_ids = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(planned_fragment_ids(&plan), vec![expected_fragment_ids]);
+
+        compact_files_with_clustering(&mut dataset, options.clone())
+            .await
+            .unwrap();
+        assert_eq!(dataset.fragments().len(), 1);
+        assert_eq!(
+            dataset
+                .manifest
+                .fragment_clustering_version(dataset.fragments()[0].id),
+            Some(spec.version)
+        );
+        assert_eq!(
+            plan_clustering_compaction(&dataset, &options)
+                .await
+                .unwrap()
+                .num_tasks(),
+            0,
+            "a lone current-version partial fragment must not be rewritten forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recluster_keeps_one_multi_fragment_group_stable() {
+        use lance_index::clustering::{ClusteringCurve, ClusteringSpec};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![5, 1, 4, 0, 3, 2]))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let spec = ClusteringSpec::new(vec!["k".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+        compact_files_with_clustering(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        let groups = dataset.manifest.fragment_clustering_groups();
+        assert!(groups.iter().all(Option::is_some));
+        assert_eq!(groups[0], groups[1]);
+
+        let plan = plan_clustering_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.num_tasks(),
+            0,
+            "one current-version group must not be rewritten only because it spans small files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recluster_refreshes_existing_zonemap() {
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::clustering::ClusteringCurve;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![5, 1, 4, 0, 3, 2]))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(
+                &["k"],
+                IndexType::ZoneMap,
+                Some("k_zonemap".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let spec = ClusteringSpec::new(vec!["k".into()], ClusteringCurve::Hilbert).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+
+        compact_files_with_clustering(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .unindexed_fragments("k_zonemap")
+                .await
+                .unwrap()
+                .is_empty(),
+            "clustering compaction must refresh zonemap coverage for rewritten fragments"
+        );
+        let batch = dataset
+            .scan()
+            .filter("k >= 2 AND k <= 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_recluster_creates_zonemaps_for_clustering_columns() {
+        use crate::index::DatasetIndexInternalExt;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![5, 1, 4, 0, 3, 2]))],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await
+        .unwrap();
+        let spec = ClusteringSpec::new(vec!["k".into()], Default::default()).unwrap();
+        dataset.set_clustering(&spec).await.unwrap();
+        dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_clustering_compaction(&dataset, &options)
+                .await
+                .unwrap()
+                .num_tasks(),
+            0,
+            "one current clustering group should not require a data rewrite"
+        );
+
+        let data_version = dataset.version().version;
+        let metrics = compact_files_with_clustering(&mut dataset, options.clone())
+            .await
+            .unwrap();
+        assert_eq!(metrics, CompactionMetrics::default());
+        assert!(dataset.version().version > data_version);
+
+        let field_id = dataset.schema().field_id("k").unwrap();
+        let index_name = format!("__lance_clustering_zonemap_{field_id}");
+        let indices = dataset.load_indices_by_name(&index_name).await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(indices.iter().all(|index| {
+            index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+        }));
+        assert!(
+            dataset
+                .unindexed_fragments(&index_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let filtered = dataset
+            .scan()
+            .filter("k >= 2 AND k <= 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 3);
+
+        let maintained_version = dataset.version().version;
+        let metrics = compact_files_with_clustering(&mut dataset, options)
+            .await
+            .unwrap();
+        assert_eq!(metrics, CompactionMetrics::default());
+        assert_eq!(
+            dataset.version().version,
+            maintained_version,
+            "steady-state clustering and zonemap maintenance must not create a commit"
+        );
+    }
+
     #[rstest]
     #[case::bumped(false)]
     #[case::cleared(true)]
@@ -11556,11 +12066,12 @@ mod tests {
         let mut manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
         manifest_proto.fragments[0].clustering_version = 2;
         manifest_proto.fragments[1].clustering_version = 1;
+        manifest_proto.fragments[1].clustering_group_id = "current".to_string();
         dataset.manifest =
             Arc::new(lance_table::format::Manifest::try_from(manifest_proto).unwrap());
 
         let planner = ClusteringCompactionPlanner::new(CompactionOptions {
-            target_rows_per_fragment: 1_000,
+            target_rows_per_fragment: 250,
             ..Default::default()
         })
         .unwrap();

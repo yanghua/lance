@@ -25,13 +25,15 @@ use datafusion_common::{DataFusionError, Result as DataFusionResult};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_physical_expr::expressions::Column as DFColumn;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_datafusion::exec::{
-    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan,
+    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan, provider_to_stream,
 };
+use lance_datafusion::spill::spilling_table_provider;
 
-use super::{ClusteringSpec, SpaceFillingEncoder};
+use super::{ClusteringSpec, QuantileModelBuilder, SpaceFillingEncoder};
 
 /// Name of the transient column holding the space-filling-curve ordering value.
 const CLUSTERING_ORDER_FIELD: &str = "__lance_clustering_order";
@@ -216,10 +218,10 @@ where
 /// yields the same schema as the input (the transient ordering column is
 /// projected away). Sorting uses DataFusion's `SortExec`, which spills to disk
 /// for inputs larger than memory.
-pub async fn cluster_sort_stream(
+pub fn cluster_sort_stream<'a>(
     data: SendableRecordBatchStream,
-    spec: &ClusteringSpec,
-) -> Result<SendableRecordBatchStream> {
+    spec: &'a ClusteringSpec,
+) -> BoxFuture<'a, Result<SendableRecordBatchStream>> {
     cluster_sort_stream_with_options(
         data,
         spec,
@@ -228,7 +230,7 @@ pub async fn cluster_sort_stream(
             ..Default::default()
         },
     )
-    .await
+    .boxed()
 }
 
 async fn cluster_sort_stream_with_options(
@@ -255,6 +257,30 @@ async fn cluster_sort_stream_with_options(
         })?;
         key_indices.push(idx);
     }
+    let encoder = SpaceFillingEncoder::from_spec(spec)?;
+    let order_width = encoder.output_width(spec.columns.len())?;
+    let added_bytes_per_row = projection_bytes_per_row(spec.columns.len(), order_width)?;
+
+    // A clustering stream is one-shot, but distribution-aware normalization
+    // needs one pass to fit approximate ranks and a second pass to sort. Reuse
+    // the existing memory-first replay spill so large writes remain bounded.
+    // Split oversized source batches before sampling as well as sorting: fitting
+    // materializes one u64 key per row and must obey the same memory cap as the
+    // later projection.
+    let replay_memory_limit = max_batch_bytes;
+    let data = cap_projection_input(data, max_batch_bytes, added_bytes_per_row);
+    let replay = spilling_table_provider(data, replay_memory_limit).await?;
+    let mut sampling_stream = provider_to_stream(replay.clone()).await?;
+    let mut quantile_builder = QuantileModelBuilder::new(key_indices.len())?;
+    while let Some(batch) = sampling_stream.try_next().await? {
+        let key_columns = key_indices
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect::<Vec<_>>();
+        quantile_builder.add(&key_columns)?;
+    }
+    let quantile_model = quantile_builder.finish();
+    let data = provider_to_stream(replay).await?;
 
     // Projection 1: pass every input column through, then append the ordering
     // column computed from the key columns.
@@ -276,11 +302,10 @@ async fn cluster_sort_stream_with_options(
             Arc::new(DFColumn::new(input_schema.field(idx).name(), idx)) as Arc<dyn PhysicalExpr>
         })
         .collect();
-    let udf = ClusteringOrderUdf::new(SpaceFillingEncoder::from_spec(spec)?, spec.columns.len())?;
-    let order_width = udf.output_width;
-    let added_bytes_per_row = projection_bytes_per_row(spec.columns.len(), order_width)?;
-    let projection_input = cap_projection_input(data, max_batch_bytes, added_bytes_per_row);
-    let source = Arc::new(OneShotExec::new(projection_input));
+    let encoder = encoder.with_quantile_model(quantile_model)?;
+    let udf = ClusteringOrderUdf::new(encoder, spec.columns.len())?;
+    debug_assert_eq!(order_width, udf.output_width);
+    let source = Arc::new(OneShotExec::new(data));
     let order_expr = Arc::new(ScalarFunctionExpr::new(
         CLUSTERING_ORDER_FIELD,
         Arc::new(ScalarUDF::new_from_impl(udf)),
@@ -363,6 +388,7 @@ impl ClusteringOrderUdf {
 impl PartialEq for ClusteringOrderUdf {
     fn eq(&self, other: &Self) -> bool {
         self.signature == other.signature
+            && self.encoder == other.encoder
             && self.num_columns == other.num_columns
             && self.output_width == other.output_width
     }
@@ -373,6 +399,7 @@ impl Eq for ClusteringOrderUdf {}
 impl std::hash::Hash for ClusteringOrderUdf {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.signature.hash(state);
+        self.encoder.hash(state);
         self.num_columns.hash(state);
         self.output_width.hash(state);
     }
@@ -412,7 +439,7 @@ mod tests {
     use crate::clustering::ClusteringCurve;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow_array::{BooleanArray, Int32Array, LargeBinaryArray, RecordBatch};
+    use arrow_array::{BooleanArray, Int32Array, Int64Array, LargeBinaryArray, RecordBatch};
     use arrow_schema::{Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
@@ -481,6 +508,41 @@ mod tests {
         assert_eq!(out_schema.field(1).name(), "k");
         // A single-column clustering key sorts by the raw value.
         assert_eq!(ks, vec![10, 20, 30, 40]);
+    }
+
+    #[tokio::test]
+    async fn sort_uses_task_wide_ranks_for_small_int64_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![5_i64, 1, 3]))],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![4_i64, 0, 2]))],
+            )
+            .unwrap(),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let spec = ClusteringSpec::new(vec!["k".into()], ClusteringCurve::Hilbert).unwrap();
+
+        let sorted = cluster_sort_stream(stream, &spec).await.unwrap();
+        let batches = sorted.try_collect::<Vec<_>>().await.unwrap();
+        let mut values = Vec::new();
+        for batch in batches {
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend((0..array.len()).map(|row| array.value(row)));
+        }
+        assert_eq!(values, vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[tokio::test]

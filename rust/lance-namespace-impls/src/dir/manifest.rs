@@ -1325,9 +1325,11 @@ impl ManifestNamespace {
         fragments.sort_by_key(|fragment| fragment.id);
         let fragment_count = fragments.len();
         let mut manifest = Manifest::new_from_previous(previous, schema, Arc::new(fragments));
-        manifest.replace_fragments_with_clustering_versions(
+        let clustering_group = clustering_version.map(|_| Uuid::new_v4().to_string());
+        manifest.replace_fragments_with_clustering_metadata(
             manifest.fragments.clone(),
             vec![clustering_version; fragment_count],
+            vec![clustering_group; fragment_count],
         )?;
         Ok(manifest)
     }

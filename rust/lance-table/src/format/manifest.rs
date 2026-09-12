@@ -62,6 +62,11 @@ pub struct Manifest {
     /// so callers cannot mutate the sidecar independently; because `fragments`
     /// remains public for compatibility, write boundaries still validate alignment.
     fragment_clustering_versions: Vec<Option<u64>>,
+    /// Clustering group identifiers aligned positionally with [`Self::fragments`].
+    ///
+    /// Fragments written or rewritten by the same clustering operation share a
+    /// group id. `None` means no authoritative grouping is known.
+    fragment_clustering_groups: Vec<Option<String>>,
 
     /// Fragment layouts captured when [`Self::fragment_clustering_versions`] was installed.
     ///
@@ -222,6 +227,7 @@ impl Manifest {
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let fragment_clustering_versions = vec![None; fragments.len()];
+        let fragment_clustering_groups = vec![None; fragments.len()];
         let fragment_clustering_version_fragments = fragments.clone();
 
         Self {
@@ -231,6 +237,7 @@ impl Manifest {
             writer_version: Some(WriterVersion::default()),
             fragments,
             fragment_clustering_versions,
+            fragment_clustering_groups,
             fragment_clustering_version_fragments,
             version_aux_data: 0,
             index_section: None,
@@ -264,6 +271,7 @@ impl Manifest {
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let fragment_clustering_versions = vec![None; fragments.len()];
+        let fragment_clustering_groups = vec![None; fragments.len()];
         let fragment_clustering_version_fragments = fragments.clone();
 
         Self {
@@ -273,6 +281,7 @@ impl Manifest {
             writer_version: Some(WriterVersion::default()),
             fragments,
             fragment_clustering_versions,
+            fragment_clustering_groups,
             fragment_clustering_version_fragments,
             version_aux_data: 0,
             index_section: None, // Caller should update index if they want to keep them.
@@ -332,6 +341,7 @@ impl Manifest {
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments.clone()),
             fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+            fragment_clustering_groups: self.fragment_clustering_groups.clone(),
             // The clone intentionally rewrites file base IDs, so its copied
             // stamps are rebound to the cloned fragment layouts.
             fragment_clustering_version_fragments: Arc::new(cloned_fragments),
@@ -394,6 +404,11 @@ impl Manifest {
         &self.fragment_clustering_versions
     }
 
+    /// Clustering group identifiers aligned with [`Self::fragments`].
+    pub fn fragment_clustering_groups(&self) -> &[Option<String>] {
+        &self.fragment_clustering_groups
+    }
+
     /// Return the clustering layout version recorded for `fragment_id`.
     pub fn fragment_clustering_version(&self, fragment_id: u64) -> Option<u64> {
         let position = self
@@ -411,6 +426,23 @@ impl Manifest {
             .and_then(|position| self.fragment_clustering_versions.get(position))
             .copied()
             .flatten()
+    }
+
+    /// Return the clustering group recorded for `fragment_id`.
+    pub fn fragment_clustering_group(&self, fragment_id: u64) -> Option<&str> {
+        let position = self
+            .fragments
+            .partition_point(|fragment| fragment.id < fragment_id);
+        let position = match self.fragments.get(position) {
+            Some(fragment) if fragment.id == fragment_id => Some(position),
+            _ => self
+                .fragments
+                .iter()
+                .position(|fragment| fragment.id == fragment_id),
+        };
+        position
+            .and_then(|position| self.fragment_clustering_groups.get(position))
+            .and_then(Option::as_deref)
     }
 
     /// Whether any current fragment has a clustering layout version.
@@ -432,6 +464,29 @@ impl Manifest {
                 "manifest has {} fragments but {} fragment clustering versions",
                 self.fragments.len(),
                 self.fragment_clustering_versions.len()
+            )));
+        }
+        if self.fragment_clustering_groups.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "manifest has {} fragments but {} fragment clustering groups",
+                self.fragments.len(),
+                self.fragment_clustering_groups.len()
+            )));
+        }
+        if let Some((position, group)) = self
+            .fragment_clustering_versions
+            .iter()
+            .zip(&self.fragment_clustering_groups)
+            .enumerate()
+            .find_map(|(position, (version, group))| match (version, group) {
+                (None, Some(group)) => Some((position, group)),
+                (_, Some(group)) if group.is_empty() => Some((position, group)),
+                _ => None,
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "manifest fragment at position {position} has invalid clustering group \
+                 {group:?}; groups must be non-empty and require a clustering version"
             )));
         }
         if self.fragment_clustering_version_fragments.len() != self.fragments.len() {
@@ -488,10 +543,12 @@ impl Manifest {
             .fragment_clustering_version_fragments
             .iter()
             .zip(self.fragment_clustering_versions.iter().copied())
+            .zip(self.fragment_clustering_groups.iter().cloned())
             .collect::<Vec<_>>();
         let mut versions = Vec::with_capacity(fragments.len());
+        let mut groups = Vec::with_capacity(fragments.len());
         for (position, fragment) in fragments.iter().enumerate() {
-            let Some(bound_position) = remaining.iter().position(|(bound_fragment, _)| {
+            let Some(bound_position) = remaining.iter().position(|((bound_fragment, _), _)| {
                 fragment_clustering_layout_eq(fragment, bound_fragment)
             }) else {
                 return Err(Error::invalid_input(format!(
@@ -500,11 +557,12 @@ impl Manifest {
                     fragment.id, position
                 )));
             };
-            let (_, version) = remaining.remove(bound_position);
+            let ((_, version), group) = remaining.remove(bound_position);
             versions.push(version);
+            groups.push(group);
         }
 
-        self.replace_fragments_with_clustering_versions(fragments, versions)
+        self.replace_fragments_with_clustering_metadata(fragments, versions, groups)
     }
 
     /// Replace fragments and their positionally aligned clustering versions atomically.
@@ -519,6 +577,18 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         versions: Vec<Option<u64>>,
     ) -> Result<()> {
+        let groups = vec![None; fragments.len()];
+        self.replace_fragments_with_clustering_metadata(fragments, versions, groups)
+    }
+
+    /// Replace fragments and all positionally aligned clustering metadata.
+    #[doc(hidden)]
+    pub fn replace_fragments_with_clustering_metadata(
+        &mut self,
+        fragments: Arc<Vec<Fragment>>,
+        versions: Vec<Option<u64>>,
+        groups: Vec<Option<String>>,
+    ) -> Result<()> {
         if versions.len() != fragments.len() {
             return Err(Error::invalid_input(format!(
                 "replacement has {} fragments but {} fragment clustering versions",
@@ -526,11 +596,31 @@ impl Manifest {
                 versions.len()
             )));
         }
+        if groups.len() != fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "replacement has {} fragments but {} fragment clustering groups",
+                fragments.len(),
+                groups.len()
+            )));
+        }
+        if let Some((position, group)) = versions.iter().zip(&groups).enumerate().find_map(
+            |(position, (version, group))| match (version, group) {
+                (None, Some(group)) => Some((position, group)),
+                (_, Some(group)) if group.is_empty() => Some((position, group)),
+                _ => None,
+            },
+        ) {
+            return Err(Error::invalid_input(format!(
+                "replacement fragment at position {position} has invalid clustering group \
+                 {group:?}; groups must be non-empty and require a clustering version"
+            )));
+        }
 
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let fragment_clustering_version_fragments = fragments.clone();
         self.fragments = fragments;
         self.fragment_clustering_versions = versions;
+        self.fragment_clustering_groups = groups;
         self.fragment_clustering_version_fragments = fragment_clustering_version_fragments;
         self.fragment_offsets = fragment_offsets;
         Ok(())
@@ -1138,11 +1228,31 @@ impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(p: pb::Manifest) -> Result<Self> {
+        if let Some((position, fragment)) = p.fragments.iter().enumerate().find(|(_, fragment)| {
+            fragment.clustering_version == 0 && !fragment.clustering_group_id.is_empty()
+        }) {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "fragment at position {position} has clustering group {:?} without a \
+                     clustering version",
+                    fragment.clustering_group_id
+                ),
+            ));
+        }
         let fragment_clustering_versions = p
             .fragments
             .iter()
             .map(|fragment| {
                 (fragment.clustering_version != 0).then_some(fragment.clustering_version)
+            })
+            .collect();
+        let fragment_clustering_groups = p
+            .fragments
+            .iter()
+            .map(|fragment| {
+                (!fragment.clustering_group_id.is_empty())
+                    .then(|| fragment.clustering_group_id.clone())
             })
             .collect();
         let timestamp_nanos = p.timestamp.map(|ts| {
@@ -1204,7 +1314,7 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
-        Ok(Self {
+        let manifest = Self {
             schema,
             version: p.version,
             branch: p.branch,
@@ -1218,6 +1328,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             max_fragment_id: p.max_fragment_id,
             fragments,
             fragment_clustering_versions,
+            fragment_clustering_groups,
             fragment_clustering_version_fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
@@ -1235,7 +1346,9 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
-        })
+        };
+        manifest.validate_fragment_invariants()?;
+        Ok(manifest)
     }
 }
 
@@ -1282,6 +1395,12 @@ impl From<&Manifest> for pb::Manifest {
                         .get(position)
                         .copied()
                         .flatten()
+                        .unwrap_or_default();
+                    proto.clustering_group_id = m
+                        .fragment_clustering_groups
+                        .get(position)
+                        .and_then(Option::as_ref)
+                        .cloned()
                         .unwrap_or_default();
                     proto
                 })
@@ -1400,22 +1519,34 @@ mod tests {
             HashMap::new(),
         );
         manifest
-            .set_fragment_clustering_versions(vec![Some(3), None])
+            .replace_fragments_with_clustering_metadata(
+                manifest.fragments.clone(),
+                vec![Some(3), None],
+                vec![Some("group-a".to_string()), None],
+            )
             .unwrap();
 
         let encoded = pb::Manifest::from(&manifest);
         assert_eq!(encoded.fragments[0].clustering_version, 3);
         assert_eq!(encoded.fragments[1].clustering_version, 0);
+        assert_eq!(encoded.fragments[0].clustering_group_id, "group-a");
+        assert_eq!(encoded.fragments[1].clustering_group_id, "");
         // Generic fragment conversion cannot accidentally transport a stamp.
         assert_eq!(
             pb::DataFragment::from(&manifest.fragments[0]).clustering_version,
             0
+        );
+        assert_eq!(
+            pb::DataFragment::from(&manifest.fragments[0]).clustering_group_id,
+            ""
         );
 
         let decoded = Manifest::try_from(encoded).unwrap();
         assert_eq!(decoded.fragment_clustering_versions(), &[Some(3), None]);
         assert_eq!(decoded.fragment_clustering_version(2), Some(3));
         assert_eq!(decoded.fragment_clustering_version(7), None);
+        assert_eq!(decoded.fragment_clustering_group(2), Some("group-a"));
+        assert_eq!(decoded.fragment_clustering_group(7), None);
         assert!(decoded.has_fragment_clustering_versions());
     }
 
@@ -1428,7 +1559,40 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(manifest.fragment_clustering_versions(), &[None, None]);
+        assert_eq!(manifest.fragment_clustering_groups(), &[None, None]);
         assert!(!manifest.has_fragment_clustering_versions());
+    }
+
+    #[test]
+    fn clustering_group_requires_a_version() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let mut replacement = manifest.clone();
+        let error = replacement
+            .replace_fragments_with_clustering_metadata(
+                replacement.fragments.clone(),
+                vec![None],
+                vec![Some("group-a".to_string())],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(
+            "fragment at position 0 has invalid clustering group \"group-a\"; groups must \
+             be non-empty and require a clustering version"
+        ));
+
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.fragments[0].clustering_group_id = "group-a".to_string();
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(
+            "fragment at position 0 has clustering group \"group-a\" without a clustering \
+             version"
+        ));
     }
 
     #[test]

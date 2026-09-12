@@ -755,6 +755,7 @@ impl From<&Fragment> for pb::DataFragment {
             // Clustering stamps are owned by Manifest's private positional
             // sidecar and injected only by Manifest serialization.
             clustering_version: 0,
+            clustering_group_id: String::new(),
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
