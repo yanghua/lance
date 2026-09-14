@@ -3343,6 +3343,26 @@ impl Dataset {
         self.ds.config().clone()
     }
 
+    fn set_clustering(&mut self, columns: Vec<String>) -> PyResult<()> {
+        let mut dataset = self.ds.as_ref().clone();
+        rt().block_on(None, dataset.set_clustering(columns))?
+            .infer_error()?;
+        self.ds = Arc::new(dataset);
+        Ok(())
+    }
+
+    fn clustering_columns(&self) -> PyResult<Option<Vec<String>>> {
+        self.ds.clustering_columns().infer_error()
+    }
+
+    fn clear_clustering(&mut self) -> PyResult<()> {
+        let mut dataset = self.ds.as_ref().clone();
+        rt().block_on(None, dataset.clear_clustering())?
+            .infer_error()?;
+        self.ds = Arc::new(dataset);
+        Ok(())
+    }
+
     // Unified metadata APIs
 
     #[pyo3(signature = ())]

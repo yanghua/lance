@@ -16,7 +16,7 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        RewriteResult, commit_compaction, compact_files, plan_compaction, recluster,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -513,6 +513,24 @@ impl PyCompaction {
         let metrics = rt().block_on(None, async move {
             fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
+        dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        Ok(metrics.into())
+    }
+
+    /// Recluster fragments using the dataset's declared clustering columns.
+    #[staticmethod]
+    pub fn recluster(
+        dataset: Bound<PyAny>,
+        options: Bound<PyAny>,
+    ) -> PyResult<PyCompactionMetrics> {
+        let dataset_ref = unwrap_dataset(dataset)?;
+        let dataset = dataset_ref.borrow().clone();
+        let options = options.cast::<PyDict>()?;
+        let opts = parse_compaction_options(options, &dataset.ds.manifest.config)?;
+        let mut new_ds = dataset.ds.as_ref().clone();
+        let metrics = rt()
+            .block_on(None, recluster(&mut new_ds, opts))?
+            .map_err(|error| PyIOError::new_err(error.to_string()))?;
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
         Ok(metrics.into())
     }

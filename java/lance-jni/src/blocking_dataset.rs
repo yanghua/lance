@@ -33,7 +33,9 @@ use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
     CleanupReferencedBranch, RemovalStats,
 };
-use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
+use lance::dataset::optimize::{
+    CompactionOptions as RustCompactionOptions, compact_files, recluster,
+};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
@@ -441,6 +443,11 @@ impl BlockingDataset {
 
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
         block_on(compact_files(&mut self.inner, options, None))?;
+        Ok(())
+    }
+
+    pub fn recluster(&mut self, options: RustCompactionOptions) -> Result<()> {
+        block_on(recluster(&mut self.inner, options))?;
         Ok(())
     }
 
@@ -2413,6 +2420,96 @@ fn inner_sample(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeSetClustering(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    columns: JObject,
+) {
+    let result = (|| -> Result<()> {
+        let columns = env.get_strings(&columns)?;
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(dataset.inner.set_clustering(columns))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetClusteringColumns<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        (|| -> Result<JObject<'local>> {
+            let columns = {
+                let dataset = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                }?;
+                dataset.inner.clustering_columns()?
+            };
+            let Some(columns) = columns else {
+                return Ok(JObject::null());
+            };
+            let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for column in columns {
+                let value = JObject::from(env.new_string(column)?);
+                env.call_method(
+                    &list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&value)],
+                )?;
+            }
+            Ok(list)
+        })()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeClearClustering(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    let result = (|| -> Result<()> {
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(dataset.inner.clear_clustering())?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeRecluster(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject,
+) {
+    let result = (|| -> Result<()> {
+        let config = {
+            let dataset = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+            }?;
+            dataset.inner.manifest.config.clone()
+        };
+        let options =
+            convert_java_compaction_options_to_rust(&mut env, compaction_options, &config)?;
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset.recluster(options)
+    })();
+    if let Err(error) = result {
+        let _ = env.throw_new("java/lang/RuntimeException", error.to_string());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeDelete(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -3231,7 +3328,7 @@ fn inner_compact(
     Ok(())
 }
 
-fn convert_java_compaction_options_to_rust(
+pub(crate) fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
     config: &std::collections::HashMap<String, String>,

@@ -2030,6 +2030,23 @@ class LanceDataset(pa.dataset.Dataset):
         # Use the new path-based Rust function directly
         self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
+    def set_clustering(self, columns: List[str]) -> None:
+        """Declare clustering columns without rewriting existing data.
+
+        Layout generations and encoding details are managed internally. New
+        writes remain streaming; call :meth:`DatasetOptimizer.recluster` to
+        incrementally apply the declaration.
+        """
+        self._ds.set_clustering(columns)
+
+    def clustering_columns(self) -> Optional[List[str]]:
+        """Return the ordered clustering columns, or ``None`` if unset."""
+        return self._ds.clustering_columns()
+
+    def clear_clustering(self) -> None:
+        """Remove the clustering declaration without rewriting data."""
+        self._ds.clear_clustering()
+
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
 
@@ -7437,6 +7454,43 @@ class DatasetOptimizer:
             if v is not None
         }
         return Compaction.execute(self._dataset, opts)
+
+    def recluster(
+        self,
+        *,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        num_threads: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
+    ) -> CompactionMetrics:
+        """Incrementally apply the dataset's declared clustering layout.
+
+        Only fragments not written under the current layout generation are
+        rewritten. Stable row IDs and non-zonemap secondary indices are not
+        currently supported. Compaction sizing and source-limit options have
+        the same meaning as in :meth:`compact_files`.
+        """
+        opts = {
+            key: value
+            for key, value in {
+                "target_rows_per_fragment": target_rows_per_fragment,
+                "max_rows_per_group": max_rows_per_group,
+                "max_bytes_per_file": max_bytes_per_file,
+                "num_threads": num_threads,
+                "batch_size": batch_size,
+                "max_source_fragments": max_source_fragments,
+                "max_source_rows": max_source_rows,
+                "max_source_bytes": max_source_bytes,
+                "excluded_fragment_ids": excluded_fragment_ids,
+            }.items()
+            if value is not None
+        }
+        return Compaction.recluster(self._dataset, opts)
 
     def optimize_indices(self, **kwargs):
         """Optimizes index performance.

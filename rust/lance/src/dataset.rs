@@ -125,7 +125,7 @@ use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::{cleanup_data_fragments, write_fragments_internal};
+use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
@@ -3890,7 +3890,11 @@ impl Dataset {
     ///
     /// Pass `None` for a value to remove that key.
     ///
-    /// Use `.replace()` to replace the entire config map instead of merging.
+    /// Use `.replace()` to replace the entire config map instead of merging. If
+    /// clustering is declared, call [`Self::clear_clustering`] first because
+    /// replacement cannot implicitly remove reserved clustering configuration.
+    /// Keys in the reserved `lance.clustering.*` namespace must be managed with
+    /// [`Self::set_clustering`] and [`Self::clear_clustering`].
     ///
     /// Returns the updated config map after the operation.
     ///
@@ -3964,6 +3968,36 @@ impl Dataset {
             .collect::<HashMap<_, _>>();
         self.update_schema_metadata(new_values).replace().await?;
         Ok(())
+    }
+
+    /// Declare or replace the clustering columns for this dataset.
+    ///
+    /// The clustering key must contain one to four supported top-level scalar
+    /// columns from the current schema. Supported types are booleans, signed
+    /// and unsigned integers, float32/float64, strings, dates, timestamps, and
+    /// decimal128 values.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test_set_clustering(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.set_clustering(vec!["x".into(), "y".into()]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_clustering(&mut self, columns: Vec<String>) -> Result<()> {
+        metadata::set_clustering(self, columns).await
+    }
+
+    /// Return the declared clustering columns, if any.
+    pub fn clustering_columns(&self) -> Result<Option<Vec<String>>> {
+        Ok(metadata::clustering_spec(self)?.map(|spec| spec.columns))
+    }
+
+    /// Remove the clustering declaration from this dataset.
+    ///
+    /// Existing data keeps its physical layout; only the declaration is dropped.
+    pub async fn clear_clustering(&mut self) -> Result<()> {
+        metadata::clear_clustering(self).await
     }
 
     /// Update field metadata

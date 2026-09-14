@@ -25,6 +25,8 @@ pub mod scalar;
 pub mod traits;
 pub mod vector;
 
+pub mod clustering;
+
 pub use crate::traits::*;
 
 // Re-export core traits from lance-index-core
@@ -70,6 +72,12 @@ pub mod pbold {
 pub mod cache_pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+}
+
+/// Versioned wire messages for distributed clustering.
+pub mod clustering_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.clustering.rs"));
 }
 
 #[derive(Serialize, Deserialize, Debug)]

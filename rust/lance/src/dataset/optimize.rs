@@ -95,7 +95,8 @@ use super::transaction::{
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
-use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
+use super::write::write_fragments_internal;
+use super::{WriteMode, WriteParams, cleanup_data_fragments};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -123,18 +124,26 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_index::IndexType;
+use lance_index::clustering::{ClusteringModel, cluster_sort_stream_with_model};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
+use lance_index::optimize::OptimizeOptions as IndexOptimizeOptions;
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 pub(super) mod binary_copy;
+mod distributed_clustering;
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
+pub use distributed_clustering::{
+    ReclusterGroup, ReclusterPlan, ReclusterResult, commit_recluster, plan_recluster,
+};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -906,6 +915,130 @@ pub async fn compact_files(
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let planner = DefaultCompactionPlanner::new(options)?;
     compact_files_with_planner(dataset, remap_options, &planner).await
+}
+
+/// Reorder fragments that do not match the dataset's current clustering layout.
+///
+/// This is intentionally a local maintenance operation. Ordinary writes remain
+/// streaming and are picked up by a later recluster instead of sorting on the
+/// write path.
+///
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::optimize::{CompactionOptions, recluster};
+/// # async fn example(dataset: &mut Dataset) -> Result<()> {
+/// dataset.set_clustering(vec!["tenant_id".into(), "timestamp".into()]).await?;
+/// recluster(dataset, CompactionOptions::default()).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn recluster(
+    dataset: &mut Dataset,
+    mut options: CompactionOptions,
+) -> Result<CompactionMetrics> {
+    let plan = plan_recluster(dataset, &options).await?;
+    options.compaction_mode = Some(CompactionMode::Reencode);
+    options.validate()?;
+    if plan.groups().is_empty() {
+        maintain_clustering_zonemaps(dataset).await?;
+        return Ok(CompactionMetrics::default());
+    }
+    let (model, group_row_digests) =
+        distributed_clustering::build_recluster_model(dataset, &plan).await?;
+
+    let snapshot = dataset.clone();
+    let num_threads = options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
+    let results = futures::stream::iter(plan.groups().iter().cloned())
+        .map(|group| {
+            let plan = &plan;
+            let model = &model;
+            let options = &options;
+            let snapshot = &snapshot;
+            let output_row_digest = group_row_digests[&group.id()].to_bytes();
+            async move {
+                let group_id = group.id();
+                let task = group.task_data();
+                let result =
+                    rewrite_files_internal(Cow::Borrowed(snapshot), task, options, Some(model))
+                        .await?;
+                ReclusterResult::try_new(
+                    plan,
+                    group_id,
+                    model,
+                    result.new_fragments,
+                    output_row_digest,
+                )
+            }
+        })
+        .buffer_unordered(num_threads)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    commit_recluster(dataset, &plan, &model, results).await
+}
+
+async fn maintain_clustering_zonemaps(dataset: &mut Dataset) -> Result<()> {
+    let Some(spec) = super::metadata::clustering_spec(dataset)? else {
+        return Ok(());
+    };
+    let indices = dataset.load_indices().await?;
+    let clustering_fields = spec
+        .columns
+        .iter()
+        .map(|column| {
+            dataset
+                .schema()
+                .field(column)
+                .map(|field| field.id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "clustering column {column:?} does not exist in the dataset schema"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut zonemap_fields = HashSet::new();
+    for index in indices.iter().filter(|index| {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+    }) {
+        if let Some(field_id) = index.keyed_field() {
+            zonemap_fields.insert(field_id);
+        }
+    }
+    for (column, field_id) in spec.columns.iter().zip(clustering_fields) {
+        if !zonemap_fields.contains(&field_id) {
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+                .with_params(&serde_json::json!({"use_seeds": true}));
+            dataset
+                .create_index_builder(&[column.as_str()], IndexType::ZoneMap, &params)
+                .name(format!("__lance_clustering_zonemap_{field_id}"))
+                .await?;
+        }
+    }
+
+    let names = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .filter(|index| {
+            index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+        })
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    if !names.is_empty() {
+        dataset
+            .optimize_indices(&IndexOptimizeOptions::append().index_names(names))
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn compact_files_with_planner(
@@ -2161,6 +2294,15 @@ async fn rewrite_files(
     task: TaskData,
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
+    rewrite_files_internal(dataset, task, options, None).await
+}
+
+async fn rewrite_files_internal(
+    dataset: Cow<'_, Dataset>,
+    task: TaskData,
+    options: &CompactionOptions,
+    clustering_model: Option<&ClusteringModel>,
+) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
 
     if task.fragments.is_empty() {
@@ -2190,7 +2332,8 @@ async fn rewrite_files(
         .sum::<u64>();
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
-    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
+    let capture_row_addrs = clustering_model.is_none()
+        && !dataset.manifest.uses_stable_row_ids()
         && (options.defer_index_remap
             || load_indices_for_remapping(dataset.as_ref())
                 .await?
@@ -2204,7 +2347,8 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    let can_binary_copy = clustering_model.is_none()
+        && can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -2322,13 +2466,19 @@ async fn rewrite_files(
             row_ids_rx = Some(rx);
         }
     } else {
+        let reader = reader.expect("reader must be prepared for non-binary-copy path");
+        let reader = if let Some(model) = clustering_model {
+            cluster_sort_stream_with_model(reader, model).await?
+        } else {
+            reader
+        };
         let (frags, _) = write_fragments_internal(
             dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
             dataset.schema().clone(),
-            reader.expect("reader must be prepared for non-binary-copy path"),
+            reader,
             params,
             None,
         )
@@ -2570,6 +2720,16 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
+    commit_compaction_internal(dataset, completed_tasks, remap_options, options, None).await
+}
+
+async fn commit_compaction_internal(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    clustering_version: Option<u64>,
+) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
@@ -2786,7 +2946,7 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = TransactionBuilder::new(
+    let mut transaction_builder = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
         // mode the caller may open a fresh dataset at a later version (V+N), but
@@ -2801,8 +2961,11 @@ pub async fn commit_compaction(
             frag_reuse_index,
         },
     )
-    .transaction_properties(options.transaction_properties.clone())
-    .build();
+    .transaction_properties(options.transaction_properties.clone());
+    if let Some(version) = clustering_version {
+        transaction_builder = transaction_builder.new_fragment_clustering_version(version);
+    }
+    let transaction = transaction_builder.build();
 
     if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
@@ -2974,6 +3137,233 @@ mod tests {
             vec![Arc::new(Int64Array::from_iter_values(0..10_000))],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_recluster_is_incremental_and_idempotent() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("key", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(Int32Array::from(vec![11, 0, 9, 2, 7, 4, 5, 6, 3, 8, 1, 10])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                max_rows_per_group: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset.set_clustering(vec!["key".into()]).await.unwrap();
+        assert_eq!(
+            dataset.clustering_columns().unwrap(),
+            Some(vec!["key".into()])
+        );
+        let version = super::super::metadata::clustering_spec(&dataset)
+            .unwrap()
+            .unwrap()
+            .version;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100,
+            max_rows_per_group: 100,
+            num_threads: Some(1),
+            ..Default::default()
+        };
+        let metrics = recluster(&mut dataset, options.clone()).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+        assert!(
+            dataset
+                .manifest
+                .fragment_clustering_versions()
+                .into_iter()
+                .all(|stamp| stamp == Some(version))
+        );
+        let initial_groups = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| {
+                dataset
+                    .manifest
+                    .fragment_clustering_group(fragment.id() as u64)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(initial_groups.len(), 1);
+        let key_field_id = dataset.schema().field("key").unwrap().id;
+        assert!(dataset.load_indices().await.unwrap().iter().any(|index| {
+            index.keyed_field() == Some(key_field_id)
+                && index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+        }));
+
+        let sorted = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            sorted["key"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &(0..12).collect::<Vec<_>>()
+        );
+        let version_before_noop = dataset.version().version;
+        assert_eq!(
+            recluster(&mut dataset, options.clone()).await.unwrap(),
+            CompactionMetrics::default()
+        );
+        assert_eq!(dataset.version().version, version_before_noop);
+        let stable_options = CompactionOptions {
+            target_rows_per_fragment: 10,
+            ..options.clone()
+        };
+        assert!(
+            plan_recluster(&dataset, &stable_options)
+                .await
+                .unwrap()
+                .groups()
+                .is_empty()
+        );
+
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![12, 13, 14, 15])),
+                Arc::new(Int32Array::from(vec![15, 12, 14, 13])),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+            .await
+            .unwrap();
+        let appended_fragment_id = dataset.get_fragments().last().unwrap().id() as u32;
+        assert_eq!(
+            dataset
+                .manifest
+                .fragment_clustering_versions()
+                .into_iter()
+                .filter(Option::is_none)
+                .count(),
+            1
+        );
+        let stable_plan = plan_recluster(&dataset, &stable_options).await.unwrap();
+        assert_eq!(stable_plan.groups().len(), 1);
+        assert_eq!(
+            stable_plan.groups()[0]
+                .source_fragment_ids()
+                .collect::<Vec<_>>(),
+            vec![appended_fragment_id as u64]
+        );
+        let merge_options = options.clone();
+        let merge_plan = plan_recluster(&dataset, &merge_options).await.unwrap();
+        assert_eq!(merge_plan.groups().len(), 1);
+        assert_eq!(
+            merge_plan.groups()[0].source_fragment_ids().count(),
+            2,
+            "the complete existing layout group and the append must merge together"
+        );
+
+        let mut excluded_options = merge_options.clone();
+        excluded_options.excluded_fragment_ids = vec![appended_fragment_id];
+        assert_eq!(
+            recluster(&mut dataset, excluded_options).await.unwrap(),
+            CompactionMetrics::default()
+        );
+        assert_eq!(
+            dataset
+                .manifest
+                .fragment_clustering_version(appended_fragment_id as u64),
+            None
+        );
+
+        let metrics = recluster(&mut dataset, merge_options.clone())
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+        assert!(
+            dataset
+                .manifest
+                .fragment_clustering_versions()
+                .into_iter()
+                .all(|stamp| stamp == Some(version))
+        );
+        let groups = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| {
+                dataset
+                    .manifest
+                    .fragment_clustering_group(fragment.id() as u64)
+            })
+            .collect::<Vec<_>>();
+        assert!(groups.iter().all(Option::is_some));
+        assert!(
+            groups
+                .iter()
+                .all(|group| { group.is_some_and(|group| !initial_groups.contains(group)) })
+        );
+        let merged_group = groups[0];
+        let merged_fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .filter(|fragment| {
+                dataset
+                    .manifest
+                    .fragment_clustering_group(fragment.id() as u64)
+                    == merged_group
+            })
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut exclude_part_of_group = CompactionOptions {
+            target_rows_per_fragment: 100,
+            ..merge_options
+        };
+        exclude_part_of_group.excluded_fragment_ids = vec![merged_fragment_ids[0]];
+        assert!(
+            plan_recluster(&dataset, &exclude_part_of_group)
+                .await
+                .unwrap()
+                .groups()
+                .is_empty()
+        );
+        let indices = dataset.load_indices().await.unwrap();
+        let zonemaps = indices
+            .iter()
+            .filter(|index| index.keyed_field() == Some(key_field_id))
+            .filter(|index| {
+                index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+            })
+            .collect::<Vec<_>>();
+        assert!(dataset.get_fragments().iter().all(|fragment| {
+            zonemaps.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(fragment.id() as u32))
+            })
+        }));
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 16);
     }
 
     /// Build (or, with `replace`, rebuild) a scalar index named "scalar" on `col`.

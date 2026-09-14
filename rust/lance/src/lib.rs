@@ -92,6 +92,12 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
 }
 
+/// Versioned wire messages for distributed clustering coordination.
+pub mod recluster_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.recluster.rs"));
+}
+
 pub use blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
     BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,

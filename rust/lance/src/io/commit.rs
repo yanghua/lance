@@ -34,6 +34,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
+use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
     is_detached_version, list_index_files_with_sizes, pb,
@@ -1041,6 +1042,8 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    ensure_writable(&dataset.manifest)?;
+
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
@@ -1251,6 +1254,18 @@ async fn load_and_sort_new_transactions(
     Ok((new_ds, txns))
 }
 
+fn ensure_writable(manifest: &Manifest) -> Result<()> {
+    if can_write_dataset(manifest.writer_feature_flags) {
+        Ok(())
+    } else {
+        Err(Error::not_supported(format!(
+            "This dataset cannot be written by this version of Lance. \
+             Please upgrade Lance to write to this dataset.\n Flags: {}",
+            manifest.writer_feature_flags
+        )))
+    }
+}
+
 /// Success-path bookkeeping shared by the direct-success and
 /// verified-own-commit paths of [`commit_transaction`]: populate the session
 /// caches and run the auto-cleanup hook.
@@ -1387,6 +1402,7 @@ pub(crate) async fn commit_transaction(
 
             transaction = rebase.finish(&dataset).await?;
         }
+        ensure_writable(&dataset.manifest)?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.

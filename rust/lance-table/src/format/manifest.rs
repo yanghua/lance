@@ -18,8 +18,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_COVERED_INDEX_METADATA;
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_CLUSTERING_VERSION, FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS,
+    has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -53,6 +55,12 @@ pub struct Manifest {
     /// This list is stored in order, sorted by fragment id.  However, the fragment id
     /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
+
+    /// Clustering layout version by fragment id. Missing entries are unclustered.
+    fragment_clustering_versions: HashMap<u64, u64>,
+
+    /// Clustering layout group by fragment id. Missing entries have no authoritative group.
+    fragment_clustering_groups: HashMap<u64, String>,
 
     /// The file position of the version aux data.
     pub version_aux_data: usize,
@@ -177,13 +185,14 @@ impl Manifest {
         base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-
         Self {
             schema,
             version: 1,
             branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
+            fragment_clustering_versions: HashMap::new(),
+            fragment_clustering_groups: HashMap::new(),
             version_aux_data: 0,
             index_section: None,
             timestamp_nanos: 0,
@@ -208,13 +217,14 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-
         Self {
             schema,
             version: previous.version + 1,
             branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
+            fragment_clustering_versions: HashMap::new(),
+            fragment_clustering_groups: HashMap::new(),
             version_aux_data: 0,
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
@@ -272,19 +282,17 @@ impl Manifest {
             branch: branch_name,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
+            fragment_clustering_versions: self.fragment_clustering_versions.clone(),
+            fragment_clustering_groups: self.fragment_clustering_groups.clone(),
             version_aux_data: self.version_aux_data,
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            // Not derivable from the manifest, so it would be lost like any other
-            // zeroed word: a clone of a table with covering indexes would come
-            // back unfenced, and since the clone copies the index metadata
-            // wholesale -- `covering_fields` included -- a build that predates
-            // covering could then open it and read carried columns as keyed ones.
-            // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
+            // Clustering only fences writers because it changes physical layout,
+            // not logical read semantics.
             reader_feature_flags: self.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
-            writer_feature_flags: self.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | FLAG_CLUSTERING_VERSION),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -326,6 +334,108 @@ impl Manifest {
     /// Get a mutable reference to the table metadata
     pub fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.table_metadata
+    }
+
+    /// The clustering layout versions in fragment order.
+    pub fn fragment_clustering_versions(&self) -> Vec<Option<u64>> {
+        self.fragments
+            .iter()
+            .map(|fragment| self.fragment_clustering_version(fragment.id))
+            .collect()
+    }
+
+    /// The clustering layout groups in fragment order.
+    pub fn fragment_clustering_groups(&self) -> Vec<Option<&str>> {
+        self.fragments
+            .iter()
+            .map(|fragment| self.fragment_clustering_group(fragment.id))
+            .collect()
+    }
+
+    /// Return the clustering layout version recorded for `fragment_id`.
+    pub fn fragment_clustering_version(&self, fragment_id: u64) -> Option<u64> {
+        self.fragment_clustering_versions.get(&fragment_id).copied()
+    }
+
+    /// Return the clustering layout group recorded for `fragment_id`.
+    pub fn fragment_clustering_group(&self, fragment_id: u64) -> Option<&str> {
+        self.fragment_clustering_groups
+            .get(&fragment_id)
+            .map(String::as_str)
+    }
+
+    /// Whether any current fragment has a clustering layout version.
+    pub fn has_fragment_clustering_versions(&self) -> bool {
+        self.fragments
+            .iter()
+            .any(|fragment| self.fragment_clustering_versions.contains_key(&fragment.id))
+    }
+
+    /// Replace clustering versions and groups aligned with [`Self::fragments`].
+    #[doc(hidden)]
+    pub fn set_fragment_clustering_metadata(
+        &mut self,
+        metadata: Vec<(Option<u64>, Option<String>)>,
+    ) -> Result<()> {
+        if metadata.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "manifest has {} fragments but received {} clustering metadata entries",
+                self.fragments.len(),
+                metadata.len()
+            )));
+        }
+        if let Some((position, group)) =
+            metadata
+                .iter()
+                .enumerate()
+                .find_map(|(position, (version, group))| match (version, group) {
+                    (None, Some(group)) => Some((position, group)),
+                    (_, Some(group)) if group.is_empty() => Some((position, group)),
+                    _ => None,
+                })
+        {
+            return Err(Error::invalid_input(format!(
+                "manifest fragment at position {position} has invalid clustering group \
+                 {group:?}; groups must be non-empty and require a clustering version"
+            )));
+        }
+        let mut group_versions = HashMap::<&str, u64>::new();
+        for (version, group) in &metadata {
+            if let (Some(version), Some(group)) = (version, group)
+                && let Some(previous) = group_versions.insert(group, *version)
+                && previous != *version
+            {
+                return Err(Error::invalid_input(format!(
+                    "clustering group {group:?} has conflicting versions {previous} and \
+                     {version}"
+                )));
+            }
+        }
+        self.fragment_clustering_versions.clear();
+        self.fragment_clustering_groups.clear();
+        for (fragment, (version, group)) in self.fragments.iter().zip(metadata) {
+            if let Some(version) = version {
+                self.fragment_clustering_versions
+                    .insert(fragment.id, version);
+            }
+            if let Some(group) = group {
+                self.fragment_clustering_groups.insert(fragment.id, group);
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the clustering layout versions aligned with [`Self::fragments`].
+    ///
+    /// The caller must supply exactly one entry per fragment.
+    #[doc(hidden)]
+    pub fn set_fragment_clustering_versions(&mut self, versions: Vec<Option<u64>>) -> Result<()> {
+        self.set_fragment_clustering_metadata(
+            versions
+                .into_iter()
+                .map(|version| (version, None))
+                .collect(),
+        )
     }
 
     /// Get a mutable reference to the schema metadata
@@ -922,6 +1032,43 @@ impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(p: pb::Manifest) -> Result<Self> {
+        if let Some(fragment) = p.fragments.iter().find(|fragment| {
+            fragment.clustering_version == 0 && !fragment.clustering_group_id.is_empty()
+        }) {
+            return Err(Error::invalid_input(format!(
+                "fragment {} has clustering group {:?} without a clustering version",
+                fragment.id, fragment.clustering_group_id
+            )));
+        }
+        let mut group_versions = HashMap::<&str, u64>::new();
+        for fragment in p
+            .fragments
+            .iter()
+            .filter(|fragment| !fragment.clustering_group_id.is_empty())
+        {
+            if let Some(previous) = group_versions.insert(
+                fragment.clustering_group_id.as_str(),
+                fragment.clustering_version,
+            ) && previous != fragment.clustering_version
+            {
+                return Err(Error::invalid_input(format!(
+                    "clustering group {:?} has conflicting versions {previous} and {}",
+                    fragment.clustering_group_id, fragment.clustering_version
+                )));
+            }
+        }
+        let fragment_clustering_versions = p
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.clustering_version != 0)
+            .map(|fragment| (fragment.id, fragment.clustering_version))
+            .collect();
+        let fragment_clustering_groups = p
+            .fragments
+            .iter()
+            .filter(|fragment| !fragment.clustering_group_id.is_empty())
+            .map(|fragment| (fragment.id, fragment.clustering_group_id.clone()))
+            .collect();
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -993,6 +1140,8 @@ impl TryFrom<pb::Manifest> for Manifest {
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
             fragments,
+            fragment_clustering_versions,
+            fragment_clustering_groups,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
@@ -1045,7 +1194,24 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragments: m
+                .fragments
+                .iter()
+                .map(|fragment| {
+                    let mut proto = pb::DataFragment::from(fragment);
+                    proto.clustering_version = m
+                        .fragment_clustering_versions
+                        .get(&fragment.id)
+                        .copied()
+                        .unwrap_or_default();
+                    proto.clustering_group_id = m
+                        .fragment_clustering_groups
+                        .get(&fragment.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    proto
+                })
+                .collect(),
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1140,7 +1306,7 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
+    use crate::feature_flags::{FLAG_CLUSTERING_VERSION, FLAG_USE_V2_FORMAT_DEPRECATED};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
@@ -1150,6 +1316,122 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_metadata_is_manifest_owned_and_round_trips() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(2), Fragment::new(7)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![
+                (Some(3), Some("group-a".to_string())),
+                (None, None),
+            ])
+            .unwrap();
+
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragments[0].clustering_version, 3);
+        assert_eq!(encoded.fragments[1].clustering_version, 0);
+        assert_eq!(encoded.fragments[0].clustering_group_id, "group-a");
+        assert!(encoded.fragments[1].clustering_group_id.is_empty());
+        let mut invalid = encoded.clone();
+        invalid.fragments[1].clustering_group_id = "orphan".to_string();
+        assert!(Manifest::try_from(invalid).is_err());
+        let mut conflicting = encoded.clone();
+        conflicting.fragments[1].clustering_version = 4;
+        conflicting.fragments[1].clustering_group_id = "group-a".to_string();
+        assert!(Manifest::try_from(conflicting).is_err());
+        // Generic fragment conversion cannot accidentally transport a stamp.
+        assert_eq!(
+            pb::DataFragment::from(&manifest.fragments[0]).clustering_version,
+            0
+        );
+        assert!(
+            pb::DataFragment::from(&manifest.fragments[0])
+                .clustering_group_id
+                .is_empty()
+        );
+
+        let decoded = Manifest::try_from(encoded).unwrap();
+        assert_eq!(decoded.fragment_clustering_versions(), &[Some(3), None]);
+        assert_eq!(decoded.fragment_clustering_version(2), Some(3));
+        assert_eq!(decoded.fragment_clustering_version(7), None);
+        assert_eq!(decoded.fragment_clustering_group(2), Some("group-a"));
+        assert_eq!(decoded.fragment_clustering_group(7), None);
+        assert!(decoded.has_fragment_clustering_versions());
+    }
+
+    #[test]
+    fn new_manifest_defaults_every_clustering_version_to_none() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        assert_eq!(manifest.fragment_clustering_versions(), &[None, None]);
+        assert_eq!(manifest.fragment_clustering_groups(), &[None, None]);
+        assert!(!manifest.has_fragment_clustering_versions());
+    }
+
+    #[test]
+    fn clustering_versions_follow_fragment_ids() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(2), Fragment::new(7)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3), Some(5)])
+            .unwrap();
+        manifest.fragments = Arc::new(vec![Fragment::new(7), Fragment::new(2), Fragment::new(9)]);
+
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragments.len(), 3);
+        assert_eq!(
+            encoded
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![7, 2, 9]
+        );
+        assert_eq!(
+            encoded
+                .fragments
+                .iter()
+                .map(|fragment| fragment.clustering_version)
+                .collect::<Vec<_>>(),
+            vec![5, 3, 0]
+        );
+    }
+
+    #[test]
+    fn shallow_clone_preserves_clustering_writer_fence() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![(Some(3), Some("group-a".to_string()))])
+            .unwrap();
+        manifest.reader_feature_flags = FLAG_CLUSTERING_VERSION;
+        manifest.writer_feature_flags = FLAG_CLUSTERING_VERSION;
+
+        let cloned =
+            manifest.shallow_clone(None, "memory://parent".to_string(), 7, None, String::new());
+
+        assert_eq!(cloned.fragment_clustering_versions(), &[Some(3)]);
+        assert_eq!(cloned.fragment_clustering_groups(), &[Some("group-a")]);
+        assert_eq!(cloned.reader_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

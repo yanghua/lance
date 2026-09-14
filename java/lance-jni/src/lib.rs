@@ -43,6 +43,7 @@ mod async_scanner;
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
+mod clustering;
 mod delta;
 mod dispatcher;
 pub mod error;

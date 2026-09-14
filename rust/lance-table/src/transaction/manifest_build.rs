@@ -48,6 +48,134 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 impl Transaction {
+    fn data_file_identity_eq(left: &DataFile, right: &DataFile) -> bool {
+        left.path == right.path
+            && left.fields == right.fields
+            && left.column_indices == right.column_indices
+            && left.file_major_version == right.file_major_version
+            && left.file_minor_version == right.file_minor_version
+            && left.base_id == right.base_id
+    }
+
+    fn clustering_layout_unchanged(previous: &Fragment, next: &Fragment) -> bool {
+        previous.files.len() == next.files.len()
+            && previous
+                .files
+                .iter()
+                .zip(&next.files)
+                .all(|(left, right)| Self::data_file_identity_eq(left, right))
+            && previous.overlays.len() == next.overlays.len()
+            && previous
+                .overlays
+                .iter()
+                .zip(&next.overlays)
+                .all(|(left, right)| {
+                    left.committed_version == right.committed_version
+                        && left.coverage == right.coverage
+                        && Self::data_file_identity_eq(&left.data_file, &right.data_file)
+                })
+    }
+
+    fn reconcile_fragment_clustering_metadata(
+        &self,
+        current_manifest: Option<&Manifest>,
+        manifest: &mut Manifest,
+    ) -> Result<()> {
+        // Reclustering carries the layout generation through the ordinary rewrite
+        // transaction so commit can stamp the final fragment ids. The marker is
+        // internal metadata, not proof of the files' physical ordering.
+        let new_fragment_version = self.new_fragment_clustering_version()?;
+        let rewrite_group_for_fragment = |fragment: &Fragment| {
+            new_fragment_version?;
+            let Operation::Rewrite { groups, .. } = &self.operation else {
+                return None;
+            };
+            groups.iter().enumerate().find_map(|(group_index, group)| {
+                group
+                    .new_fragments
+                    .iter()
+                    .any(|candidate| Self::clustering_layout_unchanged(candidate, fragment))
+                    .then(|| format!("{}:{group_index}", self.uuid))
+            })
+        };
+        if let Some(marker_version) = new_fragment_version {
+            if !matches!(self.operation, Operation::Rewrite { .. }) {
+                return Err(Error::invalid_input(format!(
+                    "reserved new fragment clustering marker is not valid for operation {}",
+                    self.operation.name()
+                )));
+            }
+            let declared_version = current_manifest
+                .map(crate::transaction::clustering_config::clustering_version)
+                .transpose()?
+                .flatten();
+            match declared_version {
+                Some(declared_version) if declared_version == marker_version => {}
+                Some(declared_version) => {
+                    return Err(Error::invalid_input(format!(
+                        "new fragment clustering marker version {marker_version} does not match \
+                         the clustering declaration version {declared_version} that governed the write"
+                    )));
+                }
+                None => {
+                    return Err(Error::invalid_input(format!(
+                        "new fragment clustering marker version {marker_version} requires a \
+                         clustering declaration that governed the write"
+                    )));
+                }
+            }
+        }
+        if crate::transaction::clustering_config::clustering_version(manifest)?.is_none() {
+            return manifest
+                .set_fragment_clustering_metadata(vec![(None, None); manifest.fragments.len()]);
+        }
+        let is_overwrite = matches!(self.operation, Operation::Overwrite { .. });
+        let schema_changed = matches!(self.operation, Operation::Project { .. })
+            && current_manifest.is_some_and(|current| current.schema != manifest.schema);
+        let mut previous_by_id = HashMap::new();
+        let mut duplicate_ids = HashSet::new();
+        if !is_overwrite && let Some(current) = current_manifest {
+            for fragment in current.fragments.iter() {
+                let version = current.fragment_clustering_version(fragment.id);
+                let group = current
+                    .fragment_clustering_group(fragment.id)
+                    .map(str::to_owned);
+                if previous_by_id
+                    .insert(fragment.id, (fragment, version, group))
+                    .is_some()
+                {
+                    duplicate_ids.insert(fragment.id);
+                }
+            }
+        }
+
+        let metadata = manifest
+            .fragments
+            .iter()
+            .map(|fragment| {
+                if schema_changed {
+                    return (None, None);
+                }
+                if is_overwrite || current_manifest.is_none() {
+                    return (new_fragment_version, None);
+                }
+                if duplicate_ids.contains(&fragment.id) {
+                    return (None, None);
+                }
+                match previous_by_id.get(&fragment.id) {
+                    Some((previous, version, group))
+                        if Self::clustering_layout_unchanged(previous, fragment) =>
+                    {
+                        (*version, group.clone())
+                    }
+                    Some(_) => (None, None),
+                    None => (new_fragment_version, rewrite_group_for_fragment(fragment)),
+                }
+            })
+            .collect();
+        manifest.set_fragment_clustering_metadata(metadata)
+    }
+
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
@@ -867,9 +995,9 @@ impl Transaction {
             Operation::Merge { fragments, .. } => {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
+                let prev_by_id: HashMap<u64, &Fragment> =
+                    existing_fragments.iter().map(|f| (f.id, f)).collect();
                 if next_row_id.is_some() {
-                    let prev_by_id: HashMap<u64, &Fragment> =
-                        existing_fragments.iter().map(|f| (f.id, f)).collect();
                     for fragment in merged_fragments.iter_mut() {
                         match prev_by_id.get(&fragment.id) {
                             Some(prev) => {
@@ -979,7 +1107,6 @@ impl Transaction {
                             .collect()
                     })
                     .unwrap_or_default();
-
                 // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
                 // 3. add modified fragments to final_fragments
                 for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
@@ -1282,43 +1409,6 @@ impl Transaction {
 
         manifest.tag.clone_from(&self.tag);
 
-        if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) build with the default config,
-            // which has use_stable_row_ids = false. Without inheriting from the previous
-            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
-            let inherited = current_manifest
-                .map(|m| m.uses_stable_row_ids())
-                .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
-            apply_feature_flags(
-                &mut manifest,
-                use_stable_row_ids,
-                config.disable_transaction_file,
-            )?;
-        }
-        // Set after apply_feature_flags, which resets both flag words -- and a
-        // `Manifest` only points at its index section, so the flag cannot be
-        // derived there.
-        //
-        // Derived fresh from `final_indices` on every commit, never inherited.
-        // Every manifest this reaches starts with both words zeroed -- `Manifest::new`
-        // and `new_from_previous` alike -- so there is no stale bit to clear, and
-        // dropping the last covering index lifts the fence by simply not setting
-        // it again. Inheriting it from the previous manifest instead would make
-        // the fence permanent.
-        //
-        // Both words: a reader that selects a vector index by membership of
-        // `fields` would answer a query on a merely-carried column with an index
-        // keyed on another one, and a writer that treats every entry of `fields`
-        // as keyed would mismaintain it.
-        if final_indices
-            .iter()
-            .any(|index| !index.covering_fields.is_empty())
-        {
-            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-        }
-
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
@@ -1460,6 +1550,13 @@ impl Transaction {
             _ => {}
         }
 
+        self.reconcile_fragment_clustering_metadata(current_manifest, &mut manifest)?;
+
+        crate::transaction::clustering_config::validate_clustering_config_transition(
+            current_manifest,
+            &manifest,
+        )?;
+
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
             // Validate and add new base paths to the manifest
@@ -1502,6 +1599,37 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        // Derive flags only after every operation-specific mutation has reached
+        // the candidate manifest. In particular, UpdateConfig and Overwrite can
+        // introduce table and clustering config, while UpdateBases adds paths.
+        if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) build with the default config,
+            // which has use_stable_row_ids = false. Without inheriting from the previous
+            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
+            let inherited = current_manifest
+                .map(|m| m.uses_stable_row_ids())
+                .unwrap_or(false);
+            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            apply_feature_flags(
+                &mut manifest,
+                use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
+        }
+
+        // A `Manifest` only points at its index section, so this flag cannot be
+        // derived by apply_feature_flags. Derive it fresh from the final index
+        // list on every commit instead of inheriting a stale bit. Both readers
+        // and writers must understand that `fields` contains keyed followed by
+        // covered columns.
+        if final_indices
+            .iter()
+            .any(|index| !index.covering_fields.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+
         Ok((manifest, final_indices))
     }
 
@@ -1531,6 +1659,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{FLAG_CLUSTERING_VERSION, FLAG_TABLE_CONFIG};
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
     use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
@@ -1539,7 +1668,10 @@ mod tests {
         default_build_config, make_stable_row_id_manifest, overlay_with_field,
         sample_index_metadata, sample_manifest,
     };
-    use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
+    use crate::transaction::{
+        DataOverlayGroup, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        validate_operation,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -1555,6 +1687,684 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    fn stamped_manifest_with_fragments(count: u64) -> Manifest {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let fragments = (0..count)
+            .map(|id| {
+                let mut fragment = Fragment::new(id);
+                fragment.files = vec![DataFile::new_legacy_from_fields(
+                    format!("{id}.lance"),
+                    vec![0, 1],
+                    None,
+                )];
+                fragment
+            })
+            .collect();
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(fragments),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.config.extend(
+            clustering_entries(r#"["id"]"#, "7")
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.key,
+                        entry.value.expect("clustering entry has a value"),
+                    )
+                }),
+        );
+        manifest
+            .set_fragment_clustering_metadata(
+                (0..count)
+                    .map(|id| (Some(7), Some(format!("group-{id}"))))
+                    .collect(),
+            )
+            .unwrap();
+        manifest
+    }
+
+    const CLUSTERING_COLUMNS_KEY: &str = "lance.clustering.columns";
+    const CLUSTERING_ALGORITHM_REVISION_KEY: &str = "lance.clustering.algorithm_revision";
+    const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
+
+    fn clustering_entries(columns: &str, version: &str) -> Vec<UpdateMapEntry> {
+        [
+            (CLUSTERING_COLUMNS_KEY, Some(columns)),
+            (
+                CLUSTERING_ALGORITHM_REVISION_KEY,
+                Some(lance_core::clustering::CLUSTERING_ALGORITHM_REVISION),
+            ),
+            (CLUSTERING_VERSION_KEY, Some(version)),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect()
+    }
+
+    fn update_config_transaction(
+        read_version: u64,
+        update_entries: Vec<UpdateMapEntry>,
+        replace: bool,
+    ) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: Some(UpdateMap {
+                    update_entries,
+                    replace,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        )
+    }
+
+    fn manifest_with_clustering_config(
+        mut manifest: Manifest,
+        columns: &str,
+        version: &str,
+    ) -> Manifest {
+        for entry in clustering_entries(columns, version) {
+            manifest.config.insert(
+                entry.key,
+                entry.value.expect("clustering entry has a value"),
+            );
+        }
+        manifest
+    }
+
+    #[test]
+    fn test_update_config_accepts_complete_clustering_declaration() {
+        let manifest = sample_manifest();
+        let transaction = update_config_transaction(
+            manifest.version,
+            clustering_entries(r#"["id"]"#, "1"),
+            false,
+        );
+
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.config[CLUSTERING_COLUMNS_KEY], r#"["id"]"#);
+        assert_eq!(
+            result.config[CLUSTERING_ALGORITHM_REVISION_KEY],
+            lance_core::clustering::CLUSTERING_ALGORITHM_REVISION
+        );
+        assert_eq!(result.config[CLUSTERING_VERSION_KEY], "1");
+        assert_ne!(result.writer_feature_flags & FLAG_TABLE_CONFIG, 0);
+        assert_ne!(result.writer_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+    }
+
+    #[test]
+    fn test_update_config_rejects_partial_clustering_declarations() {
+        let manifest = sample_manifest();
+        for missing_key in [
+            CLUSTERING_COLUMNS_KEY,
+            CLUSTERING_ALGORITHM_REVISION_KEY,
+            CLUSTERING_VERSION_KEY,
+        ] {
+            let mut update_entries = clustering_entries(r#"["id"]"#, "1");
+            update_entries.retain(|entry| entry.key != missing_key);
+
+            let error = update_config_transaction(manifest.version, update_entries, false)
+                .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidInput { .. }),
+                "got {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("incomplete clustering config"),
+                "got {error}"
+            );
+            assert!(
+                message.contains(missing_key),
+                "expected missing key {missing_key:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_config_rejects_malformed_clustering_declarations() {
+        let manifest = sample_manifest();
+        let cases = [
+            (
+                clustering_entries("not-json", "1"),
+                "expected a JSON string array",
+            ),
+            (
+                clustering_entries(r#"["id", 1]"#, "1"),
+                "expected a JSON string array",
+            ),
+            (
+                clustering_entries(r#"["id"]"#, "one"),
+                "expected a positive u64",
+            ),
+        ];
+
+        for (update_entries, expected_message) in cases {
+            let error = update_config_transaction(manifest.version, update_entries, false)
+                .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidInput { .. }),
+                "got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_message),
+                "expected {expected_message:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_config_rejects_zero_clustering_version() {
+        let manifest = sample_manifest();
+        let error = update_config_transaction(
+            manifest.version,
+            clustering_entries(r#"["id"]"#, "0"),
+            false,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::InvalidInput { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("version must be positive"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn test_update_config_validates_clustering_columns_against_final_schema() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, false),
+        ]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        for (column, expected_message) in [
+            ("missing", "must name an existing top-level column"),
+            ("payload", "does not support column type Binary"),
+        ] {
+            let columns = format!(r#"["{column}"]"#);
+            let error = update_config_transaction(
+                manifest.version,
+                clustering_entries(&columns, "1"),
+                false,
+            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+
+            assert!(
+                matches!(&error, Error::InvalidInput { .. }),
+                "got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_message),
+                "expected {expected_message:?} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_config_rejects_clustering_version_decrease() {
+        let manifest = manifest_with_clustering_config(sample_manifest(), r#"["id"]"#, "3");
+        let error = update_config_transaction(
+            manifest.version,
+            vec![(CLUSTERING_VERSION_KEY, Some("2")).into()],
+            false,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::InvalidInput { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("cannot decrease from 3 to 2"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn test_update_config_requires_version_bump_for_algorithm_change() {
+        let manifest = manifest_with_clustering_config(sample_manifest(), r#"["id"]"#, "3");
+        let error = update_config_transaction(
+            manifest.version,
+            vec![
+                (
+                    CLUSTERING_ALGORITHM_REVISION_KEY,
+                    Some("typed-quantile-rank-v2"),
+                )
+                    .into(),
+            ],
+            false,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::InvalidInput { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("changing clustering columns or algorithm revision requires"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn test_update_config_reenable_requires_version_above_fragment_stamps() {
+        let mut manifest = sample_manifest();
+        manifest
+            .set_fragment_clustering_versions(vec![Some(3)])
+            .unwrap();
+        let error = update_config_transaction(
+            manifest.version,
+            clustering_entries(r#"["id"]"#, "3"),
+            false,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::InvalidInput { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("greater than existing fragment version 3"),
+            "got {error}"
+        );
+
+        update_config_transaction(
+            manifest.version,
+            clustering_entries(r#"["id"]"#, "4"),
+            false,
+        )
+        .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+        .unwrap();
+    }
+
+    #[test]
+    fn test_new_fragment_marker_must_match_governing_declaration() {
+        let manifest = stamped_manifest_with_fragments(1);
+        let transaction = TransactionBuilder::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments.as_ref().clone(),
+                    new_fragments: vec![Fragment::new(1)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+        )
+        .new_fragment_clustering_version(8)
+        .build();
+
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("marker version 8 does not match the clustering declaration version 7"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn test_clustering_rewrite_stamps_distinct_layout_groups() {
+        let manifest = stamped_manifest_with_fragments(2);
+        let mut first = Fragment::new(0);
+        first.files = vec![DataFile::new_legacy_from_fields(
+            "first-output.lance",
+            vec![0, 1],
+            None,
+        )];
+        let mut second = Fragment::new(0);
+        second.files = vec![DataFile::new_legacy_from_fields(
+            "second-output.lance",
+            vec![0, 1],
+            None,
+        )];
+        let mut first_sibling = Fragment::new(0);
+        first_sibling.files = vec![DataFile::new_legacy_from_fields(
+            "first-sibling-output.lance",
+            vec![0, 1],
+            None,
+        )];
+        let transaction = TransactionBuilder::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![
+                    RewriteGroup {
+                        old_fragments: vec![manifest.fragments[0].clone()],
+                        new_fragments: vec![first, first_sibling],
+                    },
+                    RewriteGroup {
+                        old_fragments: vec![manifest.fragments[1].clone()],
+                        new_fragments: vec![second],
+                    },
+                ],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+        )
+        .new_fragment_clustering_version(7)
+        .build();
+
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(
+            result.fragment_clustering_versions(),
+            vec![Some(7), Some(7), Some(7)]
+        );
+        let groups = result.fragment_clustering_groups();
+        assert!(groups.iter().all(Option::is_some));
+        assert_eq!(groups[0], groups[1]);
+        assert_ne!(groups[1], groups[2]);
+    }
+
+    #[test]
+    fn test_new_fragment_marker_rejects_unsupported_operations() {
+        let manifest = stamped_manifest_with_fragments(1);
+        let operations = [
+            Operation::Append {
+                fragments: vec![Fragment::new(0)],
+            },
+            Operation::Overwrite {
+                fragments: vec![Fragment::new(0)],
+                schema: manifest.schema.clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(0)],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            Operation::Merge {
+                fragments: manifest.fragments.as_ref().clone(),
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+        ];
+
+        for operation in operations {
+            let operation_name = operation.name().to_string();
+            let error = TransactionBuilder::new(manifest.version, operation)
+                .new_fragment_clustering_version(7)
+                .build()
+                .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+                .unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(
+                error.to_string().contains(&format!(
+                    "reserved new fragment clustering marker is not valid for operation \
+                     {operation_name}"
+                )),
+                "got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_config_allows_clearing_all_clustering_keys() {
+        let mut manifest = manifest_with_clustering_config(sample_manifest(), r#"["id"]"#, "1");
+        manifest
+            .config
+            .insert("application.key".to_string(), "value".to_string());
+        let deletes = [
+            CLUSTERING_COLUMNS_KEY,
+            CLUSTERING_ALGORITHM_REVISION_KEY,
+            CLUSTERING_VERSION_KEY,
+        ]
+        .into_iter()
+        .map(|key| (key, None).into())
+        .collect();
+
+        let (result, _) = update_config_transaction(manifest.version, deletes, false)
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert!(
+            result
+                .config
+                .keys()
+                .all(|key| !key.starts_with("lance.clustering."))
+        );
+        assert_eq!(result.config["application.key"], "value");
+        assert_eq!(result.writer_feature_flags & FLAG_CLUSTERING_VERSION, 0);
+    }
+
+    #[test]
+    fn test_schema_changes_cannot_leave_clustering_columns_dangling() {
+        let manifest = manifest_with_clustering_config(sample_manifest(), r#"["id"]"#, "1");
+        let projected = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "other",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+
+        let operations = [
+            Operation::Project {
+                schema: projected.clone(),
+                preserves_nullability: true,
+            },
+            Operation::Overwrite {
+                fragments: vec![Fragment::new(0)],
+                schema: projected,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        ];
+        for operation in operations {
+            let error = Transaction::new(manifest.version, operation, None)
+                .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::InvalidInput { .. }),
+                "got {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("clustering column \"id\" must name an existing top-level column"),
+                "got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_columns_invalidates_updated_and_inserted_fragments() {
+        let manifest = stamped_manifest_with_fragments(2);
+        let mut updated = manifest.fragments[0].clone();
+        updated.files[0].path = "0-updated.lance".to_string();
+        // The transaction may have been staged before the current stamp was
+        // known; build_manifest owns the final invalidation decision.
+        let mut inserted = Fragment::new(0);
+        inserted.files = vec![DataFile::new_legacy_from_fields(
+            "inserted.lance",
+            vec![0, 1],
+            None,
+        )];
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated],
+                new_fragments: vec![inserted],
+                fields_modified: vec![1],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.fragment_clustering_version(0), None);
+        assert_eq!(result.fragment_clustering_version(1), Some(7));
+        assert_eq!(result.fragment_clustering_version(2), None);
+    }
+
+    #[test]
+    fn test_non_column_update_and_delete_preserve_clustering_version() {
+        let manifest = stamped_manifest_with_fragments(1);
+        let mut updated = manifest.fragments[0].clone();
+        updated.physical_rows = Some(9);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(result.fragment_clustering_version(0), Some(7));
+        assert_eq!(result.fragment_clustering_group(0), Some("group-0"));
+
+        let deleted = result.fragments[0].clone();
+        let transaction = Transaction::new(
+            result.version,
+            Operation::Delete {
+                updated_fragments: vec![deleted],
+                deleted_fragment_ids: vec![],
+                predicate: "id = 1".to_string(),
+            },
+            None,
+        );
+        let (result, _) = transaction
+            .build_manifest(Some(&result), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(result.fragment_clustering_version(0), Some(7));
+        assert_eq!(result.fragment_clustering_group(0), Some("group-0"));
+    }
+
+    #[test]
+    fn test_merge_invalidates_only_physically_rewritten_existing_fragments() {
+        let manifest = stamped_manifest_with_fragments(2);
+        let unchanged = manifest.fragments[0].clone();
+        let mut rewritten = manifest.fragments[1].clone();
+        rewritten.files[0].path = "1-rewritten.lance".to_string();
+        let mut inserted = Fragment::new(2);
+        inserted.files = vec![DataFile::new_legacy_from_fields(
+            "inserted.lance",
+            vec![0, 1],
+            None,
+        )];
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: vec![unchanged, rewritten, inserted],
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.fragment_clustering_version(0), Some(7));
+        assert_eq!(result.fragment_clustering_version(1), None);
+        assert_eq!(result.fragment_clustering_version(2), None);
+        assert_eq!(result.fragment_clustering_group(0), Some("group-0"));
+        assert_eq!(result.fragment_clustering_group(1), None);
+        assert_eq!(result.fragment_clustering_group(2), None);
+    }
+
+    #[test]
+    fn test_project_preserves_fragment_clustering_versions() {
+        let manifest = stamped_manifest_with_fragments(2);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project {
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let (unchanged, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(
+            unchanged.fragment_clustering_versions(),
+            &[Some(7), Some(7)]
+        );
+        assert_eq!(
+            unchanged.fragment_clustering_groups(),
+            &[Some("group-0"), Some("group-1")]
+        );
+
+        let projected_schema = manifest.schema.project_by_ids(&[0], true);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project {
+                schema: projected_schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let (projected, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(projected.fragment_clustering_versions(), &[None, None]);
+        assert_eq!(projected.fragment_clustering_groups(), &[None, None]);
     }
 
     #[test]

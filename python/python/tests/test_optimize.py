@@ -62,6 +62,28 @@ def test_dataset_optimize_excluded_fragment_ids(tmp_path: Path):
     assert fragments[1].fragment_id in remaining_fragment_ids
 
 
+def test_recluster_is_exposed_as_local_maintenance(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"key": [3, 1, 2, 0]}),
+        tmp_path / "dataset",
+        max_rows_per_file=2,
+    )
+    assert dataset.clustering_columns() is None
+
+    dataset.set_clustering(["key"])
+    assert dataset.clustering_columns() == ["key"]
+    metrics = dataset.optimize.recluster(
+        target_rows_per_fragment=100,
+        max_rows_per_group=100,
+        num_threads=1,
+    )
+
+    assert metrics.fragments_removed == 2
+    assert dataset.to_table()["key"].to_pylist() == [0, 1, 2, 3]
+    dataset.clear_clustering()
+    assert dataset.clustering_columns() is None
+
+
 def test_compact_files_source_budgets(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     data = pa.table({"a": range(1000), "b": range(1000)})

@@ -48,6 +48,10 @@ class Compaction:
         dataset: "LanceDataset", options: CompactionOptions
     ) -> CompactionMetrics: ...
     @staticmethod
+    def recluster(
+        dataset: "LanceDataset", options: CompactionOptions
+    ) -> CompactionMetrics: ...
+    @staticmethod
     def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
     @staticmethod
     def commit(

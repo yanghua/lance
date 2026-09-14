@@ -9,6 +9,8 @@ use arrow_schema::{DataType, Field as ArrowField};
 use std::sync::LazyLock;
 
 pub mod cache;
+#[doc(hidden)]
+pub mod clustering;
 pub mod container;
 pub mod datatypes;
 pub mod deepsize;

@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.clustering;
+
+// One deterministic sample retained while building a distributed clustering model.
+message Sample {
+  fixed64 priority = 1;
+  fixed64 row_address = 2;
+  bytes encoded_value = 3;
+}
+
+// Samples for one clustering column. `data_type` is Arrow's canonical type string.
+message SampleColumn {
+  string data_type = 1;
+  repeated Sample samples = 2;
+  uint64 max_encoded_value_bytes = 3;
+}
+
+// Mergeable partial state produced independently by clustering workers.
+message PartialModel {
+  uint32 format_version = 1;
+  string algorithm_revision = 2;
+  repeated string columns = 3;
+  repeated SampleColumn sample_columns = 4;
+  // Opaque plan identity. Partial models with different contexts cannot merge.
+  bytes context = 5;
+  // Total rows observed before bounded value sampling.
+  uint64 input_rows = 6;
+  // Four-word, order-independent digest of all input row addresses.
+  repeated fixed64 row_digest = 7;
+}
+
+// Final empirical-rank model shared by every worker in one reclustering plan.
+message Model {
+  uint32 format_version = 1;
+  string algorithm_revision = 2;
+  repeated string columns = 3;
+  repeated ModelColumn model_columns = 4;
+  // Opaque plan identity copied into the final model.
+  bytes context = 5;
+  uint64 input_rows = 6;
+  repeated fixed64 row_digest = 7;
+}
+
+message ModelColumn {
+  string data_type = 1;
+  repeated bytes encoded_values = 2;
+}

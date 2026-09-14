@@ -384,18 +384,23 @@ impl Transaction {
         _next_row_id: Option<&u64>,
     ) -> Result<()> {
         for group in groups {
+            let Some(first_old_fragment) = group.old_fragments.first() else {
+                return Err(Error::invalid_input(
+                    "rewrite group must contain at least one source fragment",
+                ));
+            };
             // If the old fragments are contiguous, find the range
             let replace_range = {
                 let start = final_fragments
                     .iter()
                     .enumerate()
-                    .find(|(_, f)| f.id == group.old_fragments[0].id)
+                    .find(|(_, f)| f.id == first_old_fragment.id)
                     .ok_or_else(|| {
                         Error::commit_conflict_source(
                             version,
                             format!(
                                 "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
-                                group.old_fragments[0].id
+                                first_old_fragment.id
                             )
                             .into(),
                         )
@@ -408,7 +413,10 @@ impl Transaction {
                     if i == group.old_fragments.len() {
                         break Some(start..start + i);
                     }
-                    if final_fragments[start + i].id != group.old_fragments[i].id {
+                    if final_fragments
+                        .get(start + i)
+                        .is_none_or(|fragment| fragment.id != group.old_fragments[i].id)
+                    {
                         break None;
                     }
                     i += 1;
@@ -492,6 +500,24 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_rewrite_fragments_rejects_empty_source_group() {
+        let error = Transaction::handle_rewrite_fragments(
+            &mut vec![Fragment::new(0)],
+            &[RewriteGroup {
+                old_fragments: vec![],
+                new_fragments: vec![Fragment::new(1)],
+            }],
+            &mut 2,
+            1,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("at least one source fragment"));
     }
 
     #[test]

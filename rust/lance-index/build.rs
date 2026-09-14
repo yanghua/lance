@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         &[
             "./protos/index.proto",
             "./protos/index_old.proto",
+            "./protos/clustering.proto",
             "./protos-cache/cache.proto",
         ],
         &["./protos", "./protos-cache"],

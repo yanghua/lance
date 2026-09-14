@@ -125,6 +125,11 @@ message Manifest {
   //   merely-carried column with an index keyed on a different column. Writers must
   //   refuse it too: one that treats every entry of fields as keyed would maintain
   //   the index against the wrong dependency set.
+  // * 1 << 8: the dataset has an active liquid-clustering configuration or fragments
+  //   with clustering layout version/group stamps. Readers and writers that predate this
+  //   contract must refuse writes because old rewrite paths could silently
+  //   discard the declaration or stamps. Readers may ignore physical layout
+  //   metadata, so this bit is set only in writer_feature_flags.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -393,6 +398,20 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // The clustering layout version this fragment's data was written under, if
+  // it was written by a clustering-aware writer (see the `lance.clustering.*`
+  // dataset config). A fragment whose stamp is absent (0) or does not equal the
+  // dataset's current clustering version is "under-clustered" and is a
+  // candidate for re-clustering during optimize. Zero means unset.
+  // Manifests containing this field set writer feature flag 256. Readers may
+  // ignore the stamp because it does not change logical row values.
+  uint64 clustering_version = 12;
+
+  // Identifies the clustering rewrite group that produced this fragment. All
+  // fragments in one group were ordered using the same clustering model. Empty
+  // means no authoritative group is known.
+  string clustering_group_id = 13;
 }
 
 message DataFile {

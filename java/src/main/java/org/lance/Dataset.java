@@ -1693,6 +1693,71 @@ public class Dataset implements Closeable {
   private native void nativeCompact(CompactionOptions options);
 
   /**
+   * Declare clustering columns without rewriting existing data.
+   *
+   * <p>One to four top-level scalar columns are supported. Layout generations and encoding details
+   * are managed internally; ordinary writes remain streaming until {@link #recluster()} is called.
+   *
+   * @param columns ordered clustering columns
+   */
+  public void setClustering(List<String> columns) {
+    Preconditions.checkNotNull(columns, "columns cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeSetClustering(columns);
+    }
+  }
+
+  private native void nativeSetClustering(List<String> columns);
+
+  /**
+   * Return the declared clustering columns.
+   *
+   * @return the ordered columns, or empty if clustering is not declared
+   */
+  public Optional<List<String>> getClusteringColumns() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeGetClusteringColumns());
+    }
+  }
+
+  private native List<String> nativeGetClusteringColumns();
+
+  /** Remove the clustering declaration without rewriting existing data. */
+  public void clearClustering() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeClearClustering();
+    }
+  }
+
+  private native void nativeClearClustering();
+
+  /**
+   * Incrementally apply the declared clustering layout.
+   *
+   * <p>Only fragments not stamped with the current internal layout generation are rewritten. Stable
+   * row IDs and non-zonemap secondary indices are not yet supported.
+   *
+   * @param options compaction sizing and per-run source limits
+   */
+  public void recluster(CompactionOptions options) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeRecluster(options);
+    }
+  }
+
+  /** Incrementally apply the declared clustering layout with default options. */
+  public void recluster() {
+    recluster(CompactionOptions.builder().build());
+  }
+
+  private native void nativeRecluster(CompactionOptions options);
+
+  /**
    * Update the config of the dataset. This operation will only overwrite and NOT delete the
    * existing config.
    *
