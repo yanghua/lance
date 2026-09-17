@@ -53,16 +53,21 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// Reserved for datasets that reference recognized V2 data files with
 /// different exact versions.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// The dataset has liquid-clustering configuration or fragment layout stamps.
+/// Writers must preserve this metadata; readers may ignore it because it does
+/// not affect logical row values.
+pub const FLAG_CLUSTERING_METADATA: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 8;
+pub const FLAG_UNKNOWN: u64 = 1 << 10;
 
-// Supported flags stay below the unknown boundary; the mixed-version bit is
-// reserved at the boundary until its storage contract lands.
+// Supported flags stay below the unknown boundary. The mixed-version bit is
+// allocated but removed from the supported mask until its storage contract lands.
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
-const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_CLUSTERING_METADATA);
+const _: () = assert!(FLAG_CLUSTERING_METADATA < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -139,6 +144,12 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
+    let has_clustering_metadata =
+        manifest.liquid_clustering.is_some() || manifest.has_fragment_clustering_generations();
+    if has_clustering_metadata {
+        manifest.writer_feature_flags |= FLAG_CLUSTERING_METADATA;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -188,6 +199,9 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
+    // Bit 8 is allocated but intentionally unsupported until the full mixed
+    // exact-version contract lands. Do not expose it by moving FLAG_UNKNOWN.
+    supported &= !FLAG_MIXED_DATA_FILE_VERSIONS;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -330,6 +344,46 @@ mod tests {
         // Enabled (debug or env opt-in): the overlay flag is understood.
         let supported = supported_flags_when(true);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
+    }
+
+    #[test]
+    fn clustering_metadata_requires_only_a_current_writer() {
+        assert!(can_read_dataset(FLAG_CLUSTERING_METADATA));
+        assert!(can_write_dataset(FLAG_CLUSTERING_METADATA));
+    }
+
+    #[test]
+    fn apply_feature_flags_sets_clustering_writer_flag() {
+        use crate::clustering::ClusteringGroupId;
+        use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let mut configured = empty_manifest();
+        configured.liquid_clustering = Some(
+            LiquidClusteringState::new(true, 1, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
+        );
+        apply_feature_flags(&mut configured, false, false).unwrap();
+        assert_eq!(
+            configured.reader_feature_flags & FLAG_CLUSTERING_METADATA,
+            0
+        );
+        assert_ne!(
+            configured.writer_feature_flags & FLAG_CLUSTERING_METADATA,
+            0
+        );
+
+        let mut stamped = empty_manifest();
+        stamped.fragments = Arc::new(vec![crate::format::Fragment::new(0)]);
+        stamped
+            .set_fragment_clustering_metadata(vec![(
+                Some(1),
+                Some(ClusteringGroupId::from(Uuid::from_u128(1))),
+            )])
+            .unwrap();
+        apply_feature_flags(&mut stamped, false, false).unwrap();
+        assert_eq!(stamped.reader_feature_flags & FLAG_CLUSTERING_METADATA, 0);
+        assert_ne!(stamped.writer_feature_flags & FLAG_CLUSTERING_METADATA, 0);
     }
 
     #[test]
@@ -549,6 +603,5 @@ mod tests {
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
-        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_UNKNOWN);
     }
 }

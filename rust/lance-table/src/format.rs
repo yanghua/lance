@@ -26,6 +26,8 @@ pub use manifest::{
 pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
 pub use transaction::{Transaction, operation_may_change_schema};
 
+use crate::clustering::ClusteringGroupId;
+use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
 use lance_core::{Error, Result};
 
 // In 0.36.1 we renamed Index to IndexMetadata because Index conflicted too much with the
@@ -70,6 +72,58 @@ impl From<&Uuid> for pb::Uuid {
     fn from(value: &Uuid) -> Self {
         Self {
             uuid: value.into_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<&pb::Uuid> for ClusteringGroupId {
+    type Error = Error;
+
+    fn try_from(value: &pb::Uuid) -> Result<Self> {
+        Ok(Uuid::try_from(value)?.into())
+    }
+}
+
+impl From<&ClusteringGroupId> for pb::Uuid {
+    fn from(value: &ClusteringGroupId) -> Self {
+        Self::from(&Uuid::from(*value))
+    }
+}
+
+impl TryFrom<&pb::LiquidClusteringState> for LiquidClusteringState {
+    type Error = Error;
+
+    fn try_from(value: &pb::LiquidClusteringState) -> Result<Self> {
+        let algorithm = match pb::ClusteringAlgorithm::try_from(value.algorithm) {
+            Ok(pb::ClusteringAlgorithm::TypedQuantileRankV1) => {
+                ClusteringAlgorithm::TypedQuantileRankV1
+            }
+            Ok(pb::ClusteringAlgorithm::Unspecified) => {
+                return Err(Error::invalid_input(
+                    "liquid clustering algorithm must be specified",
+                ));
+            }
+            Err(_) => {
+                return Err(Error::not_supported(format!(
+                    "unknown liquid clustering algorithm {}",
+                    value.algorithm
+                )));
+            }
+        };
+        Self::new(value.enabled, value.generation, algorithm)
+    }
+}
+
+impl From<&LiquidClusteringState> for pb::LiquidClusteringState {
+    fn from(value: &LiquidClusteringState) -> Self {
+        Self {
+            enabled: value.enabled,
+            generation: value.generation,
+            algorithm: match value.algorithm {
+                ClusteringAlgorithm::TypedQuantileRankV1 => {
+                    pb::ClusteringAlgorithm::TypedQuantileRankV1 as i32
+                }
+            },
         }
     }
 }

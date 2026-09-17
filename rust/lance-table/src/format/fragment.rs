@@ -753,6 +753,10 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            // Clustering stamps are owned by Manifest's private sidecar and
+            // injected only when the complete Manifest is serialized.
+            clustering_generation: 0,
+            clustering_group_id: None,
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
