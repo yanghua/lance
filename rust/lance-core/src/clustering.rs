@@ -1,37 +1,80 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Persisted clustering declaration shared by table and execution crates.
+//! Liquid-clustering state shared by table and execution crates.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use arrow_schema::DataType;
 
 use crate::datatypes::Schema;
+use crate::deepsize::DeepSizeOf;
 use crate::{Error, Result, is_system_column};
 
-pub const CLUSTERING_CONFIG_PREFIX: &str = "lance.clustering.";
-pub const CLUSTERING_COLUMNS_KEY: &str = "lance.clustering.columns";
-pub const CLUSTERING_ALGORITHM_REVISION_KEY: &str = "lance.clustering.algorithm_revision";
-pub const CLUSTERING_VERSION_KEY: &str = "lance.clustering.version";
 pub const CLUSTERING_ALGORITHM_REVISION: &str = "typed-quantile-rank-v1";
 pub const MAX_CLUSTERING_COLUMNS: usize = 4;
+
+/// Physical layout algorithm used by liquid clustering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub enum ClusteringAlgorithm {
+    TypedQuantileRankV1,
+}
+
+impl ClusteringAlgorithm {
+    pub const fn revision(self) -> &'static str {
+        match self {
+            Self::TypedQuantileRankV1 => CLUSTERING_ALGORITHM_REVISION,
+        }
+    }
+}
+
+/// Persisted table-level liquid-clustering state.
+///
+/// The ordered clustering key is intentionally not repeated here. It is stored
+/// on schema fields as the unenforced clustering key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub struct LiquidClusteringState {
+    pub enabled: bool,
+    pub generation: u64,
+    pub algorithm: ClusteringAlgorithm,
+}
+
+impl LiquidClusteringState {
+    pub fn new(enabled: bool, generation: u64, algorithm: ClusteringAlgorithm) -> Result<Self> {
+        let state = Self {
+            enabled,
+            generation,
+            algorithm,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.generation == 0 {
+            return Err(Error::invalid_input(
+                "clustering generation must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Desired clustering columns and the internally managed layout generation.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusteringSpec {
     pub columns: Vec<String>,
-    pub algorithm_revision: String,
-    pub version: u64,
+    pub algorithm: ClusteringAlgorithm,
+    pub generation: u64,
 }
 
 impl ClusteringSpec {
-    pub fn new(columns: Vec<String>, version: u64) -> Result<Self> {
+    pub fn new(columns: Vec<String>, generation: u64) -> Result<Self> {
         let spec = Self {
             columns,
-            algorithm_revision: CLUSTERING_ALGORITHM_REVISION.to_string(),
-            version,
+            algorithm: ClusteringAlgorithm::TypedQuantileRankV1,
+            generation,
         };
         spec.validate()?;
         Ok(spec)
@@ -49,12 +92,9 @@ impl ClusteringSpec {
                 self.columns.len()
             )));
         }
-        if self.version == 0 {
-            return Err(Error::invalid_input("clustering version must be positive"));
-        }
-        if self.algorithm_revision.is_empty() {
+        if self.generation == 0 {
             return Err(Error::invalid_input(
-                "clustering algorithm revision must not be empty",
+                "clustering generation must be positive",
             ));
         }
         if let Some(column) = self.columns.iter().find(|column| column.is_empty()) {
@@ -97,92 +137,58 @@ impl ClusteringSpec {
         Ok(())
     }
 
-    pub fn from_config(config: &HashMap<String, String>) -> Result<Option<Self>> {
-        let has_clustering = config
-            .keys()
-            .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX));
-        if !has_clustering {
-            return Ok(None);
-        }
-        if let Some(key) = config.keys().find(|key| {
-            key.starts_with(CLUSTERING_CONFIG_PREFIX)
-                && key.as_str() != CLUSTERING_COLUMNS_KEY
-                && key.as_str() != CLUSTERING_ALGORITHM_REVISION_KEY
-                && key.as_str() != CLUSTERING_VERSION_KEY
-        }) {
-            return Err(Error::invalid_input(format!(
-                "unknown clustering config key {key:?}"
-            )));
-        }
-        let columns = config.get(CLUSTERING_COLUMNS_KEY).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "incomplete clustering config: missing {CLUSTERING_COLUMNS_KEY}"
-            ))
-        })?;
-        let version = config.get(CLUSTERING_VERSION_KEY).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "incomplete clustering config: missing {CLUSTERING_VERSION_KEY}"
-            ))
-        })?;
-        let algorithm_revision = config
-            .get(CLUSTERING_ALGORITHM_REVISION_KEY)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "incomplete clustering config: missing {CLUSTERING_ALGORITHM_REVISION_KEY}"
-                ))
-            })?
-            .clone();
-        let columns = serde_json::from_str(columns).map_err(|error| {
-            Error::invalid_input(format!(
-                "invalid {CLUSTERING_COLUMNS_KEY}: expected a JSON string array: {error}"
-            ))
-        })?;
-        let version = version.parse().map_err(|error| {
-            Error::invalid_input(format!(
-                "invalid {CLUSTERING_VERSION_KEY}: expected a positive u64: {error}"
-            ))
-        })?;
-        let spec = Self {
-            columns,
-            algorithm_revision,
-            version,
-        };
-        spec.validate()?;
-        Ok(Some(spec))
-    }
-
-    pub fn to_config(&self) -> Result<[(String, String); 3]> {
-        self.validate()?;
-        Ok([
-            (
-                CLUSTERING_COLUMNS_KEY.to_string(),
-                serde_json::to_string(&self.columns)?,
-            ),
-            (
-                CLUSTERING_ALGORITHM_REVISION_KEY.to_string(),
-                self.algorithm_revision.clone(),
-            ),
-            (CLUSTERING_VERSION_KEY.to_string(), self.version.to_string()),
-        ])
-    }
-
-    pub fn config_keys() -> [&'static str; 3] {
-        [
-            CLUSTERING_COLUMNS_KEY,
-            CLUSTERING_ALGORITHM_REVISION_KEY,
-            CLUSTERING_VERSION_KEY,
-        ]
-    }
-
     pub fn validate_current_algorithm(&self) -> Result<()> {
-        if self.algorithm_revision != CLUSTERING_ALGORITHM_REVISION {
-            return Err(Error::not_supported(format!(
-                "clustering algorithm revision {:?} is not supported by this build; \
-                 redeclare the clustering columns to upgrade to {CLUSTERING_ALGORITHM_REVISION:?}",
-                self.algorithm_revision
+        match self.algorithm {
+            ClusteringAlgorithm::TypedQuantileRankV1 => Ok(()),
+        }
+    }
+
+    /// Build an executable spec from typed manifest state and the schema key.
+    pub fn from_state(
+        state: Option<&LiquidClusteringState>,
+        schema: &Schema,
+    ) -> Result<Option<Self>> {
+        let Some(state) = state.filter(|state| state.enabled) else {
+            return Ok(None);
+        };
+        state.validate()?;
+        let key = schema.unenforced_clustering_key();
+        if key.is_empty() {
+            return Err(Error::invalid_input(
+                "enabled liquid clustering requires an unenforced clustering key",
+            ));
+        }
+        if key.len() > MAX_CLUSTERING_COLUMNS {
+            return Err(Error::invalid_input(format!(
+                "clustering supports at most {MAX_CLUSTERING_COLUMNS} columns, got {}",
+                key.len()
             )));
         }
-        Ok(())
+        for (expected, field) in (1_u32..).zip(key.iter()) {
+            if !schema
+                .fields
+                .iter()
+                .any(|top_level| top_level.id == field.id)
+            {
+                return Err(Error::invalid_input(format!(
+                    "clustering column {:?} must be a top-level column",
+                    field.name
+                )));
+            }
+            if field.unenforced_clustering_key_position != Some(expected) {
+                return Err(Error::invalid_input(format!(
+                    "unenforced clustering key positions must be unique and contiguous from 1; \
+                     expected position {expected} for column {:?}, got {:?}",
+                    field.name, field.unenforced_clustering_key_position
+                )));
+            }
+            validate_data_type(&field.data_type())?;
+        }
+        Ok(Some(Self {
+            columns: key.iter().map(|field| field.name.clone()).collect(),
+            algorithm: state.algorithm,
+            generation: state.generation,
+        }))
     }
 }
 
@@ -234,14 +240,12 @@ mod tests {
     }
 
     #[test]
-    fn config_round_trip_includes_algorithm_revision() {
-        let spec = ClusteringSpec::new(vec!["x".into(), "y".into()], 7).unwrap();
-        let config = HashMap::from(spec.to_config().unwrap());
-        assert_eq!(ClusteringSpec::from_config(&config).unwrap(), Some(spec));
-        assert_eq!(config.len(), 3);
-        assert_eq!(
-            config[CLUSTERING_ALGORITHM_REVISION_KEY],
-            CLUSTERING_ALGORITHM_REVISION
+    fn disabled_state_preserves_a_valid_generation() {
+        assert!(
+            LiquidClusteringState::new(false, 7, ClusteringAlgorithm::TypedQuantileRankV1).is_ok()
+        );
+        assert!(
+            LiquidClusteringState::new(false, 0, ClusteringAlgorithm::TypedQuantileRankV1).is_err()
         );
     }
 }

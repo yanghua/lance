@@ -9,14 +9,17 @@
 //! [`super::manifest_build`]; deciding whether two of them collide is
 //! [`super::conflicts`].
 
+use crate::clustering::ClusteringGroupId;
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::overlay::DataOverlayFile;
 use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
+use lance_core::clustering::LiquidClusteringState;
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -197,6 +200,13 @@ pub enum Operation {
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
     },
+    /// Update the typed liquid-clustering declaration and, on first enable,
+    /// atomically install the schema-level unenforced clustering key.
+    UpdateClustering {
+        state: LiquidClusteringState,
+        /// Ordered top-level field IDs. Empty only when disabling clustering.
+        clustering_fields: Vec<i32>,
+    },
     /// Update SSTable compaction progress in the MemWAL index.
     ///
     /// This is used during merge-insert to atomically record which
@@ -264,6 +274,7 @@ impl std::fmt::Display for Operation {
             Self::Update { .. } => write!(f, "Update"),
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
+            Self::UpdateClustering { .. } => write!(f, "UpdateClustering"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::DataOverlay { .. } => write!(f, "DataOverlay"),
             Self::Clone { .. } => write!(f, "Clone"),
@@ -297,6 +308,14 @@ impl DeepSizeOf for RewrittenIndex {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+    pub liquid_clustering: Option<LiquidClusteringRewrite>,
+}
+
+/// Provenance for one rewrite group produced by liquid clustering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf, Serialize, Deserialize)]
+pub struct LiquidClusteringRewrite {
+    pub generation: u64,
+    pub group_id: ClusteringGroupId,
 }
 
 impl PartialEq for RewriteGroup {
@@ -306,6 +325,7 @@ impl PartialEq for RewriteGroup {
         }
         compare_vec(&self.old_fragments, &other.old_fragments)
             && compare_vec(&self.new_fragments, &other.new_fragments)
+            && self.liquid_clustering == other.liquid_clustering
     }
 }
 
@@ -323,6 +343,7 @@ impl Operation {
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
+            Self::UpdateClustering { .. } => "UpdateClustering",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::DataOverlay { .. } => "DataOverlay",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",

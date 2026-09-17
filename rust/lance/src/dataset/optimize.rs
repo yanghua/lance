@@ -91,7 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    LiquidClusteringRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -2728,7 +2729,7 @@ async fn commit_compaction_internal(
     completed_tasks: Vec<RewriteResult>,
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
-    clustering_version: Option<u64>,
+    liquid_clustering: Option<Vec<LiquidClusteringRewrite>>,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
@@ -2765,6 +2766,16 @@ async fn commit_compaction_internal(
         .min()
         .unwrap_or(dataset.manifest.version);
 
+    if let Some(provenance) = liquid_clustering.as_ref()
+        && provenance.len() != completed_tasks.len()
+    {
+        return Err(Error::internal(format!(
+            "received {} clustering provenance entries for {} rewrite results",
+            provenance.len(),
+            completed_tasks.len()
+        )));
+    }
+    let mut clustering_provenance = liquid_clustering.map(Vec::into_iter);
     let mut completed_tasks = completed_tasks;
 
     // Collect the rewritten fragments' file paths up front so every failure
@@ -2827,6 +2838,7 @@ async fn commit_compaction_internal(
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
+            liquid_clustering: clustering_provenance.as_mut().and_then(Iterator::next),
         };
 
         if index_remapper.is_some() {
@@ -2946,7 +2958,7 @@ async fn commit_compaction_internal(
         None
     };
 
-    let mut transaction_builder = TransactionBuilder::new(
+    let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
         // mode the caller may open a fresh dataset at a later version (V+N), but
@@ -2961,11 +2973,8 @@ async fn commit_compaction_internal(
             frag_reuse_index,
         },
     )
-    .transaction_properties(options.transaction_properties.clone());
-    if let Some(version) = clustering_version {
-        transaction_builder = transaction_builder.new_fragment_clustering_version(version);
-    }
-    let transaction = transaction_builder.build();
+    .transaction_properties(options.transaction_properties.clone())
+    .build();
 
     if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
@@ -3172,10 +3181,10 @@ mod tests {
             dataset.clustering_columns().unwrap(),
             Some(vec!["key".into()])
         );
-        let version = super::super::metadata::clustering_spec(&dataset)
+        let generation = super::super::metadata::clustering_spec(&dataset)
             .unwrap()
             .unwrap()
-            .version;
+            .generation;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 100,
@@ -3189,9 +3198,9 @@ mod tests {
         assert!(
             dataset
                 .manifest
-                .fragment_clustering_versions()
+                .fragment_clustering_generations()
                 .into_iter()
-                .all(|stamp| stamp == Some(version))
+                .all(|stamp| stamp == Some(generation))
         );
         let initial_groups = dataset
             .get_fragments()
@@ -3201,7 +3210,6 @@ mod tests {
                     .manifest
                     .fragment_clustering_group(fragment.id() as u64)
                     .unwrap()
-                    .to_string()
             })
             .collect::<HashSet<_>>();
         assert_eq!(initial_groups.len(), 1);
@@ -3257,7 +3265,7 @@ mod tests {
         assert_eq!(
             dataset
                 .manifest
-                .fragment_clustering_versions()
+                .fragment_clustering_generations()
                 .into_iter()
                 .filter(Option::is_none)
                 .count(),
@@ -3289,7 +3297,7 @@ mod tests {
         assert_eq!(
             dataset
                 .manifest
-                .fragment_clustering_version(appended_fragment_id as u64),
+                .fragment_clustering_generation(appended_fragment_id as u64),
             None
         );
 
@@ -3301,9 +3309,9 @@ mod tests {
         assert!(
             dataset
                 .manifest
-                .fragment_clustering_versions()
+                .fragment_clustering_generations()
                 .into_iter()
-                .all(|stamp| stamp == Some(version))
+                .all(|stamp| stamp == Some(generation))
         );
         let groups = dataset
             .get_fragments()
@@ -3318,7 +3326,7 @@ mod tests {
         assert!(
             groups
                 .iter()
-                .all(|group| { group.is_some_and(|group| !initial_groups.contains(group)) })
+                .all(|group| { group.is_some_and(|group| !initial_groups.contains(&group)) })
         );
         let merged_group = groups[0];
         let merged_fragment_ids = dataset

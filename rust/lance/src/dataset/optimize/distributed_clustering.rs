@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use lance_core::ROW_ADDR;
-use lance_core::clustering::ClusteringSpec;
+use lance_core::clustering::{ClusteringAlgorithm, ClusteringSpec};
 use lance_index::clustering::{ClusteringModel, PartialClusteringModel, RowDigest};
+use lance_table::clustering::ClusteringGroupId;
 use lance_table::format::Fragment;
+use lance_table::transaction::LiquidClusteringRewrite;
 use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -32,7 +34,7 @@ struct PlanningUnit {
     fragments: Vec<Fragment>,
     rows: usize,
     bytes: u64,
-    group_id: Option<String>,
+    group_id: Option<ClusteringGroupId>,
     is_under_clustered: bool,
     is_excluded: bool,
 }
@@ -90,12 +92,22 @@ impl ReclusterPlan {
         self.read_version
     }
 
-    pub fn clustering_version(&self) -> u64 {
-        self.spec.version
+    pub fn clustering_generation(&self) -> u64 {
+        self.spec.generation
     }
 
-    pub fn algorithm_revision(&self) -> &str {
-        &self.spec.algorithm_revision
+    #[deprecated(note = "Use clustering_generation")]
+    pub fn clustering_version(&self) -> u64 {
+        self.clustering_generation()
+    }
+
+    pub fn algorithm(&self) -> ClusteringAlgorithm {
+        self.spec.algorithm
+    }
+
+    #[deprecated(note = "Use algorithm")]
+    pub fn algorithm_revision(&self) -> &'static str {
+        self.algorithm().revision()
     }
 
     pub fn columns(&self) -> &[String] {
@@ -197,10 +209,6 @@ impl ReclusterPlan {
 pub struct ReclusterResult {
     plan_id: Uuid,
     group_id: Uuid,
-    dataset_uri: String,
-    read_version: u64,
-    clustering_version: u64,
-    algorithm_revision: String,
     model_digest: [u8; 32],
     source_fragment_ids: Vec<u64>,
     new_fragments: Vec<Fragment>,
@@ -240,10 +248,6 @@ impl ReclusterResult {
         Ok(Self {
             plan_id: plan.id,
             group_id,
-            dataset_uri: plan.dataset_uri.clone(),
-            read_version: plan.read_version,
-            clustering_version: plan.spec.version,
-            algorithm_revision: plan.algorithm_revision().to_string(),
             model_digest: model.digest(),
             source_fragment_ids: group.source_fragment_ids().collect(),
             new_fragments,
@@ -299,15 +303,12 @@ pub async fn plan_recluster(
         .map(|(fragment, rows)| (fragment.id() as u64, *rows))
         .collect::<HashMap<_, _>>();
     let mut units = Vec::<PlanningUnit>::new();
-    let mut group_units = HashMap::<String, usize>::new();
+    let mut group_units = HashMap::<ClusteringGroupId, usize>::new();
     for (fragment, rows) in fragments_with_rows {
         let fragment_id = fragment.id() as u64;
-        let group_id = dataset
-            .manifest
-            .fragment_clustering_group(fragment_id)
-            .map(str::to_owned);
-        let is_under_clustered = dataset.manifest.fragment_clustering_version(fragment_id)
-            != Some(spec.version)
+        let group_id = dataset.manifest.fragment_clustering_group(fragment_id);
+        let is_under_clustered = dataset.manifest.fragment_clustering_generation(fragment_id)
+            != Some(spec.generation)
             || group_id.is_none();
         let is_excluded = u32::try_from(fragment.id())
             .is_ok_and(|fragment_id| excluded_fragment_ids.contains(fragment_id));
@@ -334,7 +335,7 @@ pub async fn plan_recluster(
                 unit.is_under_clustered |= is_under_clustered;
                 unit.is_excluded |= is_excluded;
             } else {
-                group_units.insert(group_id.clone(), units.len());
+                group_units.insert(group_id, units.len());
                 units.push(PlanningUnit {
                     fragments: vec![fragment.metadata],
                     rows,
@@ -575,7 +576,7 @@ fn push_group(
     bytes: &mut u64,
     fragment_count: &mut usize,
     has_under_clustered: &mut bool,
-    group_ids: &mut HashSet<String>,
+    group_ids: &mut HashSet<ClusteringGroupId>,
 ) {
     if !fragments.is_empty() {
         let fragments = std::mem::take(fragments);
@@ -693,6 +694,7 @@ pub async fn commit_recluster(
     }
     let mut completed_group_ids = HashSet::with_capacity(results.len());
     let mut rewrites = Vec::with_capacity(results.len());
+    let mut provenance = Vec::with_capacity(results.len());
     let mut output_digest = lance_index::clustering::RowDigest::default();
     let source_paths = plan
         .groups
@@ -731,6 +733,10 @@ pub async fn commit_recluster(
             result.output_row_digest,
         ))?;
         let group = plan.group(result.group_id)?;
+        provenance.push(LiquidClusteringRewrite {
+            generation: plan.spec.generation,
+            group_id: result.group_id.into(),
+        });
         rewrites.push(RewriteResult {
             metrics: CompactionMetrics {
                 fragments_removed: group.source_fragments.len(),
@@ -777,7 +783,7 @@ pub async fn commit_recluster(
         rewrites,
         Arc::new(IgnoreRemap {}),
         &options,
-        Some(plan.spec.version),
+        Some(provenance),
     )
     .await?;
     if let Err(error) = maintain_clustering_zonemaps(dataset).await {
@@ -792,13 +798,7 @@ fn validate_result(
     result: &ReclusterResult,
 ) -> Result<()> {
     let group = plan.group(result.group_id)?;
-    if result.plan_id != plan.id
-        || result.dataset_uri != plan.dataset_uri
-        || result.read_version != plan.read_version
-        || result.clustering_version != plan.spec.version
-        || result.algorithm_revision != plan.algorithm_revision()
-        || result.model_digest != model.digest()
-    {
+    if result.plan_id != plan.id || result.model_digest != model.digest() {
         return Err(Error::invalid_input(format!(
             "recluster result for group {} does not match plan {}",
             result.group_id, plan.id
@@ -884,7 +884,7 @@ async fn validate_plan_snapshot(plan: &ReclusterPlan, snapshot: &Dataset) -> Res
         .flat_map(|group| &group.source_fragments)
         .filter_map(|fragment| snapshot.manifest.fragment_clustering_group(fragment.id))
         .collect::<HashSet<_>>();
-    let mut current_group_rows = HashMap::<&str, u64>::new();
+    let mut current_group_rows = HashMap::<ClusteringGroupId, u64>::new();
     for fragment in &snapshot_fragments {
         let Some(group_id) = snapshot
             .manifest
@@ -902,8 +902,8 @@ async fn validate_plan_snapshot(plan: &ReclusterPlan, snapshot: &Dataset) -> Res
         }
         if snapshot
             .manifest
-            .fragment_clustering_version(fragment.id() as u64)
-            == Some(plan.spec.version)
+            .fragment_clustering_generation(fragment.id() as u64)
+            == Some(plan.spec.generation)
         {
             let rows = collect_metrics(fragment).await?.num_rows() as u64;
             let total = current_group_rows.entry(group_id).or_default();
@@ -974,17 +974,21 @@ impl From<&ReclusterPlan> for recluster_pb::Plan {
     fn from(plan: &ReclusterPlan) -> Self {
         Self {
             format_version: PROTOCOL_VERSION,
-            plan_id: plan.id.to_string(),
+            plan_id: Some(lance_table::format::pb::Uuid::from(&plan.id)),
             dataset_uri: plan.dataset_uri.clone(),
             read_version: plan.read_version,
-            clustering_version: plan.spec.version,
-            algorithm_revision: plan.spec.algorithm_revision.clone(),
+            clustering_generation: plan.spec.generation,
+            algorithm: match plan.spec.algorithm {
+                ClusteringAlgorithm::TypedQuantileRankV1 => {
+                    lance_table::format::pb::ClusteringAlgorithm::TypedQuantileRankV1 as i32
+                }
+            },
             columns: plan.spec.columns.clone(),
             groups: plan
                 .groups
                 .iter()
                 .map(|group| recluster_pb::Group {
-                    group_id: group.id.to_string(),
+                    group_id: Some(lance_table::format::pb::Uuid::from(&group.id)),
                     source_fragments: group
                         .source_fragments
                         .iter()
@@ -1004,21 +1008,38 @@ impl TryFrom<recluster_pb::Plan> for ReclusterPlan {
 
     fn try_from(plan: recluster_pb::Plan) -> Result<Self> {
         validate_protocol_version(plan.format_version, "recluster plan")?;
+        let algorithm = match lance_table::format::pb::ClusteringAlgorithm::try_from(plan.algorithm)
+        {
+            Ok(lance_table::format::pb::ClusteringAlgorithm::TypedQuantileRankV1) => {
+                ClusteringAlgorithm::TypedQuantileRankV1
+            }
+            Ok(lance_table::format::pb::ClusteringAlgorithm::Unspecified) => {
+                return Err(Error::invalid_input(
+                    "recluster plan algorithm must be specified",
+                ));
+            }
+            Err(_) => {
+                return Err(Error::not_supported(format!(
+                    "unsupported recluster plan algorithm {}",
+                    plan.algorithm
+                )));
+            }
+        };
         let result = Self {
-            id: parse_uuid(&plan.plan_id, "recluster plan id")?,
+            id: parse_uuid(plan.plan_id.as_ref(), "recluster plan id")?,
             dataset_uri: plan.dataset_uri,
             read_version: plan.read_version,
             spec: ClusteringSpec {
                 columns: plan.columns,
-                algorithm_revision: plan.algorithm_revision,
-                version: plan.clustering_version,
+                algorithm,
+                generation: plan.clustering_generation,
             },
             groups: plan
                 .groups
                 .into_iter()
                 .map(|group| {
                     Ok(ReclusterGroup {
-                        id: parse_uuid(&group.group_id, "recluster group id")?,
+                        id: parse_uuid(group.group_id.as_ref(), "recluster group id")?,
                         source_fragments: group
                             .source_fragments
                             .into_iter()
@@ -1048,12 +1069,8 @@ impl From<&ReclusterResult> for recluster_pb::Result {
     fn from(result: &ReclusterResult) -> Self {
         Self {
             format_version: PROTOCOL_VERSION,
-            plan_id: result.plan_id.to_string(),
-            group_id: result.group_id.to_string(),
-            dataset_uri: result.dataset_uri.clone(),
-            read_version: result.read_version,
-            clustering_version: result.clustering_version,
-            algorithm_revision: result.algorithm_revision.clone(),
+            plan_id: Some(lance_table::format::pb::Uuid::from(&result.plan_id)),
+            group_id: Some(lance_table::format::pb::Uuid::from(&result.group_id)),
             model_digest: result.model_digest.to_vec(),
             source_fragment_ids: result.source_fragment_ids.clone(),
             new_fragments: result
@@ -1073,11 +1090,6 @@ impl TryFrom<recluster_pb::Result> for ReclusterResult {
 
     fn try_from(result: recluster_pb::Result) -> Result<Self> {
         validate_protocol_version(result.format_version, "recluster result")?;
-        if result.algorithm_revision.is_empty() {
-            return Err(Error::invalid_input(
-                "recluster result algorithm revision must not be empty",
-            ));
-        }
         let model_digest: [u8; 32] = result.model_digest.try_into().map_err(|value: Vec<u8>| {
             Error::invalid_input(format!(
                 "recluster model digest must contain 32 bytes, got {}",
@@ -1095,12 +1107,8 @@ impl TryFrom<recluster_pb::Result> for ReclusterResult {
                     ))
                 })?;
         Ok(Self {
-            plan_id: parse_uuid(&result.plan_id, "recluster result plan id")?,
-            group_id: parse_uuid(&result.group_id, "recluster result group id")?,
-            dataset_uri: result.dataset_uri,
-            read_version: result.read_version,
-            clustering_version: result.clustering_version,
-            algorithm_revision: result.algorithm_revision,
+            plan_id: parse_uuid(result.plan_id.as_ref(), "recluster result plan id")?,
+            group_id: parse_uuid(result.group_id.as_ref(), "recluster result group id")?,
             model_digest,
             source_fragment_ids: result.source_fragment_ids,
             new_fragments: result
@@ -1124,9 +1132,9 @@ fn validate_protocol_version(version: u32, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_uuid(value: &str, name: &str) -> Result<Uuid> {
-    Uuid::parse_str(value)
-        .map_err(|error| Error::invalid_input(format!("invalid {name} {value:?}: {error}")))
+fn parse_uuid(value: Option<&lance_table::format::pb::Uuid>, name: &str) -> Result<Uuid> {
+    let value = value.ok_or_else(|| Error::invalid_input(format!("{name} must be specified")))?;
+    Uuid::try_from(value).map_err(|error| Error::invalid_input(format!("invalid {name}: {error}")))
 }
 
 fn schema_digest(schema: &lance_core::datatypes::Schema) -> [u8; 32] {
@@ -1244,14 +1252,15 @@ mod tests {
         .await
         .unwrap();
         dataset.set_clustering(vec!["key".into()]).await.unwrap();
-        let version = super::super::super::metadata::clustering_spec(&dataset)
+        let generation = super::super::super::metadata::clustering_spec(&dataset)
             .unwrap()
             .unwrap()
-            .version;
+            .generation;
+        let group_id = ClusteringGroupId::from(Uuid::from_u128(1));
         Arc::make_mut(&mut dataset.manifest)
             .set_fragment_clustering_metadata(vec![
-                (Some(version + 1), Some("outdated-group".to_string())),
-                (Some(version + 1), Some("outdated-group".to_string())),
+                (Some(generation + 1), Some(group_id)),
+                (Some(generation + 1), Some(group_id)),
                 (None, None),
             ])
             .unwrap();
@@ -1402,9 +1411,9 @@ mod tests {
         assert!(
             dataset
                 .manifest
-                .fragment_clustering_versions()
+                .fragment_clustering_generations()
                 .iter()
-                .all(|version| *version == Some(plan.clustering_version()))
+                .all(|version| *version == Some(plan.clustering_generation()))
         );
         let committed_groups = dataset
             .manifest

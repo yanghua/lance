@@ -90,6 +90,7 @@ public class ClusteringTest {
                 Clustering.planRecluster(
                     dataset, CompactionOptions.builder().withTargetRowsPerFragment(10).build()));
         assertEquals(1, plan.getGroups().size());
+        assertTrue(plan.getClusteringGeneration() > 0);
         assertEquals(Collections.singletonList(0L), plan.getGroups().get(0).getSourceFragmentIds());
         assertEquals(4, plan.getGroups().get(0).getExpectedLiveRows());
 

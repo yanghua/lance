@@ -13,9 +13,9 @@ use crate::format::pb;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
-    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
-    translate_schema_metadata_updates,
+    DataOverlayGroup, DataReplacementGroup, LiquidClusteringRewrite, Operation, RewriteGroup,
+    RewrittenIndex, Transaction, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    translate_config_updates, translate_schema_metadata_updates,
 };
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -169,6 +169,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                             .into_iter()
                             .map(Fragment::try_from)
                             .collect::<Result<Vec<_>>>()?,
+                        liquid_clustering: None,
                     }]
                 };
                 let rewritten_indices = rewritten_indices
@@ -380,6 +381,20 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::UpdateClustering(update)) => {
+                Operation::UpdateClustering {
+                    state: update
+                        .state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::invalid_input(
+                                "UpdateClustering requires liquid-clustering state",
+                            )
+                        })?
+                        .try_into()?,
+                    clustering_fields: update.clustering_fields,
+                }
+            }
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState { compacted_sstables },
             )) => Operation::UpdateMemWalState {
@@ -485,6 +500,32 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
                 .into_iter()
                 .map(Fragment::try_from)
                 .collect::<Result<Vec<_>>>()?,
+            liquid_clustering: message
+                .liquid_clustering
+                .map(|rewrite| {
+                    if rewrite.generation == 0 {
+                        return Err(Error::invalid_input(
+                            "clustering rewrite generation must be positive",
+                        ));
+                    }
+                    let group_id: crate::clustering::ClusteringGroupId = rewrite
+                        .group_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::invalid_input("clustering rewrite requires a group id")
+                        })?
+                        .try_into()?;
+                    if group_id.is_nil() {
+                        return Err(Error::invalid_input(
+                            "clustering rewrite group id must not be nil",
+                        ));
+                    }
+                    Ok(LiquidClusteringRewrite {
+                        generation: rewrite.generation,
+                        group_id,
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -681,6 +722,13 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
+            Operation::UpdateClustering {
+                state,
+                clustering_fields,
+            } => pb::transaction::Operation::UpdateClustering(pb::transaction::UpdateClustering {
+                state: Some(state.into()),
+                clustering_fields: clustering_fields.clone(),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -760,6 +808,12 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
                 .iter()
                 .map(pb::DataFragment::from)
                 .collect(),
+            liquid_clustering: value.liquid_clustering.map(|rewrite| {
+                pb::transaction::rewrite::LiquidClusteringRewrite {
+                    generation: rewrite.generation,
+                    group_id: Some((&rewrite.group_id).into()),
+                }
+            }),
         }
     }
 }
@@ -808,8 +862,76 @@ impl From<&Transaction> for crate::format::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clustering::ClusteringGroupId;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
+
+    #[test]
+    fn test_update_clustering_operation_roundtrips() {
+        let transaction = Transaction::new(
+            3,
+            Operation::UpdateClustering {
+                state: LiquidClusteringState::new(
+                    true,
+                    7,
+                    ClusteringAlgorithm::TypedQuantileRankV1,
+                )
+                .unwrap(),
+                clustering_fields: vec![2, 5],
+            },
+            None,
+        );
+
+        let encoded = pb::Transaction::from(&transaction);
+        let decoded = Transaction::try_from(encoded).unwrap();
+
+        assert_eq!(decoded, transaction);
+    }
+
+    #[test]
+    fn test_liquid_clustering_rewrite_provenance_roundtrips() {
+        let rewrite = LiquidClusteringRewrite {
+            generation: 7,
+            group_id: ClusteringGroupId::from(Uuid::from_u128(42)),
+        };
+        let transaction = Transaction::new(
+            3,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(5)],
+                    new_fragments: vec![Fragment::new(0)],
+                    liquid_clustering: Some(rewrite),
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        let encoded = pb::Transaction::from(&transaction);
+        let decoded = Transaction::try_from(encoded).unwrap();
+
+        assert_eq!(decoded, transaction);
+    }
+
+    #[test]
+    fn test_liquid_clustering_rewrite_rejects_nil_group() {
+        let message = pb::transaction::rewrite::RewriteGroup {
+            liquid_clustering: Some(pb::transaction::rewrite::LiquidClusteringRewrite {
+                generation: 7,
+                group_id: Some(pb::Uuid::from(&Uuid::nil())),
+            }),
+            ..Default::default()
+        };
+
+        let error = RewriteGroup::try_from(message).unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidInput { .. }),
+            "got {error:?}"
+        );
+        assert!(error.to_string().contains("must not be nil"), "got {error}");
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {

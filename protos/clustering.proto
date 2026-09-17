@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.clustering;
 
+import "table.proto";
+
 // One deterministic sample retained while building a distributed clustering model.
 message Sample {
   fixed64 priority = 1;
@@ -22,7 +24,7 @@ message SampleColumn {
 // Mergeable partial state produced independently by clustering workers.
 message PartialModel {
   uint32 format_version = 1;
-  string algorithm_revision = 2;
+  lance.table.ClusteringAlgorithm algorithm = 2;
   repeated string columns = 3;
   repeated SampleColumn sample_columns = 4;
   // Opaque plan identity. Partial models with different contexts cannot merge.
@@ -36,7 +38,7 @@ message PartialModel {
 // Final empirical-rank model shared by every worker in one reclustering plan.
 message Model {
   uint32 format_version = 1;
-  string algorithm_revision = 2;
+  lance.table.ClusteringAlgorithm algorithm = 2;
   repeated string columns = 3;
   repeated ModelColumn model_columns = 4;
   // Opaque plan identity copied into the final model.

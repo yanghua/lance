@@ -126,6 +126,14 @@ message Transaction {
       // The ID should have been reserved by an earlier
       // reserve operation
       repeated DataFragment new_fragments = 2;
+
+      // Present only when this group was produced by liquid clustering.
+      LiquidClusteringRewrite liquid_clustering = 3;
+    }
+
+    message LiquidClusteringRewrite {
+      uint64 generation = 1;
+      UUID group_id = 2;
     }
 
     // Groups of files that have been rewritten
@@ -322,6 +330,13 @@ message Transaction {
     }
   }
 
+  // Enable or disable liquid clustering. Clustering fields identify the
+  // schema-level unenforced clustering key and are not repeated in the manifest.
+  message UpdateClustering {
+    LiquidClusteringState state = 1;
+    repeated int32 clustering_fields = 2;
+  }
+
   message DataReplacementGroup {
     uint64 fragment_id = 1;
     DataFile new_file = 2;
@@ -386,6 +401,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    UpdateClustering update_clustering = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

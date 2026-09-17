@@ -27,19 +27,19 @@ public final class ReclusterPlan implements Serializable {
 
   private final byte[] payload;
   private final long readVersion;
-  private final long clusteringVersion;
+  private final long clusteringGeneration;
   private final List<String> columns;
   private final List<ReclusterGroup> groups;
 
   ReclusterPlan(
       byte[] payload,
       long readVersion,
-      long clusteringVersion,
+      long clusteringGeneration,
       List<String> columns,
       List<ReclusterGroup> groups) {
     this.payload = payload.clone();
     this.readVersion = readVersion;
-    this.clusteringVersion = clusteringVersion;
+    this.clusteringGeneration = clusteringGeneration;
     this.columns = List.copyOf(columns);
     this.groups = List.copyOf(groups);
   }
@@ -52,8 +52,16 @@ public final class ReclusterPlan implements Serializable {
     return readVersion;
   }
 
+  public long getClusteringGeneration() {
+    return clusteringGeneration;
+  }
+
+  /**
+   * @deprecated Use {@link #getClusteringGeneration()} instead.
+   */
+  @Deprecated
   public long getClusteringVersion() {
-    return clusteringVersion;
+    return getClusteringGeneration();
   }
 
   public List<String> getColumns() {
@@ -65,6 +73,6 @@ public final class ReclusterPlan implements Serializable {
   }
 
   private Object readResolve() {
-    return new ReclusterPlan(payload, readVersion, clusteringVersion, columns, groups);
+    return new ReclusterPlan(payload, readVersion, clusteringGeneration, columns, groups);
   }
 }

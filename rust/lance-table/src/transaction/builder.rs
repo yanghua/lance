@@ -9,15 +9,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Reserved internal transport property carrying the clustering layout version
-/// produced by a recluster rewrite until final fragment IDs are assigned.
-///
-/// Commit validates the operation and declaration version, but advanced callers
-/// that construct or deserialize [`Transaction`] directly remain responsible
-/// for the truth of reserved metadata claims.
-pub const NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY: &str =
-    "__lance_new_fragment_clustering_version";
-
 /// A change to a dataset that can be retried
 ///
 /// This contains enough information to be able to build the next manifest,
@@ -30,11 +21,7 @@ pub struct Transaction {
     pub uuid: String,
     pub operation: Operation,
     pub tag: Option<String>,
-    /// Caller metadata and reserved internal transport properties.
-    ///
-    /// Direct construction is an advanced, trusted metadata boundary. Reserved
-    /// properties are not attestations that can prove how referenced files were
-    /// produced. Prefer [`TransactionBuilder`] for ordinary construction.
+    /// Caller metadata attached to the transaction.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
@@ -73,29 +60,7 @@ impl TransactionBuilder {
         mut self,
         transaction_properties: Option<Arc<HashMap<String, String>>>,
     ) -> Self {
-        self.transaction_properties = transaction_properties.map(|properties| {
-            let mut properties = properties.as_ref().clone();
-            properties.remove(NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY);
-            Arc::new(properties)
-        });
-        self
-    }
-
-    /// Carry the clustering declaration version used by a recluster rewrite.
-    ///
-    /// This is reserved internal transport metadata. Manifest construction
-    /// checks its operation and declaration version, but does not re-read data
-    /// files to verify their physical order.
-    #[doc(hidden)]
-    pub fn new_fragment_clustering_version(mut self, version: u64) -> Self {
-        Arc::make_mut(
-            self.transaction_properties
-                .get_or_insert_with(|| Arc::new(HashMap::new())),
-        )
-        .insert(
-            NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY.to_string(),
-            version.to_string(),
-        );
+        self.transaction_properties = transaction_properties;
         self
     }
 
@@ -114,31 +79,6 @@ impl TransactionBuilder {
 }
 
 impl Transaction {
-    /// Return the reserved clustering version marker carried by this transaction.
-    ///
-    /// This accessor preserves the marker when a rewrite is retried.
-    #[doc(hidden)]
-    pub fn new_fragment_clustering_version(&self) -> lance_core::Result<Option<u64>> {
-        let Some(value) = self
-            .transaction_properties
-            .as_deref()
-            .and_then(|properties| properties.get(NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY))
-        else {
-            return Ok(None);
-        };
-        let version = value.parse::<u64>().map_err(|error| {
-            lance_core::Error::invalid_input(format!(
-                "invalid reserved transaction property \"{NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY}\" value {value:?}: expected a positive u64: {error}"
-            ))
-        })?;
-        if version == 0 {
-            return Err(lance_core::Error::invalid_input(format!(
-                "invalid reserved transaction property \"{NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY}\": version must be positive"
-            )));
-        }
-        Ok(Some(version))
-    }
-
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
         TransactionBuilder::new(read_version, operation).build()
     }
@@ -147,23 +87,5 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation)
             .tag(tag)
             .build()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn caller_properties_cannot_set_clustering_marker() {
-        let properties = Arc::new(HashMap::from([(
-            NEW_FRAGMENT_CLUSTERING_VERSION_PROPERTY.to_string(),
-            "7".to_string(),
-        )]));
-        let transaction = TransactionBuilder::new(0, Operation::Append { fragments: vec![] })
-            .transaction_properties(Some(properties))
-            .build();
-
-        assert_eq!(transaction.new_fragment_clustering_version().unwrap(), None);
     }
 }

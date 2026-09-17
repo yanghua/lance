@@ -442,7 +442,7 @@ impl IntoJava for &ReclusterPlan {
             &[
                 JValueGen::Object(&payload),
                 JValueGen::Long(self.read_version() as i64),
-                JValueGen::Long(self.clustering_version() as i64),
+                JValueGen::Long(self.clustering_generation() as i64),
                 JValueGen::Object(&columns),
                 JValueGen::Object(&groups),
             ],

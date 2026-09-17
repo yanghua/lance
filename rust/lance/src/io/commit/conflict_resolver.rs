@@ -107,6 +107,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::UpdateClustering { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
@@ -310,6 +311,37 @@ impl<'a> TransactionRebase<'a> {
         }
 
         let op = &self.transaction.operation;
+        if matches!(op, Operation::UpdateClustering { .. })
+            || matches!(
+                other_transaction.operation,
+                Operation::UpdateClustering { .. }
+            )
+        {
+            return match (op, &other_transaction.operation) {
+                (Operation::UpdateClustering { .. }, Operation::UpdateClustering { .. })
+                | (Operation::UpdateClustering { .. }, Operation::Project { .. })
+                | (Operation::Project { .. }, Operation::UpdateClustering { .. })
+                | (Operation::UpdateClustering { .. }, Operation::Merge { .. })
+                | (Operation::Merge { .. }, Operation::UpdateClustering { .. })
+                | (Operation::UpdateClustering { .. }, Operation::UpdateConfig { .. })
+                | (Operation::UpdateConfig { .. }, Operation::UpdateClustering { .. }) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                (Operation::UpdateClustering { .. }, Operation::Overwrite { .. })
+                | (Operation::Overwrite { .. }, Operation::UpdateClustering { .. })
+                | (Operation::UpdateClustering { .. }, Operation::Restore { .. })
+                | (Operation::Restore { .. }, Operation::UpdateClustering { .. }) => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+                (Operation::Rewrite { groups, .. }, Operation::UpdateClustering { .. })
+                | (Operation::UpdateClustering { .. }, Operation::Rewrite { groups, .. })
+                    if groups.iter().any(|group| group.liquid_clustering.is_some()) =>
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                _ => Ok(()),
+            };
+        }
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
             Operation::Update { .. } => self.check_update_txn(other_transaction, other_version),
@@ -343,6 +375,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            Operation::UpdateClustering { .. } => unreachable!("handled above"),
         }
     }
 
@@ -363,7 +396,8 @@ impl<'a> TransactionRebase<'a> {
                 // (deletions take precedence over overlays) and otherwise
                 // preserves physical offsets, so it never conflicts.
                 | Operation::DataOverlay { .. }
-                | Operation::UpdateBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. }
+                | Operation::UpdateClustering { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -515,6 +549,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateClustering { .. } => unreachable!("handled above"),
                 Operation::DataOverlay { groups } => {
                     // Our update recomputed rows from the pre-overlay base, so if
                     // it commits over an overlay it would silently undo the
@@ -709,6 +744,7 @@ impl<'a> TransactionRebase<'a> {
                 // version gate, so the build does not conflict.
                 | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateClustering { .. } => unreachable!("handled above"),
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -911,6 +947,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateClustering { .. } => unreachable!("handled above"),
                 Operation::Delete {
                     updated_fragments,
                     deleted_fragment_ids,
@@ -1132,6 +1169,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateClustering { .. } => unreachable!("handled above"),
         }
     }
 
@@ -1160,7 +1198,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
-            | Operation::DataOverlay { .. } => Ok(()),
+            | Operation::DataOverlay { .. }
+            | Operation::UpdateClustering { .. } => Ok(()),
         }
     }
 
@@ -1178,7 +1217,8 @@ impl<'a> TransactionRebase<'a> {
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
-                | Operation::UpdateBases { .. } => Ok(()),
+                | Operation::UpdateBases { .. }
+                | Operation::UpdateClustering { .. } => Ok(()),
                 Operation::Project { schema, .. } => {
                     // A project operation can drop fields.  If the project
                     // dropped a field this operation was replacing then
@@ -1358,7 +1398,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
-            | Operation::DataOverlay { .. } => Ok(()),
+            | Operation::DataOverlay { .. }
+            | Operation::UpdateClustering { .. } => Ok(()),
             // A concurrent Delete only tombstones rows via a deletion vector,
             // which preserves physical offsets; the overlay value for a deleted
             // offset is simply inert. Conflict only if the whole overlaid
@@ -1460,6 +1501,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateClustering { .. } => unreachable!("handled above"),
 
             Operation::Update { .. }
             | Operation::Append { .. }
@@ -1499,7 +1541,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::Clone { .. }
-            | Operation::UpdateConfig { .. } => Ok(()),
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateClustering { .. } => Ok(()),
             Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -1529,6 +1572,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateClustering { .. } => unreachable!("handled above"),
         }
     }
 
@@ -1550,6 +1594,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            Operation::UpdateClustering { .. } => unreachable!("handled above"),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1618,6 +1663,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateClustering { .. } => unreachable!("handled above"),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1683,6 +1729,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Rewrite { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateClustering { .. } => unreachable!("handled above"),
                 Operation::Append { .. }
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
@@ -1789,6 +1836,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::UpdateClustering { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
         }
@@ -2999,6 +3047,7 @@ mod tests {
                 groups: vec![RewriteGroup {
                     old_fragments: vec![fragment0.clone()],
                     new_fragments: vec![fragment1.clone()],
+                    liquid_clustering: None,
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
@@ -3138,6 +3187,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment1],
                         new_fragments: vec![fragment0.clone()],
+                        liquid_clustering: None,
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
@@ -3160,6 +3210,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment0.clone(), fragment2.clone()],
                         new_fragments: vec![fragment0.clone()],
+                        liquid_clustering: None,
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
@@ -3517,6 +3568,7 @@ mod tests {
             groups: vec![RewriteGroup {
                 old_fragments: vec![old.clone()],
                 new_fragments: vec![],
+                liquid_clustering: None,
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
@@ -3662,6 +3714,7 @@ mod tests {
             groups: vec![RewriteGroup {
                 old_fragments: vec![Fragment::new(1)],
                 new_fragments: vec![],
+                liquid_clustering: None,
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
@@ -4325,6 +4378,7 @@ mod tests {
                 groups: vec![RewriteGroup {
                     old_fragments: vec![Fragment::new(1)],
                     new_fragments: vec![Fragment::new(2)],
+                    liquid_clustering: None,
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(frag_reuse_index),
@@ -4707,6 +4761,7 @@ mod tests {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::UpdateClustering { .. }
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
@@ -4810,6 +4865,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment0.clone()],
                         new_fragments: vec![fragment1.clone()],
+                        liquid_clustering: None,
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
@@ -4825,6 +4881,7 @@ mod tests {
                     groups: vec![RewriteGroup {
                         old_fragments: vec![fragment1],
                         new_fragments: vec![fragment0],
+                        liquid_clustering: None,
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,

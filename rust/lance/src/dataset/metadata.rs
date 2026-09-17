@@ -8,7 +8,10 @@ use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEn
 use super::Dataset;
 use crate::Result;
 use futures::future::BoxFuture;
-use lance_core::clustering::ClusteringSpec;
+use lance_core::clustering::{
+    ClusteringAlgorithm, ClusteringSpec, LiquidClusteringState, MAX_CLUSTERING_COLUMNS,
+    validate_data_type,
+};
 use lance_core::datatypes::FieldRef;
 use lance_core::datatypes::Schema;
 
@@ -73,23 +76,6 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            if matches!(self.metadata_type, MetadataType::Config)
-                && (self
-                    .values
-                    .iter()
-                    .any(|entry| entry.key.starts_with("lance.clustering."))
-                    || (self.replace
-                        && self
-                            .dataset
-                            .config()
-                            .keys()
-                            .any(|key| key.starts_with("lance.clustering."))))
-            {
-                return Err(crate::Error::invalid_input(
-                    "clustering config is reserved; use Dataset::set_clustering or \
-                     Dataset::clear_clustering",
-                ));
-            }
             let update_map = Self::create_update_map(self.values, self.replace);
 
             let operation = match self.metadata_type {
@@ -130,68 +116,109 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
 /// Declare clustering columns. Layout generation is managed internally.
 pub async fn set_clustering(dataset: &mut Dataset, columns: Vec<String>) -> Result<()> {
     let current = clustering_spec(dataset)?;
-    if current.as_ref().is_some_and(|spec| {
-        spec.columns == columns
-            && spec.algorithm_revision == lance_core::clustering::CLUSTERING_ALGORITHM_REVISION
-    }) {
+    if current.as_ref().is_some_and(|spec| spec.columns == columns) {
         return Ok(());
+    }
+    if columns.is_empty() {
+        return Err(crate::Error::invalid_input(
+            "clustering requires at least one column",
+        ));
+    }
+    if columns.len() > MAX_CLUSTERING_COLUMNS {
+        return Err(crate::Error::invalid_input(format!(
+            "clustering supports at most {MAX_CLUSTERING_COLUMNS} columns, got {}",
+            columns.len()
+        )));
+    }
+    let clustering_fields = columns
+        .iter()
+        .map(|column| {
+            let field = dataset
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.name == *column)
+                .ok_or_else(|| {
+                    crate::Error::invalid_input(format!(
+                        "clustering column {column:?} must name an existing top-level column"
+                    ))
+                })?;
+            validate_data_type(&field.data_type())?;
+            Ok(field.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if clustering_fields
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != clustering_fields.len()
+    {
+        return Err(crate::Error::invalid_input(
+            "clustering columns must be unique",
+        ));
+    }
+    let existing_key = dataset
+        .schema()
+        .unenforced_clustering_key()
+        .into_iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    if !existing_key.is_empty() && existing_key != clustering_fields {
+        return Err(crate::Error::invalid_input(
+            "the unenforced clustering key cannot be changed once set",
+        ));
     }
 
     let max_fragment_version = dataset
         .manifest
-        .fragment_clustering_versions()
+        .fragment_clustering_generations()
         .into_iter()
         .flatten()
         .max()
         .unwrap_or_default();
-    let version = current
-        .as_ref()
-        .map_or(max_fragment_version, |spec| {
-            spec.version.max(max_fragment_version)
+    let generation = dataset
+        .manifest
+        .liquid_clustering
+        .map_or(max_fragment_version, |state| {
+            state.generation.max(max_fragment_version)
         })
         .checked_add(1)
-        .ok_or_else(|| crate::Error::invalid_input("clustering layout version overflowed u64"))?;
-    let spec = ClusteringSpec::new(columns, version)?;
-    spec.validate_schema(dataset.schema())?;
-
-    let config_updates = UpdateMap {
-        update_entries: spec.to_config()?.into_iter().map(Into::into).collect(),
-        replace: false,
-    };
+        .ok_or_else(|| {
+            crate::Error::invalid_input("clustering layout generation overflowed u64")
+        })?;
     execute_metadata_update(
         dataset,
-        Operation::UpdateConfig {
-            config_updates: Some(config_updates),
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
+        Operation::UpdateClustering {
+            state: LiquidClusteringState::new(
+                true,
+                generation,
+                ClusteringAlgorithm::TypedQuantileRankV1,
+            )?,
+            clustering_fields,
         },
     )
     .await
 }
 
 pub(super) fn clustering_spec(dataset: &Dataset) -> Result<Option<ClusteringSpec>> {
-    ClusteringSpec::from_config(dataset.config())
+    ClusteringSpec::from_state(
+        dataset.manifest.liquid_clustering.as_ref(),
+        dataset.schema(),
+    )
 }
 
 pub async fn clear_clustering(dataset: &mut Dataset) -> Result<()> {
-    if clustering_spec(dataset)?.is_none() {
+    let Some(current) = dataset.manifest.liquid_clustering else {
+        return Ok(());
+    };
+    if !current.enabled {
         return Ok(());
     }
-    let config_updates = UpdateMap {
-        update_entries: ClusteringSpec::config_keys()
-            .into_iter()
-            .map(|key| (key.to_string(), None).into())
-            .collect(),
-        replace: false,
-    };
     execute_metadata_update(
         dataset,
-        Operation::UpdateConfig {
-            config_updates: Some(config_updates),
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
+        Operation::UpdateClustering {
+            state: LiquidClusteringState::new(false, current.generation, current.algorithm)?,
+            clustering_fields: Vec::new(),
         },
     )
     .await
@@ -329,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clustering_declaration_is_revisioned_and_versioned() {
+    async fn test_clustering_declaration_uses_schema_key_and_typed_state() {
         let data = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(10), BatchCount::from(1));
@@ -337,7 +364,7 @@ mod tests {
 
         assert_eq!(dataset.clustering_columns().unwrap(), None);
         dataset.set_clustering(vec!["i".into()]).await.unwrap();
-        let first_version = clustering_spec(&dataset).unwrap().unwrap().version;
+        let first_generation = clustering_spec(&dataset).unwrap().unwrap().generation;
         assert_eq!(
             dataset.clustering_columns().unwrap(),
             Some(vec!["i".into()])
@@ -347,38 +374,47 @@ mod tests {
         dataset.set_clustering(vec!["i".into()]).await.unwrap();
         assert_eq!(dataset.version().version, dataset_version);
         assert_eq!(
-            clustering_spec(&dataset).unwrap().unwrap().version,
-            first_version
+            clustering_spec(&dataset).unwrap().unwrap().generation,
+            first_generation
         );
         assert_eq!(
-            dataset.config()[lance_core::clustering::CLUSTERING_ALGORITHM_REVISION_KEY],
-            lance_core::clustering::CLUSTERING_ALGORITHM_REVISION
+            dataset
+                .schema()
+                .unenforced_clustering_key()
+                .into_iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["i"]
         );
-
-        Arc::make_mut(&mut dataset.manifest).config.insert(
-            lance_core::clustering::CLUSTERING_ALGORITHM_REVISION_KEY.to_string(),
-            "typed-quantile-rank-v0".to_string(),
-        );
-        dataset.set_clustering(vec!["i".into()]).await.unwrap();
-        let upgraded = clustering_spec(&dataset).unwrap().unwrap();
-        assert_eq!(upgraded.version, first_version + 1);
         assert_eq!(
-            upgraded.algorithm_revision,
-            lance_core::clustering::CLUSTERING_ALGORITHM_REVISION
+            dataset.manifest.liquid_clustering,
+            Some(
+                LiquidClusteringState::new(
+                    true,
+                    first_generation,
+                    ClusteringAlgorithm::TypedQuantileRankV1,
+                )
+                .unwrap()
+            )
         );
 
-        let error = dataset
-            .update_config([("lance.clustering.version", "99")])
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("clustering config is reserved"));
-        let error = dataset
+        dataset
             .update_config([("application.key", "value")])
             .replace()
             .await
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
+            .unwrap();
+        assert_eq!(dataset.config()["application.key"], "value");
+        assert_eq!(
+            dataset.manifest.liquid_clustering,
+            Some(
+                LiquidClusteringState::new(
+                    true,
+                    first_generation,
+                    ClusteringAlgorithm::TypedQuantileRankV1,
+                )
+                .unwrap()
+            )
+        );
 
         dataset.clear_clustering().await.unwrap();
         assert_eq!(dataset.clustering_columns().unwrap(), None);

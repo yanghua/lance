@@ -4,7 +4,6 @@
 //! Feature flags
 
 use crate::format::Manifest;
-use lance_core::clustering::CLUSTERING_CONFIG_PREFIX;
 use lance_core::{Error, Result};
 
 /// Fragments may contain deletion files, which record the tombstones of
@@ -52,8 +51,8 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 128;
 /// The dataset has an active liquid-clustering configuration or fragments with
-/// clustering layout version/group stamps. Writers must understand this metadata so
-/// rewrites preserve the declaration and version stamps.
+/// clustering layout generation/group stamps. Writers must understand this metadata so
+/// rewrites preserve the declaration and generation stamps.
 /// Readers do not require it because clustering changes physical layout only,
 /// not logical row values or scan semantics.
 pub const FLAG_CLUSTERING_VERSION: u64 = 256;
@@ -145,11 +144,8 @@ pub fn apply_feature_flags(
     // row values or scan semantics. Fence older writers so they cannot silently
     // discard the declaration or version stamps while still
     // allowing older readers to scan the dataset.
-    let has_clustering_metadata = manifest
-        .config
-        .keys()
-        .any(|key| key.starts_with(CLUSTERING_CONFIG_PREFIX))
-        || manifest.has_fragment_clustering_versions();
+    let has_clustering_metadata =
+        manifest.liquid_clustering.is_some() || manifest.has_fragment_clustering_generations();
     if has_clustering_metadata {
         manifest.writer_feature_flags |= FLAG_CLUSTERING_VERSION;
     }
@@ -326,6 +322,7 @@ mod tests {
     fn test_apply_feature_flags_sets_clustering_writer_flag() {
         use crate::format::{DataStorageFormat, Fragment};
         use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
         use lance_core::datatypes::Schema;
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -343,9 +340,9 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        configured_manifest
-            .config
-            .insert("lance.clustering.version".to_string(), "1".to_string());
+        configured_manifest.liquid_clustering = Some(
+            LiquidClusteringState::new(true, 1, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
+        );
         // Manifests produced before the flag became writer-only may carry the
         // bit in both words. Recomputing flags removes the obsolete reader bit.
         configured_manifest.reader_feature_flags = FLAG_CLUSTERING_VERSION;
@@ -366,7 +363,7 @@ mod tests {
             HashMap::new(),
         );
         stamped_manifest
-            .set_fragment_clustering_versions(vec![Some(1)])
+            .set_fragment_clustering_generations(vec![Some(1)])
             .unwrap();
         apply_feature_flags(&mut stamped_manifest, false, false).unwrap();
         assert_eq!(

@@ -463,6 +463,7 @@ mod tests {
                 old_fragments: vec![Fragment::new(1), Fragment::new(2)],
                 // These two fragments were previously reserved
                 new_fragments: vec![Fragment::new(15), Fragment::new(16)],
+                liquid_clustering: None,
             },
             // These are not contiguous, so they will be inserted at the end.
             RewriteGroup {
@@ -470,6 +471,7 @@ mod tests {
                 // We pretend this id was not reserved.  Does not happen in practice today
                 // but we want to leave the door open.
                 new_fragments: vec![Fragment::new(0)],
+                liquid_clustering: None,
             },
         ];
 
@@ -509,6 +511,7 @@ mod tests {
             &[RewriteGroup {
                 old_fragments: vec![],
                 new_fragments: vec![Fragment::new(1)],
+                liquid_clustering: None,
             }],
             &mut 2,
             1,
@@ -935,6 +938,7 @@ mod tests {
         let groups = vec![RewriteGroup {
             old_fragments: vec![old_frag],
             new_fragments: vec![Fragment::new(7)],
+            liquid_clustering: None,
         }];
 
         // Post-remap state: every index already covers the new fragment (7).

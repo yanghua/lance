@@ -32,6 +32,22 @@ message UUID {
   bytes uuid = 1;
 }
 
+// The physical layout algorithm used by liquid clustering.
+enum ClusteringAlgorithm {
+  CLUSTERING_ALGORITHM_UNSPECIFIED = 0;
+  CLUSTERING_ALGORITHM_TYPED_QUANTILE_RANK_V1 = 1;
+}
+
+// Table-level liquid-clustering state. The clustering key itself is stored on
+// the schema fields through unenforced_clustering_key_position.
+message LiquidClusteringState {
+  // Disabled state is persisted so generations are never reused after re-enabling.
+  bool enabled = 1;
+  // Monotonically increasing physical layout generation.
+  uint64 generation = 2;
+  ClusteringAlgorithm algorithm = 3;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -126,7 +142,7 @@ message Manifest {
   //   refuse it too: one that treats every entry of fields as keyed would maintain
   //   the index against the wrong dependency set.
   // * 1 << 8: the dataset has an active liquid-clustering configuration or fragments
-  //   with clustering layout version/group stamps. Readers and writers that predate this
+  //   with clustering layout generation/group stamps. Readers and writers that predate this
   //   contract must refuse writes because old rewrite paths could silently
   //   discard the declaration or stamps. Readers may ignore physical layout
   //   metadata, so this bit is set only in writer_feature_flags.
@@ -222,6 +238,10 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Liquid-clustering state. The ordered clustering fields are defined only by
+  // Field.unenforced_clustering_key_position.
+  LiquidClusteringState liquid_clustering = 22;
 } // Manifest
 
 // external dataset base path
@@ -399,19 +419,18 @@ message DataFragment {
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
 
-  // The clustering layout version this fragment's data was written under, if
-  // it was written by a clustering-aware writer (see the `lance.clustering.*`
-  // dataset config). A fragment whose stamp is absent (0) or does not equal the
-  // dataset's current clustering version is "under-clustered" and is a
+  // The clustering layout generation this fragment's data was written under.
+  // A fragment whose stamp is absent (0) or does not equal the dataset's
+  // current clustering generation is "under-clustered" and is a
   // candidate for re-clustering during optimize. Zero means unset.
   // Manifests containing this field set writer feature flag 256. Readers may
   // ignore the stamp because it does not change logical row values.
-  uint64 clustering_version = 12;
+  uint64 clustering_generation = 12;
 
   // Identifies the clustering rewrite group that produced this fragment. All
   // fragments in one group were ordered using the same clustering model. Empty
   // means no authoritative group is known.
-  string clustering_group_id = 13;
+  UUID clustering_group_id = 13;
 }
 
 message DataFile {

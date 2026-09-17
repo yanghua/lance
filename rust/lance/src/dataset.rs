@@ -104,10 +104,10 @@ mod take;
 /// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 pub mod transaction {
     pub use lance_table::transaction::{
-        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
-        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
-        validate_operation,
+        DataOverlayGroup, DataReplacementGroup, LiquidClusteringRewrite, Operation,
+        ReadVersionState, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder, UpdateMap,
+        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+        translate_schema_metadata_updates, validate_operation,
     };
 }
 pub mod udtf;
@@ -3890,11 +3890,9 @@ impl Dataset {
     ///
     /// Pass `None` for a value to remove that key.
     ///
-    /// Use `.replace()` to replace the entire config map instead of merging. If
-    /// clustering is declared, call [`Self::clear_clustering`] first because
-    /// replacement cannot implicitly remove reserved clustering configuration.
-    /// Keys in the reserved `lance.clustering.*` namespace must be managed with
-    /// [`Self::set_clustering`] and [`Self::clear_clustering`].
+    /// Use `.replace()` to replace the entire config map instead of merging.
+    /// Typed table state such as the clustering declaration is independent of
+    /// this string map and is not affected by replacement.
     ///
     /// Returns the updated config map after the operation.
     ///

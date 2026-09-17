@@ -860,6 +860,52 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (
+                Self::UpdateClustering {
+                    state: a_state,
+                    clustering_fields: a_fields,
+                },
+                Self::UpdateClustering {
+                    state: b_state,
+                    clustering_fields: b_fields,
+                },
+            ) => a_state == b_state && a_fields == b_fields,
+            (
+                Self::UpdateClustering { .. },
+                Self::Append { .. }
+                | Self::Delete { .. }
+                | Self::Overwrite { .. }
+                | Self::CreateIndex { .. }
+                | Self::Rewrite { .. }
+                | Self::DataReplacement { .. }
+                | Self::Merge { .. }
+                | Self::Restore { .. }
+                | Self::ReserveFragments { .. }
+                | Self::Update { .. }
+                | Self::Project { .. }
+                | Self::UpdateConfig { .. }
+                | Self::UpdateMemWalState { .. }
+                | Self::Clone { .. }
+                | Self::UpdateBases { .. },
+            )
+            | (
+                Self::Append { .. }
+                | Self::Delete { .. }
+                | Self::Overwrite { .. }
+                | Self::CreateIndex { .. }
+                | Self::Rewrite { .. }
+                | Self::DataReplacement { .. }
+                | Self::Merge { .. }
+                | Self::Restore { .. }
+                | Self::ReserveFragments { .. }
+                | Self::Update { .. }
+                | Self::Project { .. }
+                | Self::UpdateConfig { .. }
+                | Self::UpdateMemWalState { .. }
+                | Self::Clone { .. }
+                | Self::UpdateBases { .. },
+                Self::UpdateClustering { .. },
+            ) => false,
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }

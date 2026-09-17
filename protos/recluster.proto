@@ -10,11 +10,11 @@ import "table.proto";
 // Versioned, opaque protocol used by distributed clustering coordinators.
 message Plan {
   uint32 format_version = 1;
-  string plan_id = 2;
+  lance.table.UUID plan_id = 2;
   string dataset_uri = 3;
   uint64 read_version = 4;
-  uint64 clustering_version = 5;
-  string algorithm_revision = 6;
+  uint64 clustering_generation = 5;
+  lance.table.ClusteringAlgorithm algorithm = 6;
   repeated string columns = 7;
   repeated Group groups = 8;
   // BLAKE3 digest of the complete schema, including schema and field metadata.
@@ -25,7 +25,7 @@ message Plan {
 
 message Group {
   // Unique execution identity within the plan.
-  string group_id = 1;
+  lance.table.UUID group_id = 1;
   // Complete metadata for the fragments atomically replaced by this group.
   repeated lance.table.DataFragment source_fragments = 2;
   // Expected live rows after applying deletion files to the source fragments.
@@ -34,20 +34,16 @@ message Group {
 
 message Result {
   uint32 format_version = 1;
-  string plan_id = 2;
-  string group_id = 3;
-  string dataset_uri = 4;
-  uint64 read_version = 5;
-  uint64 clustering_version = 6;
-  string algorithm_revision = 7;
+  lance.table.UUID plan_id = 2;
+  lance.table.UUID group_id = 3;
   // Digest of the exact finalized model used to generate clustering keys.
-  bytes model_digest = 8;
+  bytes model_digest = 4;
   // IDs must exactly match the selected group's source fragments in plan order.
-  repeated uint64 source_fragment_ids = 9;
+  repeated uint64 source_fragment_ids = 5;
   // Staged, uncommitted base-data fragments written by one successful attempt.
-  repeated lance.table.DataFragment new_fragments = 10;
-  uint64 input_rows = 11;
-  uint64 output_rows = 12;
+  repeated lance.table.DataFragment new_fragments = 6;
+  uint64 input_rows = 7;
+  uint64 output_rows = 8;
   // Order-independent digest of the source row addresses carried through shuffle.
-  bytes output_row_digest = 13;
+  bytes output_row_digest = 9;
 }

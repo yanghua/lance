@@ -631,16 +631,24 @@ fn row_converter(data_type: DataType) -> Result<RowConverter> {
     .map_err(|error| Error::invalid_input(format!("unsupported clustering type: {error}")))
 }
 
-fn validate_wire_header(format_version: u32, algorithm_revision: &str) -> Result<()> {
+fn validate_wire_header(format_version: u32, algorithm: i32) -> Result<()> {
     if format_version != MODEL_FORMAT_VERSION {
         return Err(Error::invalid_input(format!(
             "unsupported clustering model format version {format_version}"
         )));
     }
-    if algorithm_revision != CLUSTERING_ALGORITHM_REVISION {
-        return Err(Error::invalid_input(format!(
-            "unsupported clustering algorithm revision {algorithm_revision:?}"
-        )));
+    match lance_table::format::pb::ClusteringAlgorithm::try_from(algorithm) {
+        Ok(lance_table::format::pb::ClusteringAlgorithm::TypedQuantileRankV1) => {}
+        Ok(lance_table::format::pb::ClusteringAlgorithm::Unspecified) => {
+            return Err(Error::invalid_input(
+                "clustering model algorithm must be specified",
+            ));
+        }
+        Err(_) => {
+            return Err(Error::invalid_input(format!(
+                "unsupported clustering model algorithm {algorithm}"
+            )));
+        }
     }
     Ok(())
 }
@@ -649,7 +657,7 @@ impl From<&PartialClusteringModel> for crate::clustering_pb::PartialModel {
     fn from(model: &PartialClusteringModel) -> Self {
         Self {
             format_version: MODEL_FORMAT_VERSION,
-            algorithm_revision: CLUSTERING_ALGORITHM_REVISION.to_string(),
+            algorithm: lance_table::format::pb::ClusteringAlgorithm::TypedQuantileRankV1 as i32,
             columns: model.columns.clone(),
             context: model.context.clone(),
             input_rows: model.input_rows,
@@ -681,7 +689,7 @@ impl TryFrom<crate::clustering_pb::PartialModel> for PartialClusteringModel {
     type Error = Error;
 
     fn try_from(model: crate::clustering_pb::PartialModel) -> Result<Self> {
-        validate_wire_header(model.format_version, &model.algorithm_revision)?;
+        validate_wire_header(model.format_version, model.algorithm)?;
         ClusteringSpec::new(model.columns.clone(), 1)?;
         if model.columns.len() != model.sample_columns.len() {
             return Err(Error::invalid_input(
@@ -754,7 +762,7 @@ impl From<&ClusteringModel> for crate::clustering_pb::Model {
     fn from(model: &ClusteringModel) -> Self {
         Self {
             format_version: MODEL_FORMAT_VERSION,
-            algorithm_revision: CLUSTERING_ALGORITHM_REVISION.to_string(),
+            algorithm: lance_table::format::pb::ClusteringAlgorithm::TypedQuantileRankV1 as i32,
             columns: model.columns.clone(),
             context: model.context.clone(),
             input_rows: model.input_rows,
@@ -775,7 +783,7 @@ impl TryFrom<crate::clustering_pb::Model> for ClusteringModel {
     type Error = Error;
 
     fn try_from(model: crate::clustering_pb::Model) -> Result<Self> {
-        validate_wire_header(model.format_version, &model.algorithm_revision)?;
+        validate_wire_header(model.format_version, model.algorithm)?;
         ClusteringSpec::new(model.columns.clone(), 1)?;
         if model.columns.is_empty() || model.columns.len() != model.model_columns.len() {
             return Err(Error::invalid_input(

@@ -120,6 +120,7 @@ impl FromJObjectWithEnv<RewriteGroup> for JObject<'_> {
         Ok(RewriteGroup {
             old_fragments,
             new_fragments,
+            liquid_clustering: None,
         })
     }
 }

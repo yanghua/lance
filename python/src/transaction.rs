@@ -882,6 +882,7 @@ impl FromPyObject<'_, '_> for PyLance<RewriteGroup> {
         Ok(Self(RewriteGroup {
             old_fragments: extract_vec(&ob.getattr("old_fragments")?)?,
             new_fragments: extract_vec(&ob.getattr("new_fragments")?)?,
+            liquid_clustering: None,
         }))
     }
 }
