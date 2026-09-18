@@ -1268,6 +1268,12 @@ impl Transaction {
             // So we always use new_from_previous which preserves base_paths
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            // Overwrite replaces every row and establishes a new field-id
+            // namespace. Matching ids therefore cannot prove that the old
+            // clustering declaration still names the same logical columns.
+            if matches!(self.operation, Operation::Overwrite { .. }) {
+                prev_manifest.disable_liquid_clustering();
+            }
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -1561,6 +1567,7 @@ mod tests {
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1574,8 +1581,12 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_overwrite_without_clustering_key_disables_state() {
+    #[rstest]
+    #[case::different_name("replacement_key")]
+    #[case::same_name("key")]
+    fn test_overwrite_with_reassigned_clustering_key_id_disables_state(
+        #[case] replacement_name: &str,
+    ) {
         let key_field =
             ArrowField::new("key", DataType::Int32, true).with_metadata(HashMap::from([(
                 LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
@@ -1587,19 +1598,25 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
-        manifest.liquid_clustering = Some(
-            LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
-        );
+        manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap();
         manifest
             .set_fragment_clustering_metadata(vec![(Some(3), None)])
             .unwrap();
 
-        let replacement_schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Utf8,
-            true,
-        )]))
-        .unwrap();
+        let replacement_field = ArrowField::new(replacement_name, DataType::Int32, true)
+            .with_metadata(HashMap::from([(
+                LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
+                "1".to_string(),
+            )]));
+        let replacement_schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![replacement_field])).unwrap();
+        assert_eq!(manifest.schema.unenforced_clustering_key()[0].id, 0);
+        assert_eq!(replacement_schema.unenforced_clustering_key()[0].id, 0);
         let transaction = Transaction::new(
             manifest.version,
             Operation::Overwrite {
@@ -1615,13 +1632,61 @@ mod tests {
             .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
-        let state = replacement.liquid_clustering.unwrap();
+        let state = replacement.liquid_clustering().unwrap();
         assert!(!state.enabled());
         assert_eq!(state.generation(), 3);
         assert_eq!(state.algorithm(), ClusteringAlgorithm::TypedQuantileRankV1);
-        assert!(replacement.schema.unenforced_clustering_key().is_empty());
+        assert_eq!(
+            replacement.schema.unenforced_clustering_key()[0].name,
+            replacement_name
+        );
         assert_eq!(replacement.fragment_clustering_generations(), [None]);
         assert_eq!(replacement.fragment_clustering_groups(), [None]);
+    }
+
+    #[test]
+    fn test_project_rename_preserves_clustering_state() {
+        let key_field =
+            ArrowField::new("key", DataType::Int32, true).with_metadata(HashMap::from([(
+                LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
+                "1".to_string(),
+            )]));
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&ArrowSchema::new(vec![key_field])).unwrap(),
+            Arc::new(vec![Fragment::new(2)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap();
+        manifest
+            .set_fragment_clustering_metadata(vec![(Some(3), None)])
+            .unwrap();
+
+        let mut renamed_schema = manifest.schema.clone();
+        renamed_schema.field_by_id_mut(0).unwrap().name = "renamed_key".to_string();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project {
+                schema: renamed_schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let (renamed, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(renamed.liquid_clustering(), manifest.liquid_clustering());
+        assert_eq!(renamed.fragment_clustering_generations(), [Some(3)]);
+        assert_eq!(
+            renamed.schema.unenforced_clustering_key()[0].name,
+            "renamed_key"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub enum ClusteringAlgorithm {
 ///
 /// The ordered clustering key is stored separately on schema fields through
 /// `Field::unenforced_clustering_key_position`. A disabled state remains
-/// present so its generation cannot be reused if clustering is re-enabled.
+/// present so a later declaration transition can reject generation reuse.
 ///
 /// # Example
 ///
@@ -103,8 +103,9 @@ impl LiquidClusteringState {
 
     /// Return this state with clustering disabled while retaining its generation.
     ///
-    /// Retaining the generation prevents a later declaration from reusing an
-    /// identifier that appeared in an earlier dataset version.
+    /// Retaining the generation lets the manifest transition validator prevent
+    /// a later declaration from reusing an identifier that appeared in an
+    /// earlier dataset version.
     pub const fn disabled(self) -> Self {
         Self {
             enabled: false,

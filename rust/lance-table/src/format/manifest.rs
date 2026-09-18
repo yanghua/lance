@@ -26,7 +26,7 @@ use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::clustering::LiquidClusteringState;
+use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
@@ -65,7 +65,7 @@ pub struct Manifest {
     fragment_clustering_groups: HashMap<u64, ClusteringGroupId>,
 
     /// Table-level liquid-clustering state.
-    pub liquid_clustering: Option<LiquidClusteringState>,
+    liquid_clustering: Option<LiquidClusteringState>,
 
     /// The file position of the version aux data.
     pub version_aux_data: usize,
@@ -154,6 +154,9 @@ fn preserves_clustering_key(previous: &Schema, current: &Schema) -> bool {
             .iter()
             .zip(current_key)
             .all(|(previous, current)| {
+                // Within one schema lineage field ids are the stable column
+                // identity, including across renames. Overwrite is handled at
+                // the transaction boundary because it starts a new id namespace.
                 previous.id == current.id
                     && previous.unenforced_clustering_key_position
                         == current.unenforced_clustering_key_position
@@ -442,6 +445,94 @@ impl Manifest {
     #[doc(hidden)]
     pub fn fragment_clustering_group(&self, fragment_id: u64) -> Option<ClusteringGroupId> {
         self.fragment_clustering_groups.get(&fragment_id).copied()
+    }
+
+    /// Return the table-level liquid-clustering state.
+    #[doc(hidden)]
+    pub const fn liquid_clustering(&self) -> Option<LiquidClusteringState> {
+        self.liquid_clustering
+    }
+
+    /// Refuse an enabled declaration whose physical layout this build cannot
+    /// apply to newly written rows. Read-only and metadata-only operations may
+    /// still preserve the declaration opaquely.
+    #[doc(hidden)]
+    pub fn ensure_can_cluster_new_rows(&self) -> Result<()> {
+        if let Some(state) = self.liquid_clustering
+            && state.enabled()
+            && let ClusteringAlgorithm::Unknown(algorithm) = state.algorithm()
+        {
+            return Err(Error::not_supported(format!(
+                "cannot write new rows under unknown liquid clustering algorithm {algorithm}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replace the table-level liquid-clustering declaration after validating
+    /// its generation against all layout identifiers visible in this manifest.
+    #[doc(hidden)]
+    pub fn set_liquid_clustering(&mut self, state: LiquidClusteringState) -> Result<()> {
+        if self.liquid_clustering == Some(state) {
+            return Ok(());
+        }
+        if state.enabled()
+            && let ClusteringAlgorithm::Unknown(algorithm) = state.algorithm()
+        {
+            return Err(Error::not_supported(format!(
+                "cannot declare unknown liquid clustering algorithm {algorithm}"
+            )));
+        }
+
+        if !state.enabled() {
+            let Some(previous) = self.liquid_clustering else {
+                if let Some(maximum_generation) =
+                    self.fragment_clustering_generations.values().copied().max()
+                    && state.generation() < maximum_generation
+                {
+                    return Err(Error::invalid_input(format!(
+                        "disabled liquid clustering generation must be at least the maximum \
+                         existing fragment generation {maximum_generation}; got {}",
+                        state.generation()
+                    )));
+                }
+                self.liquid_clustering = Some(state);
+                return Ok(());
+            };
+            if state != previous.disabled() {
+                return Err(Error::invalid_input(format!(
+                    "disabling liquid clustering must retain generation {} and algorithm {:?}",
+                    previous.generation(),
+                    previous.algorithm()
+                )));
+            }
+            self.liquid_clustering = Some(state);
+            return Ok(());
+        }
+
+        let maximum_generation = self
+            .liquid_clustering
+            .map(|previous| previous.generation())
+            .into_iter()
+            .chain(self.fragment_clustering_generations.values().copied())
+            .max();
+        if let Some(maximum_generation) = maximum_generation
+            && state.generation() <= maximum_generation
+        {
+            return Err(Error::invalid_input(format!(
+                "enabling liquid clustering requires a generation greater than the maximum \
+                 existing generation {maximum_generation}; got {}",
+                state.generation()
+            )));
+        }
+
+        self.liquid_clustering = Some(state);
+        Ok(())
+    }
+
+    /// Disable an active declaration without discarding its generation.
+    pub(crate) fn disable_liquid_clustering(&mut self) {
+        self.liquid_clustering = self.liquid_clustering.map(LiquidClusteringState::disabled);
     }
 
     /// Whether any current fragment carries a clustering generation.
@@ -1420,16 +1511,18 @@ mod tests {
             HashMap::new(),
         );
         manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(
+                    true,
+                    3,
+                    lance_core::clustering::ClusteringAlgorithm::TypedQuantileRankV1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manifest
             .set_fragment_clustering_metadata(vec![(Some(3), Some(group_id)), (None, None)])
             .unwrap();
-        manifest.liquid_clustering = Some(
-            LiquidClusteringState::new(
-                true,
-                3,
-                lance_core::clustering::ClusteringAlgorithm::TypedQuantileRankV1,
-            )
-            .unwrap(),
-        );
 
         let encoded = pb::Manifest::from(&manifest);
         assert_eq!(encoded.fragments[0].clustering_generation, 3);
@@ -1449,7 +1542,7 @@ mod tests {
         let decoded = Manifest::try_from(encoded).unwrap();
         assert_eq!(decoded.fragment_clustering_generations(), [Some(3), None]);
         assert_eq!(decoded.fragment_clustering_groups(), [Some(group_id), None]);
-        assert_eq!(decoded.liquid_clustering, manifest.liquid_clustering);
+        assert_eq!(decoded.liquid_clustering(), manifest.liquid_clustering());
     }
 
     #[test]
@@ -1467,13 +1560,44 @@ mod tests {
         });
 
         let decoded = Manifest::try_from(encoded).unwrap();
-        let state = decoded.liquid_clustering.unwrap();
+        let state = decoded.liquid_clustering().unwrap();
         assert_eq!(state.algorithm(), ClusteringAlgorithm::Unknown(42));
+        let error = decoded.ensure_can_cluster_new_rows().unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("algorithm 42"));
         assert_eq!(
             pb::LiquidClusteringState::from(&state).algorithm,
             42,
             "an unrelated manifest rewrite must not erase a future algorithm value"
         );
+    }
+
+    #[test]
+    fn unknown_clustering_algorithm_survives_unrelated_manifest_derivation() {
+        let mut encoded = pb::Manifest::from(&Manifest::new(
+            schema_with_clustering_key(Some("key"), arrow_schema::DataType::Int32),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        ));
+        encoded.liquid_clustering = Some(pb::LiquidClusteringState {
+            enabled: true,
+            generation: 3,
+            algorithm: 42,
+        });
+        let decoded = Manifest::try_from(encoded).unwrap();
+
+        let derived = Manifest::new_from_previous(
+            &decoded,
+            decoded.schema.clone(),
+            decoded.fragments.clone(),
+        );
+        assert_eq!(
+            derived.liquid_clustering().unwrap().algorithm(),
+            ClusteringAlgorithm::Unknown(42)
+        );
+        assert!(derived.liquid_clustering().unwrap().enabled());
+        assert!(derived.ensure_can_cluster_new_rows().is_err());
     }
 
     #[test]
@@ -1598,9 +1722,12 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        manifest.liquid_clustering = Some(
-            LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
-        );
+        manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap();
         manifest
             .set_fragment_clustering_metadata(vec![(
                 Some(3),
@@ -1614,17 +1741,87 @@ mod tests {
     #[test]
     fn derived_manifest_preserves_state_for_compatible_schema() {
         let manifest = manifest_with_clustering_key();
+        let mut renamed_schema = manifest.schema.clone();
+        renamed_schema.field_by_id_mut(0).unwrap().name = "renamed_key".to_string();
         let replacement = Manifest::new_from_previous(
             &manifest,
-            manifest.schema.clone(),
+            renamed_schema,
             Arc::new(vec![Fragment::new(7)]),
         );
 
-        assert_eq!(replacement.liquid_clustering, manifest.liquid_clustering);
+        assert_eq!(
+            replacement.liquid_clustering(),
+            manifest.liquid_clustering()
+        );
         assert_eq!(replacement.fragment_clustering_generations(), [None]);
         assert_ne!(
             replacement.writer_feature_flags & FLAG_CLUSTERING_METADATA,
             0
+        );
+    }
+
+    #[test]
+    fn clustering_declaration_generation_must_advance() {
+        let mut manifest = manifest_with_clustering_key();
+        let current = manifest.liquid_clustering().unwrap();
+        manifest.set_liquid_clustering(current.disabled()).unwrap();
+
+        for generation in [1, 3] {
+            let error = manifest
+                .set_liquid_clustering(
+                    LiquidClusteringState::new(
+                        true,
+                        generation,
+                        ClusteringAlgorithm::TypedQuantileRankV1,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("maximum existing generation 3"));
+        }
+
+        manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 4, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(manifest.liquid_clustering().unwrap().generation(), 4);
+    }
+
+    #[test]
+    fn clustering_declaration_must_advance_past_fragment_generations() {
+        let mut manifest = Manifest::new(
+            schema_with_clustering_key(Some("key"), arrow_schema::DataType::Int32),
+            Arc::new(vec![Fragment::new(2)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![(Some(5), None)])
+            .unwrap();
+
+        let error = manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 5, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("maximum existing generation 5"));
+
+        let error = manifest
+            .set_liquid_clustering(
+                LiquidClusteringState::new(false, 4, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("maximum existing fragment generation 5")
         );
     }
 
@@ -1639,7 +1836,7 @@ mod tests {
             let replacement =
                 Manifest::new_from_previous(&manifest, schema, Arc::new(vec![Fragment::new(2)]));
 
-            let state = replacement.liquid_clustering.unwrap();
+            let state = replacement.liquid_clustering().unwrap();
             assert!(!state.enabled());
             assert_eq!(state.generation(), 3);
             assert_eq!(replacement.fragment_clustering_generations(), [None]);

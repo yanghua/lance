@@ -127,19 +127,23 @@ impl From<&LiquidClusteringState> for pb::LiquidClusteringState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn unknown_clustering_algorithm_round_trips_opaquely() {
+    #[rstest]
+    #[case::future_positive(42)]
+    #[case::future_negative(-1)]
+    #[case::minimum_value(i32::MIN)]
+    fn unknown_clustering_algorithm_round_trips_opaquely(#[case] algorithm: i32) {
         let encoded = pb::LiquidClusteringState {
             enabled: true,
             generation: 7,
-            algorithm: 42,
+            algorithm,
         };
 
         let decoded = LiquidClusteringState::try_from(&encoded).unwrap();
         assert!(decoded.enabled());
         assert_eq!(decoded.generation(), 7);
-        assert_eq!(decoded.algorithm(), ClusteringAlgorithm::Unknown(42));
+        assert_eq!(decoded.algorithm(), ClusteringAlgorithm::Unknown(algorithm));
         assert_eq!(pb::LiquidClusteringState::from(&decoded), encoded);
     }
 

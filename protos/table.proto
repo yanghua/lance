@@ -42,7 +42,7 @@ enum ClusteringAlgorithm {
  * schema fields through unenforced_clustering_key_position.
  */
 message LiquidClusteringState {
-  // Disabled state is persisted so generations are never reused after re-enabling.
+  // Disabled state is persisted so declaration validation can reject generation reuse.
   bool enabled = 1;
   // Monotonically increasing physical-layout generation. Zero is invalid.
   uint64 generation = 2;

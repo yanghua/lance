@@ -145,7 +145,7 @@ pub fn apply_feature_flags(
     }
 
     let has_clustering_metadata =
-        manifest.liquid_clustering.is_some() || manifest.has_fragment_clustering_generations();
+        manifest.liquid_clustering().is_some() || manifest.has_fragment_clustering_generations();
     if has_clustering_metadata {
         manifest.writer_feature_flags |= FLAG_CLUSTERING_METADATA;
     }
@@ -360,9 +360,12 @@ mod tests {
         use uuid::Uuid;
 
         let mut configured = empty_manifest();
-        configured.liquid_clustering = Some(
-            LiquidClusteringState::new(true, 1, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
-        );
+        configured
+            .set_liquid_clustering(
+                LiquidClusteringState::new(true, 1, ClusteringAlgorithm::TypedQuantileRankV1)
+                    .unwrap(),
+            )
+            .unwrap();
         apply_feature_flags(&mut configured, false, false).unwrap();
         assert_eq!(
             configured.reader_feature_flags & FLAG_CLUSTERING_METADATA,
