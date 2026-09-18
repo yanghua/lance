@@ -139,10 +139,38 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
+fn same_data_file_identity(
+    previous: &crate::format::DataFile,
+    current: &crate::format::DataFile,
+) -> bool {
+    // File size is a mutable cache populated by readers, not part of the
+    // physical file identity or row layout.
+    previous.path == current.path
+        && previous.fields == current.fields
+        && previous.column_indices == current.column_indices
+        && previous.file_major_version == current.file_major_version
+        && previous.file_minor_version == current.file_minor_version
+        && previous.base_id == current.base_id
+}
+
 fn preserves_clustering_layout(previous: &Fragment, current: &Fragment) -> bool {
     previous.id == current.id
-        && previous.files == current.files
-        && previous.overlays == current.overlays
+        && previous.files.len() == current.files.len()
+        && previous
+            .files
+            .iter()
+            .zip(current.files.iter())
+            .all(|(previous, current)| same_data_file_identity(previous, current))
+        && previous.overlays.len() == current.overlays.len()
+        && previous
+            .overlays
+            .iter()
+            .zip(current.overlays.iter())
+            .all(|(previous, current)| {
+                same_data_file_identity(&previous.data_file, &current.data_file)
+                    && previous.coverage == current.coverage
+                    && previous.committed_version == current.committed_version
+            })
         && previous.physical_rows == current.physical_rows
 }
 
@@ -486,8 +514,7 @@ impl Manifest {
 
         if !state.enabled() {
             let Some(previous) = self.liquid_clustering else {
-                if let Some(maximum_generation) =
-                    self.fragment_clustering_generations.values().copied().max()
+                if let Some(maximum_generation) = self.maximum_fragment_clustering_generation()
                     && state.generation() < maximum_generation
                 {
                     return Err(Error::invalid_input(format!(
@@ -514,7 +541,7 @@ impl Manifest {
             .liquid_clustering
             .map(|previous| previous.generation())
             .into_iter()
-            .chain(self.fragment_clustering_generations.values().copied())
+            .chain(self.maximum_fragment_clustering_generation())
             .max();
         if let Some(maximum_generation) = maximum_generation
             && state.generation() <= maximum_generation
@@ -528,6 +555,17 @@ impl Manifest {
 
         self.liquid_clustering = Some(state);
         Ok(())
+    }
+
+    fn maximum_fragment_clustering_generation(&self) -> Option<u64> {
+        self.fragments
+            .iter()
+            .filter_map(|fragment| {
+                self.fragment_clustering_generations
+                    .get(&fragment.id)
+                    .copied()
+            })
+            .max()
     }
 
     /// Disable an active declaration without discarding its generation.
@@ -1635,9 +1673,20 @@ mod tests {
     #[test]
     fn derived_manifests_preserve_clustering_metadata() {
         let group_id = ClusteringGroupId::from(Uuid::from_u128(1));
+        let mut fragment = Fragment::new(2);
+        fragment.files.push(DataFile::new_legacy_from_fields(
+            "data.lance",
+            vec![0],
+            None,
+        ));
+        fragment.overlays.push(DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
         let mut manifest = Manifest::new(
             Schema::default(),
-            Arc::new(vec![Fragment::new(2)]),
+            Arc::new(vec![fragment]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
@@ -1654,6 +1703,33 @@ mod tests {
         assert_eq!(next.fragment_clustering_generations(), [Some(3)]);
         assert_eq!(next.fragment_clustering_groups(), [Some(group_id)]);
         assert_ne!(next.writer_feature_flags & FLAG_CLUSTERING_METADATA, 0);
+
+        let mut cached_size_fragment = manifest.fragments[0].clone();
+        cached_size_fragment.files[0].file_size_bytes = NonZero::new(1024).into();
+        cached_size_fragment.overlays[0].data_file.file_size_bytes = NonZero::new(512).into();
+        let cached_size_update = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            Arc::new(vec![cached_size_fragment]),
+        );
+        assert_eq!(
+            cached_size_update.fragment_clustering_generations(),
+            [Some(3)]
+        );
+        assert_eq!(
+            cached_size_update.fragment_clustering_groups(),
+            [Some(group_id)]
+        );
+
+        let mut relocated_fragment = manifest.fragments[0].clone();
+        relocated_fragment.files[0].base_id = Some(7);
+        let relocated = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            Arc::new(vec![relocated_fragment]),
+        );
+        assert_eq!(relocated.fragment_clustering_generations(), [None]);
+        assert_eq!(relocated.fragment_clustering_groups(), [None]);
 
         let mut rewritten_fragment = manifest.fragments[0].clone();
         rewritten_fragment
@@ -1764,6 +1840,9 @@ mod tests {
     fn clustering_declaration_generation_must_advance() {
         let mut manifest = manifest_with_clustering_key();
         let current = manifest.liquid_clustering().unwrap();
+        manifest.set_liquid_clustering(current).unwrap();
+        assert_eq!(manifest.liquid_clustering(), Some(current));
+
         manifest.set_liquid_clustering(current.disabled()).unwrap();
 
         for generation in [1, 3] {
@@ -1788,6 +1867,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(manifest.liquid_clustering().unwrap().generation(), 4);
+    }
+
+    #[test]
+    fn clustering_declaration_ignores_stale_fragment_generations() {
+        let mut manifest = Manifest::new(
+            schema_with_clustering_key(Some("key"), arrow_schema::DataType::Int32),
+            Arc::new(vec![Fragment::new(2), Fragment::new(7)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![(Some(3), None), (Some(9), None)])
+            .unwrap();
+        manifest.fragments = Arc::new(vec![manifest.fragments[0].clone()]);
+
+        let mut enabled = manifest.clone();
+        let enabled_state =
+            LiquidClusteringState::new(true, 4, ClusteringAlgorithm::TypedQuantileRankV1).unwrap();
+        enabled.set_liquid_clustering(enabled_state).unwrap();
+        assert_eq!(enabled.liquid_clustering(), Some(enabled_state));
+
+        let disabled_state =
+            LiquidClusteringState::new(false, 3, ClusteringAlgorithm::TypedQuantileRankV1).unwrap();
+        manifest.set_liquid_clustering(disabled_state).unwrap();
+        assert_eq!(manifest.liquid_clustering(), Some(disabled_state));
     }
 
     #[test]
