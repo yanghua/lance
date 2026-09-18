@@ -1557,6 +1557,7 @@ mod tests {
     };
     use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::clustering::{ClusteringAlgorithm, LiquidClusteringState};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
@@ -1571,6 +1572,56 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn test_overwrite_without_clustering_key_disables_state() {
+        let key_field =
+            ArrowField::new("key", DataType::Int32, true).with_metadata(HashMap::from([(
+                LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
+                "1".to_string(),
+            )]));
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&ArrowSchema::new(vec![key_field])).unwrap(),
+            Arc::new(vec![Fragment::new(2)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.liquid_clustering = Some(
+            LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![(Some(3), None)])
+            .unwrap();
+
+        let replacement_schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Utf8,
+            true,
+        )]))
+        .unwrap();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Overwrite {
+                fragments: vec![Fragment::new(0)],
+                schema: replacement_schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+
+        let (replacement, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let state = replacement.liquid_clustering.unwrap();
+        assert!(!state.enabled());
+        assert_eq!(state.generation(), 3);
+        assert_eq!(state.algorithm(), ClusteringAlgorithm::TypedQuantileRankV1);
+        assert!(replacement.schema.unenforced_clustering_key().is_empty());
+        assert_eq!(replacement.fragment_clustering_generations(), [None]);
+        assert_eq!(replacement.fragment_clustering_groups(), [None]);
     }
 
     #[test]

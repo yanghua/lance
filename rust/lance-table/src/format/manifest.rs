@@ -146,6 +146,21 @@ fn preserves_clustering_layout(previous: &Fragment, current: &Fragment) -> bool 
         && previous.physical_rows == current.physical_rows
 }
 
+fn preserves_clustering_key(previous: &Schema, current: &Schema) -> bool {
+    let previous_key = previous.unenforced_clustering_key();
+    let current_key = current.unenforced_clustering_key();
+    previous_key.len() == current_key.len()
+        && previous_key
+            .iter()
+            .zip(current_key)
+            .all(|(previous, current)| {
+                previous.id == current.id
+                    && previous.unenforced_clustering_key_position
+                        == current.unenforced_clustering_key_position
+                    && previous.data_type() == current.data_type()
+            })
+}
+
 #[derive(Default)]
 pub struct ManifestSummary {
     pub total_fragments: u64,
@@ -231,6 +246,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let preserves_clustering_key = preserves_clustering_key(&previous.schema, &schema);
         let previous_fragments = previous
             .fragments
             .iter()
@@ -239,9 +255,10 @@ impl Manifest {
         let unchanged_fragment_ids = fragments
             .iter()
             .filter(|fragment| {
-                previous_fragments
-                    .get(&fragment.id)
-                    .is_some_and(|previous| preserves_clustering_layout(previous, fragment))
+                preserves_clustering_key
+                    && previous_fragments
+                        .get(&fragment.id)
+                        .is_some_and(|previous| preserves_clustering_layout(previous, fragment))
             })
             .map(|fragment| fragment.id)
             .collect::<std::collections::HashSet<_>>();
@@ -257,6 +274,13 @@ impl Manifest {
             .filter(|(fragment_id, _)| unchanged_fragment_ids.contains(fragment_id))
             .map(|(fragment_id, group)| (*fragment_id, *group))
             .collect();
+        let liquid_clustering = previous.liquid_clustering.map(|state| {
+            if preserves_clustering_key {
+                state
+            } else {
+                state.disabled()
+            }
+        });
 
         Self {
             schema,
@@ -266,7 +290,7 @@ impl Manifest {
             fragments,
             fragment_clustering_generations,
             fragment_clustering_groups,
-            liquid_clustering: previous.liquid_clustering,
+            liquid_clustering,
             version_aux_data: 0,
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
@@ -1381,7 +1405,8 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Field;
+    use lance_core::clustering::ClusteringAlgorithm;
+    use lance_core::datatypes::{Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION};
     use roaring::RoaringBitmap;
     use uuid::Uuid;
 
@@ -1425,6 +1450,30 @@ mod tests {
         assert_eq!(decoded.fragment_clustering_generations(), [Some(3), None]);
         assert_eq!(decoded.fragment_clustering_groups(), [Some(group_id), None]);
         assert_eq!(decoded.liquid_clustering, manifest.liquid_clustering);
+    }
+
+    #[test]
+    fn unknown_clustering_algorithm_does_not_block_manifest_read() {
+        let mut encoded = pb::Manifest::from(&Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        ));
+        encoded.liquid_clustering = Some(pb::LiquidClusteringState {
+            enabled: true,
+            generation: 3,
+            algorithm: 42,
+        });
+
+        let decoded = Manifest::try_from(encoded).unwrap();
+        let state = decoded.liquid_clustering.unwrap();
+        assert_eq!(state.algorithm(), ClusteringAlgorithm::Unknown(42));
+        assert_eq!(
+            pb::LiquidClusteringState::from(&state).algorithm,
+            42,
+            "an unrelated manifest rewrite must not erase a future algorithm value"
+        );
     }
 
     #[test]
@@ -1519,6 +1568,87 @@ mod tests {
         assert_eq!(cloned.fragment_clustering_generations(), [Some(3)]);
         assert_eq!(cloned.fragment_clustering_groups(), [Some(group_id)]);
         assert_ne!(cloned.writer_feature_flags & FLAG_CLUSTERING_METADATA, 0);
+    }
+
+    fn schema_with_clustering_key(
+        key_name: Option<&str>,
+        key_type: arrow_schema::DataType,
+    ) -> Schema {
+        let fields = [("key", key_type), ("value", arrow_schema::DataType::Utf8)]
+            .into_iter()
+            .map(|(name, data_type)| {
+                let field = ArrowField::new(name, data_type, true);
+                if key_name == Some(name) {
+                    field.with_metadata(HashMap::from([(
+                        LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_string(),
+                        "1".to_string(),
+                    )]))
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<_>>();
+        Schema::try_from(&ArrowSchema::new(fields)).unwrap()
+    }
+
+    fn manifest_with_clustering_key() -> Manifest {
+        let mut manifest = Manifest::new(
+            schema_with_clustering_key(Some("key"), arrow_schema::DataType::Int32),
+            Arc::new(vec![Fragment::new(2)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.liquid_clustering = Some(
+            LiquidClusteringState::new(true, 3, ClusteringAlgorithm::TypedQuantileRankV1).unwrap(),
+        );
+        manifest
+            .set_fragment_clustering_metadata(vec![(
+                Some(3),
+                Some(ClusteringGroupId::from(Uuid::from_u128(1))),
+            )])
+            .unwrap();
+        manifest.writer_feature_flags = FLAG_CLUSTERING_METADATA;
+        manifest
+    }
+
+    #[test]
+    fn derived_manifest_preserves_state_for_compatible_schema() {
+        let manifest = manifest_with_clustering_key();
+        let replacement = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            Arc::new(vec![Fragment::new(7)]),
+        );
+
+        assert_eq!(replacement.liquid_clustering, manifest.liquid_clustering);
+        assert_eq!(replacement.fragment_clustering_generations(), [None]);
+        assert_ne!(
+            replacement.writer_feature_flags & FLAG_CLUSTERING_METADATA,
+            0
+        );
+    }
+
+    #[test]
+    fn derived_manifest_disables_state_for_incompatible_schema() {
+        let manifest = manifest_with_clustering_key();
+        for schema in [
+            schema_with_clustering_key(None, arrow_schema::DataType::Int32),
+            schema_with_clustering_key(Some("value"), arrow_schema::DataType::Int32),
+            schema_with_clustering_key(Some("key"), arrow_schema::DataType::Int64),
+        ] {
+            let replacement =
+                Manifest::new_from_previous(&manifest, schema, Arc::new(vec![Fragment::new(2)]));
+
+            let state = replacement.liquid_clustering.unwrap();
+            assert!(!state.enabled());
+            assert_eq!(state.generation(), 3);
+            assert_eq!(replacement.fragment_clustering_generations(), [None]);
+            assert_eq!(replacement.fragment_clustering_groups(), [None]);
+            assert_ne!(
+                replacement.writer_feature_flags & FLAG_CLUSTERING_METADATA,
+                0
+            );
+        }
     }
 
     /// A shallow clone points every local file at the parent through `base_id`.

@@ -103,27 +103,56 @@ impl TryFrom<&pb::LiquidClusteringState> for LiquidClusteringState {
                     "liquid clustering algorithm must be specified",
                 ));
             }
-            Err(_) => {
-                return Err(Error::not_supported(format!(
-                    "unknown liquid clustering algorithm {}",
-                    value.algorithm
-                )));
-            }
+            Err(_) => ClusteringAlgorithm::Unknown(value.algorithm),
         };
-        Self::new(value.enabled, value.generation, algorithm)
+        Self::from_persisted(value.enabled, value.generation, algorithm)
     }
 }
 
 impl From<&LiquidClusteringState> for pb::LiquidClusteringState {
     fn from(value: &LiquidClusteringState) -> Self {
         Self {
-            enabled: value.enabled,
-            generation: value.generation,
-            algorithm: match value.algorithm {
+            enabled: value.enabled(),
+            generation: value.generation(),
+            algorithm: match value.algorithm() {
                 ClusteringAlgorithm::TypedQuantileRankV1 => {
                     pb::ClusteringAlgorithm::TypedQuantileRankV1 as i32
                 }
+                ClusteringAlgorithm::Unknown(value) => value,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_clustering_algorithm_round_trips_opaquely() {
+        let encoded = pb::LiquidClusteringState {
+            enabled: true,
+            generation: 7,
+            algorithm: 42,
+        };
+
+        let decoded = LiquidClusteringState::try_from(&encoded).unwrap();
+        assert!(decoded.enabled());
+        assert_eq!(decoded.generation(), 7);
+        assert_eq!(decoded.algorithm(), ClusteringAlgorithm::Unknown(42));
+        assert_eq!(pb::LiquidClusteringState::from(&decoded), encoded);
+    }
+
+    #[test]
+    fn unspecified_clustering_algorithm_is_rejected() {
+        let encoded = pb::LiquidClusteringState {
+            enabled: true,
+            generation: 7,
+            algorithm: pb::ClusteringAlgorithm::Unspecified as i32,
+        };
+
+        let error = LiquidClusteringState::try_from(&encoded).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("must be specified"));
     }
 }
